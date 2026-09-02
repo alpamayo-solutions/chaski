@@ -108,6 +108,10 @@ class Service:
         self._catalogue = Catalogue(Path(state_dir) / "catalogue.json", connector=connector)
         # tag_id -> (metric Topic, signal id)
         self._bindings: dict[str, tuple[Topic, str]] = {}
+        # the SIGNAL's own topic string -> tag_id, so a tombstone (which
+        # arrives on the _Signal topic, never the _Metric one _bindings
+        # stores) can find what to unbind.
+        self._signal_topic_of: dict[str, str] = {}
         self._buffer: dict[str, deque] = {}
         self._unbound_log_at: dict[str, float] = {}
         self._seen: set[str] = set()
@@ -183,11 +187,29 @@ class Service:
         svc._start()
         return svc
 
-    def _start(self) -> None:
+    def _start(self, *, connect_timeout: float = 10.0) -> None:
         mount_parts = tuple(p for p in self._mount.split("/") if p)
         filter_context = (*mount_parts, "#") if mount_parts else ("#",)
         signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
+
+        # Subscribing straight after connect()/loop_start() races the
+        # CONNACK: connect() opens the socket and sends CONNECT but does not
+        # wait for the broker's answer, so a SUBSCRIBE sent before it arrives
+        # is a protocol violation the broker is free to drop. Wait for the
+        # (paho v2) on_connect callback instead — franzmq.Client leaves
+        # .on_connect unset unless a caller sets it, so this never collides
+        # with local_service.connect_local_mqtt's own optional on_connect.
+        connected = threading.Event()
+
+        def _on_connect(_client: Any, _userdata: Any, _flags: Any, reason_code: Any,
+                        _properties: Any = None) -> None:
+            if not getattr(reason_code, "is_failure", False):
+                connected.set()
+
+        self._client.on_connect = _on_connect
         self._client.loop_start()
+        if not connected.wait(connect_timeout):
+            raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")
         self._client.subscribe(signal_filter, qos=1, callback=self._on_signal)
 
     # -- publishing --------------------------------------------------------
@@ -222,9 +244,11 @@ class Service:
             topic, signal_id = binding
         self._publish_metric(topic, signal_id, value, timestamp)
 
-    def _publish_metric(self, topic: Topic, signal_id: str, value: Any, timestamp: Optional[Any]) -> None:
+    def _publish_metric(
+        self, topic: Topic, signal_id: str, value: Any, timestamp: Optional[Any], *, wait: bool = True
+    ) -> None:
         metric = Metric(value=value, timestamp=_epoch(timestamp), signal_id=signal_id)
-        self._client.publish(topic, metric, qos=1)
+        self._client.publish(topic, metric, qos=1, wait=wait)
 
     def _buffer_sample(self, path: str, value: Any, timestamp: Optional[Any]) -> None:
         queue = self._buffer.setdefault(path, deque(maxlen=_MAX_BUFFERED_PER_PATH))
@@ -241,28 +265,51 @@ class Service:
     # -- signal binding ------------------------------------------------
 
     def _on_signal(self, message: Any) -> None:
+        """A Signal binds at ``{under}/{leaf}`` — ``under`` is the connector's
+        own mount by default, ``leaf`` the tag's sanitized NAME — which is
+        NOT in general the same string as the ``path`` a caller gave
+        ``publish()`` (a single-segment source like "temp" gets the
+        connector's mount prepended; a multi-segment one only matches by
+        coincidence). So the match key is ``signal.data_tag`` against this
+        service's own catalogue, never the topic's path (``exec_configure.go``
+        ``bindCatalogue``).
+        """
         topic_str = str(message.topic)
         parts = topic_str.split("/")
         if len(parts) < 5:
             return
         path = "/".join(parts[4:])
         signal = message.payload
+        if signal is None:
+            # Tombstone: unbind whichever tag_id this exact SIGNAL topic
+            # (not the _Metric topic _bindings stores — a different contract,
+            # hence the separate reverse index) was bound to.
+            with self._lock:
+                tag_id = self._signal_topic_of.pop(topic_str, None)
+                if tag_id is not None:
+                    self._bindings.pop(tag_id, None)
+            return
+        tag_id = getattr(signal, "data_tag", None)
+        if not tag_id:
+            return
         with self._lock:
-            tag_id = self._catalogue.tag_id(path)
-            if tag_id is None:
-                return  # a _Signal outside this service's own tags
-            if signal is None:
-                self._bindings.pop(tag_id, None)  # tombstone: unbind
-                return
-            data_tag = getattr(signal, "data_tag", None)
-            if data_tag != tag_id:
-                return  # this path's Signal is bound to a DIFFERENT tag
+            source = self._catalogue.source_for_tag(tag_id)
+            if source is None:
+                return  # a _Signal bound to a tag this service does not own
             metric_topic = Topic(payload_type=Metric, node_id=self._node_id, context=tuple(path.split("/")))
             self._bindings[tag_id] = (metric_topic, signal.id)
-            queued = self._buffer.pop(path, None)
+            self._signal_topic_of[topic_str] = tag_id
+            queued = self._buffer.pop(source, None)
         if queued:
+            # Always the MQTT network/callback thread here: franzmq.Client's
+            # own qos>=1 wait-for-PUBACK is a deadlock on this thread by
+            # construction (it is the thread that would have to read the
+            # PUBACK), so ask it to fire-and-forget instead of trusting its
+            # same-thread detection, which does not appear to catch this
+            # dispatch path (observed: a PublishTimeout after the full
+            # publish_timeout, not a same-thread skip).
             for value, timestamp in queued:
-                self._publish_metric(metric_topic, signal.id, value, timestamp)
+                self._publish_metric(metric_topic, signal.id, value, timestamp, wait=False)
 
     # -- catalogue ---------------------------------------------------------
 
