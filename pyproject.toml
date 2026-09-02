@@ -1,0 +1,38 @@
+[project]
+name = "chaski"
+version = "0.0.0"
+description = "Speak to a Colca node, or be one: Edit, Service and Node, plus the chaski CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "keyring>=25,<27",
+  "franzmq==0.6.2",
+  "paho-mqtt==2.1.0",
+  "ulid-py>=1.1",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+chaski = "chaski.cli:main"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4,<10",
+  # Local sibling package (not on PyPI); the published wheel bundles its
+  # source instead (scripts/build_edit_client.py, matching how a
+  # generated deployment's Docker build copies it too). Tests resolve it via [tool.uv.sources] below.
+  "colca-data-contracts",
+]
+
+[tool.uv.sources]
+colca-data-contracts = { path = "../colca-data-contracts" }
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
