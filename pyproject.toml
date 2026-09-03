@@ -10,6 +10,9 @@ dependencies = [
   "paho-mqtt==2.1.0",
   "ulid-py>=1.1",
   "pyyaml>=6.0",
+  # chaski.Service's own external-identity minting (ed25519 key + self-signed
+  # cert, mirroring colca-keygen -cert — SDK design §3.2).
+  "cryptography>=42",
 ]
 
 [project.scripts]

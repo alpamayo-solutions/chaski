@@ -1,40 +1,68 @@
-"""The shared connector-protocol publisher (SDK design §3, §7 gap 3).
+"""``chaski.Service``: the shared connector-protocol publisher (SDK design
+§3, §3.2 "Service lifecycle", §7 gap 3).
 
-``Service.local`` (inside a deployment, the local door, no credential) and
-``Service.external`` (outside it, the published door, a registry-pinned
-mTLS key) are ONE implementation differing only in which door they open and
-which credential they present — architecture principle 1's one-clause test,
-applied to the client side. Both give the same ``publish(path, value, unit=,
-timestamp=)``: every distinct path becomes a ``DataTag`` (see
+ONE constructor, not two classmethods: ``Service(name, mount="", *,
+node=None, ...)``. ``node`` says who this service is to Colca —
+architecture principle 1's one-clause test, applied to the client side:
+
+* ``node=None`` (the default) — inside a deployment: the local door
+  (``colca:80``/``colca:1883``, compose DNS), no credential, self-registered
+  by name+mount.
+* ``node="https://..."`` — outside a deployment: the published door
+  (8883/443), a registry-pinned ed25519 identity this Service loads or
+  mints under its own state directory.
+* ``node=LocalDoor(...)`` — an embedded node's own local door. An integrator
+  never constructs this; it is what ``chaski.Node.service()`` passes.
+
+Whichever door, ``publish(path, value, unit=, timestamp=)`` is the same
+implementation: every distinct path becomes a ``DataTag`` (see
 ``catalogue.py``), the catalogue is republished when it grows (content-hash
 guarded, exactly like the connector), and each publish resolves the Signal
 the node minted for that tag — learned from the service's own ``_Signal``
 subscription — before writing ``_Metric`` with ``signal_id``. A path with no
 Signal yet is buffered (bounded) and flushed the moment one binds.
+
+Construction never connects — it stores configuration and, outside a
+deployment, loads-or-mints the identity. ``start()`` (or the context
+manager) is what opens the door; see the design's lifecycle table for what
+happens at each stage.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import os
 import ssl
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import paho.mqtt.client as pahomqtt
+import ulid as ulid_lib
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import NameOID
 from franzmq import Client, Topic
-from colca_data_contracts.local_service import connect_local_mqtt
-from colca_data_contracts.payload import DataTags, Metric
+from colca_data_contracts.local_service import (
+    attach_log_publisher,
+    connect_local_mqtt,
+    resolve_local_identity,
+    service_details_topic,
+)
+from colca_data_contracts.payload import DataTags, Metric, ServiceDetails, ServiceType
 from colca_data_contracts.payload import Signal as SignalRecord
 from colca_data_contracts.service_topics import service_context
 
-from .catalogue import Catalogue
+from .catalogue import Catalogue, element_for
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +77,33 @@ _UNBOUND_LOG_INTERVAL = 300.0
 _MAX_BUFFERED_PER_PATH = 100
 _DEFAULT_EXTERNAL_MQTT_PORT = 8883
 _DEFAULT_EXTERNAL_API_PORT = 443
+_DEFAULT_LOCAL_HTTP_PORT = 80
+_DEFAULT_LOCAL_MQTT_PORT = 1883
+
+
+class NotEnrolled(RuntimeError):
+    """Raised by :meth:`Service.start` when the node refuses this identity's
+    CONNECT — outside a deployment only. The message IS the enroll command
+    an operator runs once; also available bare via :meth:`Service.enroll_hint`."""
+
+    def __init__(self, name: str, node_url: str, command: str) -> None:
+        super().__init__(
+            f"{name} is not enrolled at {node_url}. An operator runs:\n  {command}"
+        )
+        self.command = command
+
+
+@dataclass(frozen=True)
+class LocalDoor:
+    """An embedded node's own local door (SDK design §3.1): host, HTTP port,
+    MQTT port. An integrator never constructs this directly — pass a
+    ``node=`` URL string outside a deployment, or leave ``node`` unset
+    inside one. ``chaski.Node.service()`` is the one caller that builds and
+    passes a ``LocalDoor``."""
+
+    host: str = "colca"
+    http_port: int = _DEFAULT_LOCAL_HTTP_PORT
+    mqtt_port: int = _DEFAULT_LOCAL_MQTT_PORT
 
 
 def _epoch(ts: Any) -> float:
@@ -64,13 +119,10 @@ def _epoch(ts: Any) -> float:
     return float(ts)
 
 
-def _state_home() -> Path:
-    import os
-
+def _default_state_dir(name: str) -> Path:
     override = os.environ.get("COLCA_STATE_DIR")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".colca" / "state"
+    base = Path(override).expanduser() if override else Path.home() / ".colca"
+    return base / "services" / name
 
 
 def _insecure_ssl_context() -> ssl.SSLContext:
@@ -84,28 +136,198 @@ def _insecure_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-class Service:
-    """A publisher on either the local or the external door.
+def _pending_reason(path: str, mount: str, connector_id: str, *, connected: bool) -> str:
+    """The reason a buffered path has no bound Signal yet — pure and testable
+    without a broker (level 2). Three cases, each independently observable
+    from state the SDK already holds:
 
-    Construct with :meth:`local` or :meth:`external` — never directly.
+    * "not enrolled" — outside a deployment, this identity has never
+      completed a CONNECT, so nothing at the node can have happened yet.
+    * "element not yet authored" — the path names a parent (``element_for``
+      is non-empty), so binding first needs the node to author that element
+      (``bindCatalogue``/``authorElementAt``) — a step a mount-level path
+      (already sitting on an element the enrollment/registration authored)
+      does not need.
+    * "awaiting binding" — the tag is on an element the node already has;
+      it is only waiting for `signal/autobind` (or the node's own
+      autobind-on-catalogue-growth trigger) to mint the Signal.
     """
+    if not connected:
+        return "not enrolled"
+    element = element_for(path, mount)
+    if element:
+        return f"element not yet authored: {element!r}"
+    return (
+        "awaiting binding — an operator can run "
+        f"`colca configure signal/autobind --connector {connector_id}` at the node "
+        "if its autobind is off"
+    )
+
+
+def _mint_identity(identity_dir: Path) -> tuple[str, str, Path, Path]:
+    """Load this Service's own external identity from ``identity_dir``,
+    minting one on first use (idempotent — a second call against the same
+    directory returns the identical ulid/pubkey). Mirrors
+    ``colca-keygen -cert``: an ed25519 key (PEM PKCS8) plus a self-signed
+    certificate wrapping it (cert = key container, trust = registry pinning
+    — no CA anywhere at this door). Both files, and the minted ulid, are
+    written 0600 — private material, host-local only."""
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    ulid_path = identity_dir / "ulid"
+    key_path = identity_dir / "identity.key"
+    cert_path = identity_dir / "identity.key.crt"
+
+    if ulid_path.exists() and key_path.exists() and cert_path.exists():
+        ulid = ulid_path.read_text(encoding="utf-8").strip()
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    else:
+        ulid = str(ulid_lib.new())
+        key = Ed25519PrivateKey.generate()
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        key_path.write_bytes(key_pem)
+        key_path.chmod(0o600)
+
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, ulid)])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(hours=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .sign(key, None)
+        )
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        cert_path.chmod(0o600)
+
+        ulid_path.write_text(ulid, encoding="utf-8")
+        ulid_path.chmod(0o600)
+
+    pubkey_hex = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
+    return ulid, pubkey_hex, key_path, cert_path
+
+
+def _node_admin_base(node_url: str, api_port: Optional[int]) -> tuple[str, str]:
+    """(host, base https url) for a node's published API door."""
+    parsed = urlsplit(node_url if "://" in node_url else f"https://{node_url}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"chaski.Service: could not parse a host from {node_url!r}")
+    port = api_port if api_port is not None else (parsed.port or _DEFAULT_EXTERNAL_API_PORT)
+    return host, f"https://{host}:{port}"
+
+
+def _read_node_id(healthz_url: str, timeout: float = 10.0) -> str:
+    request = urllib.request.Request(healthz_url)
+    with urllib.request.urlopen(request, timeout=timeout, context=_insecure_ssl_context()) as response:  # noqa: S310
+        payload = json.load(response)
+    node_id = payload.get("ulid")
+    if not node_id:
+        raise RuntimeError(f"{healthz_url} did not report a node ulid")
+    return str(node_id)
+
+
+def _connect_external_mqtt(
+    host: str, port: int, ulid: str, key_path: Path, cert_path: Path,
+    *, will: Optional[tuple[Topic, ServiceDetails]] = None,
+) -> Client:
+    client = Client(client_id=ulid, protocol=pahomqtt.MQTTv5)
+    client.username_pw_set(ulid)
+    ctx = _insecure_ssl_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    client.tls_set_context(ctx)
+    if will is not None:
+        will_topic, will_payload = will
+        client.will_set(str(will_topic), will_payload.encode(), qos=1, retain=True)
+    client.reconnect_on_failure = True
+    client.reconnect_delay_set(min_delay=1, max_delay=120)
+    client.connect(host=host, port=port, clean_start=False)
+    return client
+
+
+def _revoke_external(node_url: str, ulid: str, token: str, *, api_port: Optional[int] = None,
+                      timeout: float = 15.0) -> None:
+    """``DELETE /enroll/{ulid}`` on the node's admin door — the identical
+    call ``colca external revoke`` makes (node-manager ``commands/node.py``
+    ``revoke``)."""
+    _, base = _node_admin_base(node_url, api_port)
+    request = urllib.request.Request(
+        f"{base}/enroll/{ulid}", method="DELETE", headers={"X-Colca-Token": token},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=timeout, context=_insecure_ssl_context())  # noqa: S310
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"chaski.Service.retire(): revoking {ulid} at {node_url} failed: HTTP {exc.code}"
+        ) from exc
+
+
+class Service:
+    """A publisher on either the local or the external door — one implementation,
+    one constructor. See the module docstring and the SDK design's lifecycle
+    table for what each method does."""
 
     def __init__(
         self,
+        name: str,
+        mount: str = "",
         *,
-        client: Client,
-        node_id: str,
-        mount: str,
-        catalogue_context: tuple[str, ...],
-        connector: str,
-        state_dir: Path,
+        node: Any = None,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        version: Optional[str] = None,
+        logs: bool = True,
+        state_dir: Optional[Path] = None,
+        mqtt_port: Optional[int] = None,
+        api_port: Optional[int] = None,
     ) -> None:
-        self._client = client
-        self._node_id = node_id
+        """``node`` says who this Service is to Colca: ``None`` (default,
+        inside a deployment), a ``node=`` URL string (outside one — the
+        identity is loaded or minted under ``state_dir``), or a
+        :class:`LocalDoor` (an embedded node's own local door — internal,
+        ``chaski.Node.service()`` only).
+
+        ``mqtt_port``/``api_port`` are a deliberate extension beyond the
+        design's three-argument external shape, for a node whose published
+        doors sit behind a non-standard port (a test harness, a port-mapped
+        deployment) — mirrors ``Service.external``'s equivalent keyword
+        arguments in the prior design.
+
+        Construction never touches the network except to load or mint an
+        external identity's own key material on disk — it does not dial the
+        node. See :meth:`start`.
+        """
+        self.name = name
         self._mount = mount
-        self._catalogue_topic = Topic(payload_type=DataTags, node_id=node_id, context=catalogue_context)
+        self.display_name = display_name
+        self.description = description
+        self.version = version
+        self.logs = logs
+        self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
+        self._mqtt_port_override = mqtt_port
+        self._api_port_override = api_port
+
         self._lock = threading.RLock()
-        self._catalogue = Catalogue(Path(state_dir) / "catalogue.json", connector=connector, mount=mount)
+        self._client: Optional[Client] = None
+        self._connected = False
+        self._closed = False
+        self._node_id: Optional[str] = None
+        self._service_id: Optional[str] = None
+        self._system_element_id: Optional[str] = None
+        self._hierarchy: tuple[str, ...] = ()
+        self._catalogue: Optional[Catalogue] = None
+        self._catalogue_topic: Optional[Topic] = None
+        self._details_topic: Optional[Topic] = None
         # tag_id -> (metric Topic, signal id)
         self._bindings: dict[str, tuple[Topic, str]] = {}
         # the SIGNAL's own topic string -> tag_id, so a tombstone (which
@@ -115,102 +337,190 @@ class Service:
         self._buffer: dict[str, deque] = {}
         self._unbound_log_at: dict[str, float] = {}
         self._seen: set[str] = set()
-        self._closed = False
+        self._last_status = "healthy"
+        self._last_detail = ""
 
-    # -- construction ----------------------------------------------------
+        if isinstance(node, LocalDoor):
+            self._external = False
+            self._door: Optional[LocalDoor] = node
+            self._node_url: Optional[str] = None
+            self.ulid: Optional[str] = None
+            self.pubkey: Optional[str] = None
+        elif node is None:
+            self._external = False
+            self._door = LocalDoor()
+            self._node_url = None
+            self.ulid = None
+            self.pubkey = None
+        elif isinstance(node, str):
+            self._external = True
+            self._door = None
+            self._node_url = node
+            self.ulid, self.pubkey, self._key_path, self._cert_path = _mint_identity(
+                self._state_dir / "identity"
+            )
+        else:
+            raise TypeError(
+                f"chaski.Service: node= must be None, a URL string, or LocalDoor, got {node!r}"
+            )
 
-    @classmethod
-    def local(
-        cls,
-        name: str,
-        mount: str = "",
-        *,
-        host: str = "colca",
-        http_port: int = 80,
-        mqtt_port: int = 1883,
-        state_dir: Optional[Path] = None,
-    ) -> "Service":
-        """A publisher inside this deployment: the local door proves the
-        identity, so no credential travels (local-service-trust design)."""
-        client, identity = connect_local_mqtt(
-            name, host=host, http_port=http_port, mqtt_port=mqtt_port, mount=mount
-        )
-        svc = cls(
-            client=client,
-            node_id=identity.node_id,
-            mount=identity.mount,
-            catalogue_context=identity.hierarchy,
-            connector=identity.service_id,
-            state_dir=state_dir or _state_home() / f"local-{name}",
-        )
-        svc._start()
-        return svc
+    # -- lifecycle -----------------------------------------------------
 
-    @classmethod
-    def external(
-        cls,
-        url: str,
-        cert: str,
-        key: str,
-        *,
-        ulid: str,
-        mount: str = "",
-        mqtt_port: int = _DEFAULT_EXTERNAL_MQTT_PORT,
-        api_port: Optional[int] = None,
-        state_dir: Optional[Path] = None,
-    ) -> "Service":
-        """A publisher outside this deployment: a registry-pinned mTLS key
-        is the credential (published door, 8883).
+    def start(self, *, connect_timeout: float = 10.0) -> "Service":
+        """Connect, self-register (local) or authenticate (external), publish
+        the initial retained ``_ServiceDetails``, and subscribe to this
+        service's own ``_Signal`` records. Idempotent — a second call on an
+        already-started Service is a no-op.
 
-        ``ulid`` is the identity's own id — the same value the operator gave
-        ``colca external enroll``, used as the CONNECT username and as the
-        catalogue's ``connector`` id. ``cert``/``key`` are the PEM files
-        ``colca-keygen -cert`` writes (or their equivalent): ``key`` wraps
-        the enrolled ed25519 private key, ``cert`` the self-signed
-        certificate presenting it as a TLS client certificate. ``url`` is
-        the node's own HTTPS API address — used once, unauthenticated, to
-        read the node's ulid off ``GET /healthz`` (every v1 topic needs it
-        at level 4), and to derive the MQTT host.
+        Outside a deployment, a refused CONNECT (the identity is not yet
+        enrolled) raises :class:`NotEnrolled` — see :meth:`wait_enrolled` to
+        poll instead of raising once.
         """
-        host, healthz_url = _external_healthz_url(url, api_port)
-        node_id = _read_node_id(healthz_url)
-        client = _connect_external_mqtt(host, mqtt_port, ulid, cert, key)
-        client.node_id = node_id
-        svc = cls(
-            client=client,
-            node_id=node_id,
-            mount=mount,
-            catalogue_context=service_context(mount, ulid),
-            connector=ulid,
-            state_dir=state_dir or _state_home() / f"external-{ulid}",
+        if self._client is not None:
+            return self
+        if self._external:
+            self._start_external(connect_timeout)
+        else:
+            self._start_local(connect_timeout)
+        return self
+
+    def _start_local(self, connect_timeout: float) -> None:
+        door = self._door
+        assert door is not None  # local mode always carries a door
+        identity = resolve_local_identity(
+            self.name, host=door.host, http_port=door.http_port, mount=self._mount,
         )
-        svc._start()
-        return svc
+        self._node_id = identity.node_id
+        self._service_id = identity.service_id
+        self._system_element_id = identity.system_element_id or None
+        self._hierarchy = identity.hierarchy
+        self._catalogue = Catalogue(
+            self._state_dir / "catalogue.json", connector=identity.service_id, mount=self._mount,
+        )
+        self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
+        self._details_topic = service_details_topic(identity)
 
-    def _start(self, *, connect_timeout: float = 10.0) -> None:
-        mount_parts = tuple(p for p in self._mount.split("/") if p)
-        filter_context = (*mount_parts, "#") if mount_parts else ("#",)
-        signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
+        will_payload = self._build_service_details(is_active=False, status="unhealthy")
+        try:
+            client, _ = connect_local_mqtt(
+                self.name, host=door.host, http_port=door.http_port, mqtt_port=door.mqtt_port,
+                mount=self._mount, identity=identity, publish_logs=self.logs,
+                will=(self._details_topic, will_payload),
+            )
+        except Exception:
+            self._reset_after_failed_connect()
+            raise
+        self._client = client
+        try:
+            self._connect_and_wait(connect_timeout)
+        except Exception:
+            self._reset_after_failed_connect()
+            raise
+        self._after_connect()
 
-        # Subscribing straight after connect()/loop_start() races the
-        # CONNACK: connect() opens the socket and sends CONNECT but does not
-        # wait for the broker's answer, so a SUBSCRIBE sent before it arrives
-        # is a protocol violation the broker is free to drop. Wait for the
-        # (paho v2) on_connect callback instead — franzmq.Client leaves
-        # .on_connect unset unless a caller sets it, so this never collides
-        # with local_service.connect_local_mqtt's own optional on_connect.
+    def _start_external(self, connect_timeout: float) -> None:
+        host, base = _node_admin_base(self._node_url, self._api_port_override)
+        self._node_id = _read_node_id(f"{base}/healthz")
+        self._service_id = self.ulid
+        self._system_element_id = None
+        self._hierarchy = service_context(self._mount, self.ulid)
+        self._catalogue = Catalogue(
+            self._state_dir / "catalogue.json", connector=self.ulid, mount=self._mount,
+        )
+        self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
+        self._details_topic = Topic(
+            payload_type=ServiceDetails, node_id=self._node_id, context=self._hierarchy + ("_service",),
+        )
+
+        will_payload = self._build_service_details(is_active=False, status="unhealthy")
+        port = self._mqtt_port_override or _DEFAULT_EXTERNAL_MQTT_PORT
+        self._client = _connect_external_mqtt(
+            host, port, self.ulid, self._key_path, self._cert_path,
+            will=(self._details_topic, will_payload),
+        )
+        try:
+            self._connect_and_wait(connect_timeout)
+        except Exception:
+            self._reset_after_failed_connect()
+            raise
+        if self.logs:
+            attach_log_publisher(self._client, self._hierarchy)
+        self._after_connect()
+
+    def _connect_and_wait(self, connect_timeout: float) -> None:
         connected = threading.Event()
+        outcome: dict[str, Any] = {}
 
         def _on_connect(_client: Any, _userdata: Any, _flags: Any, reason_code: Any,
                         _properties: Any = None) -> None:
-            if not getattr(reason_code, "is_failure", False):
-                connected.set()
+            outcome["reason_code"] = reason_code
+            connected.set()
 
         self._client.on_connect = _on_connect
         self._client.loop_start()
         if not connected.wait(connect_timeout):
             raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")
+        reason_code = outcome.get("reason_code")
+        if getattr(reason_code, "is_failure", False):
+            if self._external:
+                raise NotEnrolled(self.name, self._node_url, self.enroll_hint())
+            raise RuntimeError(f"chaski.Service: broker refused CONNECT ({reason_code})")
+        self._connected = True
+
+    def _reset_after_failed_connect(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.loop_stop()
+                self._client.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        self._client = None
+        self._connected = False
+
+    def _after_connect(self) -> None:
+        mount_parts = tuple(p for p in self._mount.split("/") if p)
+        filter_context = (*mount_parts, "#") if mount_parts else ("#",)
+        signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
         self._client.subscribe(signal_filter, qos=1, callback=self._on_signal)
+        self._publish_service_details(is_active=True, status="healthy")
+
+    def enroll_hint(self) -> str:
+        """The exact one-liner an operator runs to enroll this identity
+        (also the text of a raised :class:`NotEnrolled`). Outside a
+        deployment only."""
+        if not self._external:
+            raise RuntimeError(
+                "chaski.Service.enroll_hint() only applies outside a deployment (node=<url>)"
+            )
+        mount_flag = f" --mount {self._mount}" if self._mount else ""
+        return (
+            f"colca external enroll {self._node_url} --ulid {self.ulid} "
+            f"--pubkey {self.pubkey}{mount_flag}"
+        )
+
+    def wait_enrolled(self, timeout: float = 60.0, *, poll_interval: float = 2.0) -> "Service":
+        """Poll ``start()`` — reconnecting — until the operator enrolls this
+        identity, or ``timeout`` elapses. Outside a deployment only."""
+        if not self._external:
+            raise RuntimeError(
+                "chaski.Service.wait_enrolled() only applies outside a deployment (node=<url>)"
+            )
+        deadline = time.monotonic() + timeout
+        last_exc: Optional[Exception] = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self.start(connect_timeout=min(10.0, max(1.0, remaining)))
+                return self
+            except NotEnrolled as exc:
+                last_exc = exc
+                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError(
+            f"chaski.Service: {self.name} still not enrolled at {self._node_url} "
+            f"after {timeout:.0f}s" + (f" ({last_exc})" if last_exc else "")
+        )
 
     # -- publishing --------------------------------------------------------
 
@@ -232,6 +542,10 @@ class Service:
         """
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
+        if self._client is None:
+            raise RuntimeError(
+                "chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()"
+            )
         with self._lock:
             tag_id, changed = self._catalogue.ensure(path, value, unit)
             self._seen.add(path)
@@ -261,6 +575,33 @@ class Service:
                 "chaski.Service: %r has no bound Signal yet — buffering (%d queued, capped at %d)",
                 path, len(queue), _MAX_BUFFERED_PER_PATH,
             )
+
+    def pending(self) -> list[tuple[str, str]]:
+        """``(path, reason)`` for every published path with no bound Signal
+        yet — see :func:`_pending_reason` for what each reason means."""
+        with self._lock:
+            connector_id = self._catalogue.connector if self._catalogue is not None else ""
+            return [
+                (path, _pending_reason(path, self._mount, connector_id, connected=self._connected))
+                for path in self._buffer
+            ]
+
+    # -- health --------------------------------------------------------
+
+    def status(self, ok: bool, detail: str = "") -> None:
+        """Republish ``_ServiceDetails`` with ``architecture_metadata.status``
+        healthy/unhealthy (+``detail``) — what the editor's health panel
+        reads (``api/src/edge/models/service.py`` ``derived_health``)."""
+        if self._closed:
+            raise RuntimeError("chaski.Service is closed")
+        if self._client is None:
+            raise RuntimeError(
+                "chaski.Service: call start() (or use `with Service(...) as svc:`) before status()"
+            )
+        self._last_status = "healthy" if ok else "unhealthy"
+        self._last_detail = detail
+        with self._lock:
+            self._publish_service_details(is_active=True, status=self._last_status, detail=detail)
 
     # -- signal binding ------------------------------------------------
 
@@ -321,57 +662,85 @@ class Service:
         self._client.publish(self._catalogue_topic, payload, qos=1, retain=True)
         self._catalogue.record_published(revision)
 
-    # -- lifecycle -----------------------------------------------------
+    # -- ServiceDetails --------------------------------------------------
+
+    def _build_service_details(self, *, is_active: bool, status: str, detail: str = "") -> ServiceDetails:
+        metadata: dict[str, Any] = {}
+        if self.version:
+            metadata["version"] = self.version
+        architecture_metadata: dict[str, Any] = {"status": status}
+        if detail:
+            architecture_metadata["detail"] = detail
+        return ServiceDetails(
+            id=self._service_id,
+            name=self.name,
+            service_type=ServiceType.CONNECTOR,
+            colca_node_id=self._node_id,
+            display_name=self.display_name or "",
+            description=self.description or "",
+            system_element_id=self._system_element_id,
+            hierarchy=list(self._hierarchy),
+            is_active=is_active,
+            metadata=metadata,
+            architecture_metadata=architecture_metadata,
+        )
+
+    def _publish_service_details(self, *, is_active: bool, status: str, detail: str = "") -> None:
+        details = self._build_service_details(is_active=is_active, status=status, detail=detail)
+        self._client.publish(self._details_topic, details, qos=1, retain=True)
+
+    # -- lifecycle: shutdown -----------------------------------------------
 
     def close(self) -> None:
         """Seal the catalogue (any known path not published this run goes
-        stale) and disconnect. Idempotent."""
+        stale), republish ``_ServiceDetails`` with ``is_active=False``, and
+        disconnect. Registration and ids stay. Idempotent."""
         if self._closed:
             return
         self._closed = True
         with self._lock:
-            if self._catalogue.seal(self._seen):
-                self._republish_catalogue()
-        try:
-            self._client.loop_stop()
-            self._client.disconnect()
-        except Exception:  # noqa: BLE001 - best-effort teardown
-            logger.debug("chaski.Service: disconnect raised during close()", exc_info=True)
+            if self._client is not None:
+                if self._catalogue.seal(self._seen):
+                    self._republish_catalogue()
+                self._publish_service_details(is_active=False, status=self._last_status)
+        self._disconnect_client()
+
+    def retire(self, token: Optional[str] = None) -> None:
+        """A deliberate end, not a restart: tombstone this service's own
+        ``_ServiceDetails`` and ``_DataTags`` (empty retained payloads) so
+        the editor forgets it entirely. Outside a deployment, also
+        revokes the enrollment through the node's admin door — the same one
+        ``colca external revoke`` uses — which needs ``token`` (raises
+        without one). Not part of the context manager: this is an explicit
+        decision, never implied by ``__exit__``.
+        """
+        if self._external and not token:
+            raise RuntimeError(
+                "chaski.Service.retire() outside a deployment needs the node's admin token "
+                "(the same one `colca external revoke` uses)"
+            )
+        if self._closed:
+            raise RuntimeError("chaski.Service: cannot retire() a closed service")
+        self._closed = True
+        with self._lock:
+            if self._client is not None:
+                self._client.publish_tombstone(self._details_topic, qos=1)
+                self._client.publish_tombstone(self._catalogue_topic, qos=1)
+        self._disconnect_client()
+        if self._external and token:
+            _revoke_external(self._node_url, self.ulid, token, api_port=self._api_port_override)
+
+    def _disconnect_client(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.loop_stop()
+                self._client.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                logger.debug("chaski.Service: disconnect raised during teardown", exc_info=True)
+        self._connected = False
 
     def __enter__(self) -> "Service":
-        return self
+        return self.start()
 
     def __exit__(self, *exc_info: Any) -> None:
         self.close()
-
-
-def _external_healthz_url(url: str, api_port: Optional[int]) -> tuple[str, str]:
-    parsed = urlsplit(url if "://" in url else f"https://{url}")
-    host = parsed.hostname
-    if not host:
-        raise ValueError(f"chaski.Service.external: could not parse a host from {url!r}")
-    port = api_port if api_port is not None else (parsed.port or _DEFAULT_EXTERNAL_API_PORT)
-    return host, f"https://{host}:{port}/healthz"
-
-
-def _read_node_id(healthz_url: str, timeout: float = 10.0) -> str:
-    request = urllib.request.Request(healthz_url)
-    with urllib.request.urlopen(request, timeout=timeout, context=_insecure_ssl_context()) as response:
-        payload = json.load(response)
-    node_id = payload.get("ulid")
-    if not node_id:
-        raise RuntimeError(f"{healthz_url} did not report a node ulid")
-    return str(node_id)
-
-
-def _connect_external_mqtt(host: str, port: int, ulid: str, cert: str, key: str) -> Client:
-    client = Client(client_id=ulid, protocol=pahomqtt.MQTTv5)
-    client.username_pw_set(ulid)
-    ctx = _insecure_ssl_context()
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    ctx.load_cert_chain(certfile=cert, keyfile=key)
-    client.tls_set_context(ctx)
-    client.reconnect_on_failure = True
-    client.reconnect_delay_set(min_delay=1, max_delay=120)
-    client.connect(host=host, port=port, clean_start=False)
-    return client

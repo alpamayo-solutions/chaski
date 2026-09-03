@@ -7,7 +7,7 @@ access to the editor API. ``Service`` and ``Node`` publish data: a
 
 from .node import Node
 from .profiles import Profile, ProfileStore
-from .service import Service
+from .service import LocalDoor, NotEnrolled, Service
 from .edit import Edit
 
-__all__ = ["Edit", "Service", "Node", "Profile", "ProfileStore"]
+__all__ = ["Edit", "Service", "Node", "Profile", "ProfileStore", "LocalDoor", "NotEnrolled"]

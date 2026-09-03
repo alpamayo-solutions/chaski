@@ -45,7 +45,7 @@ from typing import Any, Optional, Union
 import ulid as ulid_lib
 import yaml
 
-from .service import Service
+from .service import LocalDoor, Service
 
 logger = logging.getLogger(__name__)
 
@@ -565,14 +565,14 @@ class Node:
         self._check_alive()
         if not self._ports:
             raise RuntimeError("chaski.Node.service() needs a started node (call start() first)")
-        return Service.local(
-            name,
-            mount,
+        door = LocalDoor(
             host="127.0.0.1",
             http_port=self._ports["api_local"],
             mqtt_port=self._ports["mqtt_local"],
-            state_dir=self.data_dir / "services" / name,
         )
+        svc = Service(name, mount, node=door, state_dir=self.data_dir / "services" / name)
+        svc.start()
+        return svc
 
 
 def _existing_ports(existing: Optional[dict[str, Any]]) -> Optional[dict[str, int]]:
