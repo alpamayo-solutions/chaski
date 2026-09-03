@@ -321,6 +321,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+node = [
+    { name = "colcad" },
+]
 test = [
     { name = "colca-data-contracts" },
     { name = "pytest" },
@@ -331,12 +334,18 @@ requires-dist = [
     { name = "franzmq", specifier = "==0.6.2" },
     { name = "keyring", specifier = ">=25,<27" },
     { name = "paho-mqtt", specifier = "==2.1.0" },
+    { name = "colcad", marker = "extra == 'node'", directory = "../colca/pywheel" },
     { name = "colca-data-contracts", marker = "extra == 'test'", directory = "../colca-data-contracts" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4,<10" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ulid-py", specifier = ">=1.1" },
 ]
-provides-extras = ["test"]
+provides-extras = ["test", "node"]
+
+[[package]]
+name = "colcad"
+version = "0.0.0"
+source = { directory = "../colca/pywheel" }
 
 [[package]]
 name = "colca-data-contracts"

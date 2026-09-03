@@ -23,9 +23,24 @@ test = [
   # generated deployment's Docker build copies it too). Tests resolve it via [tool.uv.sources] below.
   "colca-data-contracts",
 ]
+# `chaski[node]` (SDK design §6/§7 gap 5): the colcad binary, per platform,
+# so `chaski.Node` needs no separate download or system install. Locally
+# this resolves to colca/pywheel's bare SOURCE (see [tool.uv.sources] below)
+# — importable, but with no `bin/colcad` inside, since only
+# scripts/build_colcad_wheels.py's Go cross-compile actually populates that
+# (chaski.Node._resolve_colcad_binary() checks the file exists before
+# trusting it, and falls through to COLCAD_BINARY/PATH otherwise — local
+# development and tests use COLCAD_BINARY). The version pin here is a
+# placeholder matching colca/pywheel/pyproject.toml's own; the CI-built
+# release wheel gets the real one, matching this exact release, from
+# scripts/build_edit_client.py.
+node = [
+  "colcad==0.0.0",
+]
 
 [tool.uv.sources]
 colca-data-contracts = { path = "../colca-data-contracts" }
+colcad = { path = "../colca/pywheel" }
 
 [build-system]
 requires = ["setuptools>=77"]
