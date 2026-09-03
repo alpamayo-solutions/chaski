@@ -105,7 +105,7 @@ class Service:
         self._mount = mount
         self._catalogue_topic = Topic(payload_type=DataTags, node_id=node_id, context=catalogue_context)
         self._lock = threading.RLock()
-        self._catalogue = Catalogue(Path(state_dir) / "catalogue.json", connector=connector)
+        self._catalogue = Catalogue(Path(state_dir) / "catalogue.json", connector=connector, mount=mount)
         # tag_id -> (metric Topic, signal id)
         self._bindings: dict[str, tuple[Topic, str]] = {}
         # the SIGNAL's own topic string -> tag_id, so a tombstone (which

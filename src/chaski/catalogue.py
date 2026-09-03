@@ -33,13 +33,22 @@ def infer_data_type(value: Any) -> str:
     return "string"
 
 
-def element_for(path: str) -> str:
-    """The path's parent (SDK design §3 rule 2) — "" for a top-level path,
-    which leaves the tag unplaced (the node binds it at the service's own
-    mount, architecture principle 6)."""
+def element_for(path: str, mount: str = "") -> str:
+    """The path's parent, joined onto ``mount`` to make it node-local (SDK
+    design §3 rule 2): the node resolves ``meta.element`` as a node-local
+    path (``exec_configure.go`` ``elementAt``/``authorElementAt``), so a
+    mount-relative parent sent as-is would miss for every service that is
+    not bound at the node's root. "" for a top-level path — no parent means
+    no ``meta.element`` at all, which leaves the tag placed at the service's
+    own mount, whatever that is (architecture principle 6); joining an empty
+    parent with a mount would wrongly turn "no parent" into "the mount
+    itself"."""
     if "/" not in path:
         return ""
-    return path.rsplit("/", 1)[0]
+    parent = path.rsplit("/", 1)[0]
+    if not mount:
+        return parent
+    return f"{mount}/{parent}"
 
 
 @dataclass
@@ -63,9 +72,10 @@ class Catalogue:
     ``_finalize_catalogue`` does with a vanished connector tag.
     """
 
-    def __init__(self, path: Path, *, connector: str) -> None:
+    def __init__(self, path: Path, *, connector: str, mount: str = "") -> None:
         self._path = path
         self.connector = connector
+        self._mount = mount
         self._entries: dict[str, _Entry] = {}
         self.last_published_revision: Optional[str] = None
         self._load()
@@ -147,7 +157,7 @@ class Catalogue:
         for source, entry in self._entries.items():
             leaf = source.rsplit("/", 1)[-1]
             meta: dict[str, Any] = {}
-            element = element_for(source)
+            element = element_for(source, self._mount)
             if element:
                 meta["element"] = element
             if entry.unit is not None:

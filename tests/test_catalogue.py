@@ -21,6 +21,38 @@ def test_element_for_is_the_paths_parent_or_empty_for_a_top_level_path():
     assert element_for("temp") == ""
 
 
+def test_element_for_joins_the_mount_to_make_the_parent_node_local():
+    # The node resolves meta.element as a NODE-LOCAL path (exec_configure.go
+    # elementAt/authorElementAt), so a mounted service's parent must be
+    # joined onto its mount before it is sent, or the node looks for a
+    # root-level element that was never meant (SDK design §3 gap 1).
+    assert element_for("press3/temp", mount="line1") == "line1/press3"
+    # A top-level path has no parent at all — no meta.element, not "the
+    # mount itself" — so nothing is joined.
+    assert element_for("temp", mount="line1") == ""
+    # An unplaced service (mount "") is the identity join: joinPath("", x) == x.
+    assert element_for("press3/temp", mount="") == "press3"
+
+
+def test_data_tags_emit_the_mount_joined_element_for_a_mounted_catalogue(tmp_path):
+    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1", mount="line1")
+    cat.ensure("press3/temp", 21.5)
+
+    tag = cat.data_tags()[0]
+    assert tag.meta["element"] == "line1/press3"
+
+
+def test_data_tags_emit_no_element_for_a_top_level_path_on_a_mounted_catalogue(tmp_path):
+    # No parent means the tag stays placed at the service's own mount, which
+    # the node already does by default when meta.element is absent —
+    # sending "line1" here would wrongly narrow it to the mount itself.
+    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1", mount="line1")
+    cat.ensure("temp", 21.5)
+
+    tag = cat.data_tags()[0]
+    assert "element" not in tag.meta
+
+
 def test_a_new_path_mints_a_stable_id_reused_across_restarts(tmp_path):
     path = tmp_path / "catalogue.json"
 
