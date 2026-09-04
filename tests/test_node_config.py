@@ -54,17 +54,18 @@ def test_no_parent_means_no_parent_block(tmp_path):
 def test_an_explicit_parent_tuple_is_carried_into_the_uplink_block(tmp_path):
     node = Node(
         "erp-bridge",
-        parent=("https://hub.example", "abc123"),
+        parent=("https://hub.example:19743", "abc123"),
         data_dir=tmp_path / "n",
     )
     node._write_config()
 
     doc = _load(node)
-    # The CONFIG's parent.url is the fixed replication door (9443) on the
-    # same host — what colcad's uplink actually dials — while
-    # node.parent_url stays the API/enrollment door the caller gave
-    # (enroll_hint()/retire_hint() print that one, not the repl one).
-    assert doc["parent"] == {"url": "https://hub.example:9443", "pubkey": "abc123"}
+    # An explicit pin names the parent's REPLICATION door as reachable from
+    # here (a remapped host port, a tunnel) and is carried VERBATIM into the
+    # config — no ":9443" convention applied; only a bare-URL TOFU parent
+    # derives the fixed door. node.parent_url is that host's API/enrollment
+    # door (enroll_hint()/retire_hint() print that one, not the repl one).
+    assert doc["parent"] == {"url": "https://hub.example:19743", "pubkey": "abc123"}
     assert node.parent_url == "https://hub.example"
     assert node.parent_pubkey == "abc123"
 

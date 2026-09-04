@@ -19,8 +19,11 @@ operator runs on the PARENT (:meth:`Node.enroll_hint`, closing the loop with
   directory. Every later ``start()`` re-checks that URL still presents the
   same key and refuses a mismatch (the standard SSH TOFU contract: the trust
   DECISION is made once, but a changed key is never accepted silently).
-- ``(url, pubkey)`` — an explicit pin. This IS the re-pin mechanism a mismatch
-  error tells the caller to use.
+- ``(url, pubkey)`` — an explicit pin: the parent's REPLICATION door as
+  reachable from here and its pubkey, the two values ``colca node enroll``
+  prints, used verbatim (a host process behind a port remap cannot derive
+  that door from the parent's own address). This IS the re-pin mechanism a
+  mismatch error tells the caller to use.
 """
 
 from __future__ import annotations
@@ -165,6 +168,16 @@ def _short(hexstr: str) -> str:
 _REPL_PORT = 9443
 
 
+def _api_url(repl_url: str) -> str:
+    """The parent's API/enrollment door for the same host as an explicit
+    replication-door pin: scheme and host, the API door's default port —
+    what enroll_hint()/retire_hint() print."""
+    parsed = urllib.parse.urlsplit(repl_url if "://" in repl_url else f"https://{repl_url}")
+    if not parsed.hostname:
+        raise ValueError(f"chaski.Node: could not parse a host out of parent url {repl_url!r}")
+    return f"{parsed.scheme}://{parsed.hostname}"
+
+
 def _repl_url(api_url: str) -> str:
     parsed = urllib.parse.urlsplit(api_url if "://" in api_url else f"https://{api_url}")
     if not parsed.hostname:
@@ -279,6 +292,9 @@ class Node:
             return None
 
         if isinstance(self._parent_arg, tuple):
+            # An explicit pin names the parent's REPLICATION door verbatim —
+            # the operator knows how the parent is reachable from here (a
+            # remapped host port, a tunnel); no convention is applied.
             url, pubkey = self._parent_arg
             existing = self._read_pin()
             if existing and existing.get("url") == url and existing.get("pubkey") != pubkey:
@@ -287,8 +303,8 @@ class Node:
                     url, _short(existing["pubkey"]), _short(pubkey),
                 )
             self._write_pin(url, pubkey)
-            self.parent_url, self.parent_pubkey = url, pubkey
-            return {"url": _repl_url(url), "pubkey": pubkey}
+            self.parent_url, self.parent_pubkey = _api_url(url), pubkey
+            return {"url": url, "pubkey": pubkey}
 
         url = self._parent_arg
         existing = self._read_pin()
