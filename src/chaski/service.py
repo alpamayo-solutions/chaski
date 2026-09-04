@@ -317,6 +317,22 @@ class Service:
         self._mqtt_port_override = mqtt_port
         self._api_port_override = api_port
 
+        # _publish_outside_the_lock — the one threading rule this class has.
+        #
+        # This lock guards the catalogue, the bindings and the buffer, and it
+        # is taken by TWO threads: the caller's, and the MQTT network thread
+        # that runs `_on_signal`. A qos=1 publish waits for its PUBACK, and the
+        # PUBACK is read by that same network thread — so holding this lock
+        # across a waiting publish deadlocks the pair: the caller waits for a
+        # PUBACK the network thread cannot deliver because it is blocked on
+        # the lock the caller holds. It costs the full publish_timeout and
+        # then surfaces as `PublishTimeout` on an unrelated topic, which is
+        # what made it look like a broker fault rather than our own.
+        #
+        # So: decide under the lock, publish outside it. Every waiting publish
+        # in this class (catalogue, ServiceDetails, metric, tombstones) is
+        # reached with the lock released, and the helpers that do the
+        # publishing say so in their own docstrings.
         self._lock = threading.RLock()
         self._client: Optional[Client] = None
         self._connected = False
@@ -482,7 +498,7 @@ class Service:
         filter_context = (*mount_parts, "#") if mount_parts else ("#",)
         signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
         self._client.subscribe(signal_filter, qos=1, callback=self._on_signal)
-        self._publish_service_details(is_active=True, status="healthy")
+        self._publish_details(self._build_service_details(is_active=True, status="healthy"))
 
     def enroll_hint(self) -> str:
         """The exact one-liner an operator runs to enroll this identity
@@ -549,13 +565,18 @@ class Service:
         with self._lock:
             tag_id, changed = self._catalogue.ensure(path, value, unit)
             self._seen.add(path)
-            if changed:
-                self._republish_catalogue()
+            catalogue = self._catalogue_to_publish() if changed else None
             binding = self._bindings.get(tag_id)
             if binding is None:
                 self._buffer_sample(path, value, timestamp)
-                return
-            topic, signal_id = binding
+        # Outside the lock — see _publish_outside_the_lock. The catalogue goes
+        # first either way: it is what makes the node mint the Signal this
+        # sample binds to, so a buffered sample still has to publish it.
+        if catalogue is not None:
+            self._publish_catalogue(catalogue)
+        if binding is None:
+            return
+        topic, signal_id = binding
         self._publish_metric(topic, signal_id, value, timestamp)
 
     def _publish_metric(
@@ -601,7 +622,8 @@ class Service:
         self._last_status = "healthy" if ok else "unhealthy"
         self._last_detail = detail
         with self._lock:
-            self._publish_service_details(is_active=True, status=self._last_status, detail=detail)
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=detail)
+        self._publish_details(details)
 
     # -- signal binding ------------------------------------------------
 
@@ -654,13 +676,23 @@ class Service:
 
     # -- catalogue ---------------------------------------------------------
 
-    def _republish_catalogue(self) -> None:
+    def _catalogue_to_publish(self) -> Optional[tuple[Any, Any]]:
+        """Under the caller's lock: the catalogue that still needs publishing
+        (payload and its revision), or None when the last publish already
+        carried this content. Decides only — the publish itself belongs
+        outside the lock (:meth:`_publish_catalogue`)."""
         payload = self._catalogue.payload()
         revision = payload.version
         if revision == self._catalogue.last_published_revision:
-            return
+            return None
+        return payload, revision
+
+    def _publish_catalogue(self, prepared: tuple[Any, Any]) -> None:
+        """OUTSIDE the lock — see _publish_outside_the_lock."""
+        payload, revision = prepared
         self._client.publish(self._catalogue_topic, payload, qos=1, retain=True)
-        self._catalogue.record_published(revision)
+        with self._lock:
+            self._catalogue.record_published(revision)
 
     # -- ServiceDetails --------------------------------------------------
 
@@ -685,8 +717,8 @@ class Service:
             architecture_metadata=architecture_metadata,
         )
 
-    def _publish_service_details(self, *, is_active: bool, status: str, detail: str = "") -> None:
-        details = self._build_service_details(is_active=is_active, status=status, detail=detail)
+    def _publish_details(self, details: ServiceDetails) -> None:
+        """OUTSIDE the lock — see _publish_outside_the_lock."""
         self._client.publish(self._details_topic, details, qos=1, retain=True)
 
     # -- lifecycle: shutdown -----------------------------------------------
@@ -699,10 +731,22 @@ class Service:
             return
         self._closed = True
         with self._lock:
-            if self._client is not None:
-                if self._catalogue.seal(self._seen):
-                    self._republish_catalogue()
-                self._publish_service_details(is_active=False, status=self._last_status)
+            client = self._client
+            catalogue = (
+                self._catalogue_to_publish()
+                if client is not None and self._catalogue.seal(self._seen)
+                else None
+            )
+            details = (
+                self._build_service_details(is_active=False, status=self._last_status)
+                if client is not None
+                else None
+            )
+        # Outside the lock — see _publish_outside_the_lock.
+        if catalogue is not None:
+            self._publish_catalogue(catalogue)
+        if details is not None:
+            self._publish_details(details)
         self._disconnect_client()
 
     def retire(self, token: Optional[str] = None) -> None:
@@ -723,9 +767,11 @@ class Service:
             raise RuntimeError("chaski.Service: cannot retire() a closed service")
         self._closed = True
         with self._lock:
-            if self._client is not None:
-                self._client.publish_tombstone(self._details_topic, qos=1)
-                self._client.publish_tombstone(self._catalogue_topic, qos=1)
+            client = self._client
+        # Outside the lock — see _publish_outside_the_lock.
+        if client is not None:
+            client.publish_tombstone(self._details_topic, qos=1)
+            client.publish_tombstone(self._catalogue_topic, qos=1)
         self._disconnect_client()
         if self._external and token:
             _revoke_external(self._node_url, self.ulid, token, api_port=self._api_port_override)
