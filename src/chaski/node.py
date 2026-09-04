@@ -29,6 +29,7 @@ operator runs on the PARENT (:meth:`Node.enroll_hint`, closing the loop with
 from __future__ import annotations
 
 import json
+import os
 import logging
 import secrets
 import shutil
@@ -98,6 +99,33 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+_COLCAD_BUNDLE_ENV = "COLCAD_CONTRACTS_BUNDLE"
+
+
+def _resolve_contracts_bundle() -> str:
+    """Where colcad's contracts bundle comes from, in order: an explicit
+    override (``COLCAD_CONTRACTS_BUNDLE``), then the bundle ``colcad``
+    ships beside its binary. A colcad started without a bundle runs on the
+    builtin floor and rejects every Colca contract — the node would enroll
+    and then refuse its own service's catalogue — so this fails loudly
+    instead of writing a config without one."""
+    override = os.environ.get(_COLCAD_BUNDLE_ENV)
+    if override:
+        return override
+    try:
+        from colcad import BUNDLE_PATH  # type: ignore[import-not-found]
+    except ImportError:
+        BUNDLE_PATH = None
+    if BUNDLE_PATH is not None and Path(BUNDLE_PATH).exists():
+        return str(BUNDLE_PATH)
+    raise RuntimeError(
+        "chaski.Node could not find colcad's contracts bundle. Install `chaski[node]` "
+        f"for your platform (it ships the bundle beside the binary) or set {_COLCAD_BUNDLE_ENV} "
+        "to a contracts-bundle.json generated from the same source as the colcad binary "
+        "(`uv run scripts/dev.py bundle --out <path>`)."
+    )
 
 
 def _resolve_colcad_binary() -> str:
@@ -227,6 +255,7 @@ class Node:
         retention: Optional[str] = None,
         log_level: str = "info",
         binary: Optional[str] = None,
+        contracts_bundle: Optional[str] = None,
     ) -> None:
         """``parent`` is ``None`` (root / not yet enrolled), a bare URL
         (trust-on-first-use), or ``(url, pubkey)`` (an explicit pin — see the
@@ -239,6 +268,7 @@ class Node:
         self.retention = retention
         self.log_level = log_level
         self._binary = binary
+        self._contracts_bundle = contracts_bundle
 
         self._process: Optional[subprocess.Popen] = None
         self.ulid: Optional[str] = None
@@ -369,6 +399,7 @@ class Node:
             "name": self.name,
             "data_dir": str(self.data_dir / "store"),
             "key_file": str(self.data_dir / "node.key"),
+            "contracts": {"bundle": self._contracts_bundle or _resolve_contracts_bundle()},
             "log_level": self.log_level,
             "api": {
                 "addr": f"127.0.0.1:{self._ports['api']}",

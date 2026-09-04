@@ -492,3 +492,29 @@ def test_a_crashing_binary_is_reported_as_crashed(tmp_path):
 
     with pytest.raises((RuntimeError, TimeoutError), match="boom|exit|healthy"):
         node.start(timeout=5.0)
+
+
+# -- the contracts bundle -----------------------------------------------------
+
+
+def test_the_config_points_colcad_at_the_contracts_bundle(tmp_path, monkeypatch):
+    """A colcad without a bundle runs on the builtin floor and rejects every
+    Colca contract (the embedded node enrolled fine and then refused its own
+    service's _DataTags, level 4): the config names the bundle, from the env
+    override here, from the colcad package otherwise."""
+    monkeypatch.setenv("COLCAD_CONTRACTS_BUNDLE", "/from/env/contracts-bundle.json")
+    node = Node("erp-bridge", data_dir=tmp_path / "n")
+    node._write_config()
+    assert _load(node)["contracts"] == {"bundle": "/from/env/contracts-bundle.json"}
+
+    explicit = Node("erp-bridge", data_dir=tmp_path / "m", contracts_bundle="/explicit/bundle.json")
+    explicit._write_config()
+    assert _load(explicit)["contracts"] == {"bundle": "/explicit/bundle.json"}
+
+
+def test_a_missing_contracts_bundle_is_refused_before_colcad_starts(tmp_path, monkeypatch):
+    monkeypatch.delenv("COLCAD_CONTRACTS_BUNDLE", raising=False)
+    monkeypatch.setitem(sys.modules, "colcad", None)  # not installed
+    node = Node("erp-bridge", data_dir=tmp_path / "n")
+    with pytest.raises(RuntimeError, match="contracts bundle"):
+        node._write_config()
