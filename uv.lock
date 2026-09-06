@@ -176,16 +176,16 @@ wheels = [
 
 [[package]]
 name = "franzmq"
-version = "0.6.2"
+version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "paho-mqtt" },
     { name = "python-decouple" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/fd/e8564fe31085d7cc034ce24dd6e19627729f853152b32bd089843a99c10d/franzmq-0.6.2.tar.gz", hash = "sha256:ffe1d2bdc6317c51889e1f9a936d54552a733e16ae74c6b421a4e9fffea8d94b", size = 33465, upload-time = "2026-08-17T17:06:07.914Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/de/606145a22c98ded5e36cb13b52d651352f98fd115f61418451ea3f6c83cf/franzmq-0.6.3.tar.gz", hash = "sha256:1f664147a4b102ed94762d9cf58e50c3c738244a7504fa33ed1b1b1c87d50d4e", size = 35321, upload-time = "2026-09-06T13:45:13.812Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/6d/aca0581aa4efc3dcf35e3cd5f5cee7320a41b98ab941a0d7013db313494c/franzmq-0.6.2-py3-none-any.whl", hash = "sha256:d0294ec78a6f8f4b438b921ef70d68385544b04e0297b8bc4cc5a59463daf527", size = 25805, upload-time = "2026-08-17T17:06:06.811Z" },
+    { url = "https://files.pythonhosted.org/packages/54/da/8df86c0257cbe20e47f8fe264fb69f73b077e1caae2832160a67d997b5f9/franzmq-0.6.3-py3-none-any.whl", hash = "sha256:b15cd90a006f34bc5c0cbdd9331a47fe548383cad5506227cddb21c42ef7ffc9", size = 26497, upload-time = "2026-09-06T13:45:12.573Z" },
 ]
 
 [[package]]
@@ -333,7 +333,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=42" },
-    { name = "franzmq", specifier = "==0.6.2" },
+    { name = "franzmq", specifier = "==0.6.3" },
     { name = "keyring", specifier = ">=25,<27" },
     { name = "paho-mqtt", specifier = "==2.1.0" },
     { name = "colcad", marker = "extra == 'node'", directory = "../colca/pywheel" },
