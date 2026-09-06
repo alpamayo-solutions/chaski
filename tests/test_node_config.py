@@ -442,12 +442,20 @@ FAKE_COLCAD = textwrap.dedent(
         def log_message(self, *a):
             pass
 
+    # Like the real colcad: every door is configured `:0`, the fake binds
+    # what the kernel gives it and REPORTS the result through addr_file.
+    import os
+    addr_file = None
     with open(config_path) as f:
         for line in f:
-            if "local_addr" in line:
-                port = int(line.strip().split(":")[-1].strip('"'))
-                break
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+            if line.startswith("addr_file:"):
+                addr_file = line.split(":", 1)[1].strip().strip("'").strip(chr(34))
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    addresses = {door: f"127.0.0.1:{port}" for door in ("api", "api_local", "mqtt", "mqtt_local", "repl")}
+    with open(addr_file + ".tmp", "w") as f:
+        json.dump(addresses, f)
+    os.replace(addr_file + ".tmp", addr_file)
     print("fake colcad up", flush=True)
     server.serve_forever()
     """

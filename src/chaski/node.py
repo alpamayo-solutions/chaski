@@ -33,7 +33,6 @@ import os
 import logging
 import secrets
 import shutil
-import socket
 import ssl
 import subprocess
 import threading
@@ -89,16 +88,6 @@ class NodeStatus:
 
     state: str
     detail: Optional[str] = None
-
-
-def _free_port() -> int:
-    """A currently-free loopback TCP port. Small race (freed, then handed to
-    colcad) — the same pattern most local dev tooling accepts; ports are
-    persisted in config.yaml once picked so a restart does not reshuffle
-    them."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 _COLCAD_BUNDLE_ENV = "COLCAD_CONTRACTS_BUNDLE"
@@ -386,13 +375,15 @@ class Node:
         existing = self._load_existing()
         self.ulid = (existing or {}).get("ulid") or str(ulid_lib.new())
         self.admin_token = (existing or {}).get("api", {}).get("token") or secrets.token_hex(32)
-        self._ports = _existing_ports(existing) or {
-            "api": _free_port(),
-            "api_local": _free_port(),
-            "mqtt": _free_port(),
-            "mqtt_local": _free_port(),
-            "repl": _free_port(),
-        }
+        # Every door is `:0`: the KERNEL picks the ports, colcad reports them
+        # through `addr_file`, and start() reads them back. This used to pick
+        # "free" ports here by binding and releasing each in turn — and on
+        # Linux the kernel hands the port you just released straight back to
+        # the next bind, so two doors got one port and the Service spoke MQTT
+        # to what was actually the node's own HTTP door. CI only, never on a
+        # Mac, and the same class of bug as colca's WebSocket door race
+        # (#530): a port is owned by whoever holds it bound, and nothing else.
+        self._ports = {}
         parent = self._resolve_parent()
         doc: dict[str, Any] = {
             "ulid": self.ulid,
@@ -402,13 +393,14 @@ class Node:
             "contracts": {"bundle": self._contracts_bundle or _resolve_contracts_bundle()},
             "log_level": self.log_level,
             "api": {
-                "addr": f"127.0.0.1:{self._ports['api']}",
-                "local_addr": f"127.0.0.1:{self._ports['api_local']}",
+                "addr": "127.0.0.1:0",
+                "local_addr": "127.0.0.1:0",
                 "token": self.admin_token,
             },
-            "mqtt": {"addr": f"127.0.0.1:{self._ports['mqtt']}"},
-            "mqtt_local": {"addr": f"127.0.0.1:{self._ports['mqtt_local']}"},
-            "repl": {"addr": f"127.0.0.1:{self._ports['repl']}"},
+            "mqtt": {"addr": "127.0.0.1:0"},
+            "mqtt_local": {"addr": "127.0.0.1:0"},
+            "repl": {"addr": "127.0.0.1:0"},
+            "addr_file": str(self._addr_file()),
             "plugin": {"autobind": _AUTOBIND},
         }
         if self.retention:
@@ -425,6 +417,10 @@ class Node:
             return self
         binary = self._binary or _resolve_colcad_binary()
         self._write_config()
+        # A file from a previous run would name doors that are gone. colcad
+        # rewrites it once ITS listeners are up; until then there must be
+        # nothing to read.
+        self._addr_file().unlink(missing_ok=True)
         self._log_writer = _RotatingLogWriter(self.data_dir / "colcad.log")
         self._process = subprocess.Popen(  # noqa: S603 - binary is resolved above, not shell-interpreted
             [binary, str(self._config_path())],
@@ -436,11 +432,35 @@ class Node:
         )
         self._log_thread.start()
         try:
+            self._wait_addresses(timeout)
             self._wait_healthy(timeout)
         except Exception:
             self.stop()
             raise
         return self
+
+    def _addr_file(self) -> Path:
+        return self.data_dir / "addresses.json"
+
+    def _wait_addresses(self, timeout: float) -> None:
+        """Learn where colcad's doors landed. The file is written atomically
+        once every listener is bound, so its existence means it is complete."""
+        deadline = time.monotonic() + timeout
+        path = self._addr_file()
+        while time.monotonic() < deadline:
+            if self._process is not None and self._process.poll() is not None:
+                raise RuntimeError(self._crash_message(self._process.returncode))
+            if path.exists():
+                addresses = json.loads(path.read_text(encoding="utf-8"))
+                self._ports = {
+                    door: int(addresses[door].rsplit(":", 1)[1])
+                    for door in ("api", "api_local", "mqtt", "mqtt_local", "repl")
+                }
+                return
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"chaski.Node: colcad did not report its door addresses at {path} within {timeout:.0f}s"
+        )
 
     def _drain_log(self, pipe: Any) -> None:
         """Runs on its own thread for the process's whole life: colcad's
@@ -622,16 +642,3 @@ class Node:
         return svc
 
 
-def _existing_ports(existing: Optional[dict[str, Any]]) -> Optional[dict[str, int]]:
-    if not existing:
-        return None
-    try:
-        return {
-            "api": int(existing["api"]["addr"].rsplit(":", 1)[1]),
-            "api_local": int(existing["api"]["local_addr"].rsplit(":", 1)[1]),
-            "mqtt": int(existing["mqtt"]["addr"].rsplit(":", 1)[1]),
-            "mqtt_local": int(existing["mqtt_local"]["addr"].rsplit(":", 1)[1]),
-            "repl": int(existing["repl"]["addr"].rsplit(":", 1)[1]),
-        }
-    except (KeyError, ValueError, IndexError):
-        return None
