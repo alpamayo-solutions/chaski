@@ -16,16 +16,31 @@ architecture principle 1's one-clause test, applied to the client side:
 
 Whichever door, ``publish(path, value, unit=, timestamp=)`` is the same
 implementation: every distinct path becomes a ``DataTag`` (see
-``catalogue.py``), the catalogue is republished when it grows (content-hash
-guarded, exactly like the connector), and each publish resolves the Signal
-the node minted for that tag — learned from the service's own ``_Signal``
+``catalogue.py``), the catalogue is republished when it changes
+(content-hash guarded), and each publish resolves the Signal the node
+minted for that tag — learned from the service's own ``_Signal``
 subscription — before writing ``_Metric`` with ``signal_id``. A path with no
 Signal yet is buffered (bounded) and flushed the moment one binds.
 
 Construction never connects — it stores configuration and, outside a
 deployment, loads-or-mints the identity. ``start()`` (or the context
 manager) is what opens the door; see the design's lifecycle table for what
-happens at each stage.
+happens at each stage. ``start()`` also reads the catalogue this service
+published LAST time back from the node's KV before it subscribes to its
+``_Signal`` records: those records name the ids of the previous run, so the
+catalogue has to know them before the first one arrives, and the republish
+guard is armed from the revision already on record.
+
+**Placement follows the registry, live.** A re-placement (an operator moves
+the service's entry) kicks the MQTT session; on the reconnect the service
+re-resolves its identity, re-subscribes at its current mount, and
+republishes its ``_ServiceDetails`` and catalogue there — a rename or a
+reparent needs no redeploy (local-service-trust design §3.2, §6.1).
+
+``ConnectorService`` (``chaski.connector``) is this class plus a poll loop:
+a driver discovers tags into the same catalogue and reads them on an
+interval; bindings, publishing, registration and the consume lane are all
+this class. It re-implements nothing here.
 
 **The consume lane** (service families design 2026-09-07 §3.3, D7). A
 started Service also reads: ``kv(prefix, contract=)`` is a bounded snapshot
@@ -65,7 +80,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, NamedTuple, Optional, Union
 from urllib.parse import urlsplit
 
 import paho.mqtt.client as pahomqtt
@@ -79,7 +94,6 @@ from colca_data_contracts.local_service import (
     attach_log_publisher,
     connect_local_mqtt,
     resolve_local_identity,
-    service_details_topic,
 )
 from colca_data_contracts.payload import (
     DataTags,
@@ -95,6 +109,18 @@ from .catalogue import Catalogue, element_for
 from .door import Door, KvEntry, Stream
 
 logger = logging.getLogger(__name__)
+
+
+class Binding(NamedTuple):
+    """One ``_Signal`` record the node authored against a tag of this
+    service, keyed in :attr:`Service._bindings` by the SIGNAL's own topic —
+    a tag may be read by more than one Signal, and a tombstone arrives on
+    exactly that topic."""
+
+    tag_id: str
+    #: The ``_Metric`` topic: the Signal's own position, same node, same path.
+    topic: Topic
+    signal: SignalRecord
 
 # How long a not-yet-bound path may keep buffering before its "still
 # unbound" line repeats — mirrors colca's own 5-minute reminder shape
@@ -125,11 +151,12 @@ class NotEnrolled(RuntimeError):
 
 @dataclass(frozen=True)
 class LocalDoor:
-    """An embedded node's own local door (SDK design §3.1): host, HTTP port,
-    MQTT port. An integrator never constructs this directly — pass a
-    ``node=`` URL string outside a deployment, or leave ``node`` unset
-    inside one. ``chaski.Node.service()`` is the one caller that builds and
-    passes a ``LocalDoor``."""
+    """A node's local door (SDK design §3.1): host, HTTP port, MQTT port. An
+    integrator never constructs this directly — pass a ``node=`` URL string
+    outside a deployment, or leave ``node`` unset inside one (the compose
+    defaults below). ``chaski.Node.service()`` builds one for an embedded
+    node, and the shipped connector image builds one from its
+    ``MQTT_IP``/``HTTP_PORT``/``MQTT_PORT`` environment."""
 
     host: str = "colca"
     http_port: int = _DEFAULT_LOCAL_HTTP_PORT
@@ -320,6 +347,8 @@ class Service:
         state_dir: Optional[Path] = None,
         mqtt_port: Optional[int] = None,
         api_port: Optional[int] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        architecture_metadata: Optional[dict[str, Any]] = None,
         health_metrics: Optional[Iterable[HealthMetricDeclaration]] = None,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
@@ -333,6 +362,12 @@ class Service:
         doors sit behind a non-standard port (a test harness, a port-mapped
         deployment) — mirrors ``Service.external``'s equivalent keyword
         arguments in the prior design.
+
+        ``metadata`` and ``architecture_metadata`` ride the retained
+        ``_ServiceDetails`` record as given: what the editor shows about
+        this service beyond its health — protocol, icon, the driver behind
+        it. ``architecture_metadata`` is merged under the live
+        ``status``/``detail`` :meth:`status` writes.
 
         ``health_metrics`` declares which Prometheus-scraped metrics describe
         this service's health in the Edit (``_ServiceDetails.
@@ -351,6 +386,8 @@ class Service:
         self.description = description
         self.version = version
         self.logs = logs
+        self.metadata: dict[str, Any] = dict(metadata or {})
+        self.architecture_metadata: dict[str, Any] = dict(architecture_metadata or {})
         self.health_metrics = list(health_metrics or [])
         self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
         self._mqtt_port_override = mqtt_port
@@ -384,17 +421,25 @@ class Service:
         self._node_id: Optional[str] = None
         self._service_id: Optional[str] = None
         self._system_element_id: Optional[str] = None
+        # Where the node currently has this service: the resolved mount and
+        # the hierarchy (mount + name) its own records live under. Local
+        # services learn it from /self and re-learn it on every reconnect;
+        # an external one is placed by its enrollment and keeps the mount
+        # it was constructed with.
+        self._resolved_mount: str = mount
         self._hierarchy: tuple[str, ...] = ()
         self._catalogue: Optional[Catalogue] = None
         self._catalogue_topic: Optional[Topic] = None
         self._details_topic: Optional[Topic] = None
-        # tag_id -> (metric Topic, signal id)
-        self._bindings: dict[str, tuple[Topic, str]] = {}
-        # the SIGNAL's own topic string -> tag_id, so a tombstone (which
-        # arrives on the _Signal topic, never the _Metric one _bindings
-        # stores) can find what to unbind.
-        self._signal_topic_of: dict[str, str] = {}
+        self._signal_filter: Optional[Topic] = None
+        # The SIGNAL's own topic -> Binding. See Binding for why the key is
+        # the signal's topic and not the tag id.
+        self._bindings: dict[str, Binding] = {}
         self._buffer: dict[str, deque] = {}
+        # First CONNACK: start() waits on this; every later on_connect is a
+        # reconnect and re-announces placement instead (see _on_connect).
+        self._connected_event = threading.Event()
+        self._connect_outcome: Any = None
         self._unbound_log_at: dict[str, float] = {}
         self._seen: set[str] = set()
         self._last_status = "healthy"
@@ -452,13 +497,8 @@ class Service:
         )
         self._node_id = identity.node_id
         self._service_id = identity.service_id
-        self._system_element_id = identity.system_element_id or None
-        self._hierarchy = identity.hierarchy
-        self._catalogue = Catalogue(
-            self._state_dir / "catalogue.json", connector=identity.service_id, mount=self._mount,
-        )
-        self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
-        self._details_topic = service_details_topic(identity)
+        self._apply_placement(identity.mount, identity.hierarchy, identity.system_element_id or None)
+        self._catalogue = Catalogue(connector=identity.service_id, mount=self._resolved_mount)
         self._http = Door(f"http://{door.host}:{door.http_port}", service=self.name)
 
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
@@ -483,15 +523,8 @@ class Service:
         host, base = _node_admin_base(self._node_url, self._api_port_override)
         self._node_id = _read_node_id(f"{base}/healthz")
         self._service_id = self.ulid
-        self._system_element_id = None
-        self._hierarchy = service_context(self._mount, self.ulid)
-        self._catalogue = Catalogue(
-            self._state_dir / "catalogue.json", connector=self.ulid, mount=self._mount,
-        )
-        self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
-        self._details_topic = Topic(
-            payload_type=ServiceDetails, node_id=self._node_id, context=self._hierarchy + ("_service",),
-        )
+        self._apply_placement(self._mount, service_context(self._mount, self.ulid), None)
+        self._catalogue = Catalogue(connector=self.ulid, mount=self._mount)
         # The published API door authenticates the same pinned key the MQTT
         # door does, presented as a client certificate ("Node
         # doors": API 443, credential "cert").
@@ -512,25 +545,112 @@ class Service:
             attach_log_publisher(self._client, self._hierarchy)
         self._after_connect()
 
+    def _apply_placement(self, mount: str, hierarchy: tuple[str, ...], element_id: Optional[str]) -> None:
+        """Take the node's current answer for where this service sits: the
+        topics its own records live at, and the ``_Signal`` filter narrowed
+        to its own read scope (at or below its bound element — a fully
+        wildcarded filter is not authorized under local-service-trust, auth
+        §5.3)."""
+        self._resolved_mount = mount
+        self._hierarchy = tuple(hierarchy)
+        self._system_element_id = element_id
+        self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
+        self._details_topic = Topic(
+            payload_type=ServiceDetails, node_id=self._node_id, context=self._hierarchy + ("_service",),
+        )
+        mount_parts = tuple(p for p in mount.split("/") if p)
+        filter_context = (*mount_parts, "#") if mount_parts else ("#",)
+        self._signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
+
     def _connect_and_wait(self, connect_timeout: float) -> None:
-        connected = threading.Event()
-        outcome: dict[str, Any] = {}
-
-        def _on_connect(_client: Any, _userdata: Any, _flags: Any, reason_code: Any,
-                        _properties: Any = None) -> None:
-            outcome["reason_code"] = reason_code
-            connected.set()
-
-        self._client.on_connect = _on_connect
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
         self._client.loop_start()
-        if not connected.wait(connect_timeout):
+        if not self._connected_event.wait(connect_timeout):
             raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")
-        reason_code = outcome.get("reason_code")
+        reason_code = self._connect_outcome
         if getattr(reason_code, "is_failure", False):
             if self._external:
                 raise NotEnrolled(self.name, self._node_url, self.enroll_hint())
             raise RuntimeError(f"chaski.Service: broker refused CONNECT ({reason_code})")
         self._connected = True
+
+    def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any,
+                    _properties: Any = None) -> None:
+        """paho's CONNACK callback, on its network thread. The first one
+        releases :meth:`start`, which finishes the setup on the caller's
+        thread (:meth:`_after_connect`). Every later one is a RECONNECT —
+        and a re-placement kicks the live session, so a reconnect is exactly
+        when placement may have moved: re-resolve it and re-announce
+        (:meth:`_reannounce`). Nothing here may wait for a PUBACK: this is
+        the thread that would read it."""
+        if not self._connected_event.is_set():
+            self._connect_outcome = reason_code
+            self._connected_event.set()
+            return
+        if getattr(reason_code, "is_failure", False):
+            return
+        self._broker_state_changed(True)
+        try:
+            self._reannounce(client)
+        except Exception:  # noqa: BLE001 - a callback that raises is swallowed by paho anyway
+            logger.exception("chaski.Service: re-announcing %s after a reconnect failed", self.name)
+
+    def _on_disconnect(self, *_args: Any, **_kwargs: Any) -> None:
+        logger.warning("chaski.Service: %s disconnected from the broker (auto-reconnecting)", self.name)
+        self._broker_state_changed(False)
+
+    def _broker_state_changed(self, connected: bool) -> None:
+        """Hook: the broker link came up (True) or went down (False)."""
+
+    def _reannounce(self, client: Any) -> None:
+        """On a reconnect (network thread): follow the registry's CURRENT
+        placement — re-subscribe at it, republish ``_ServiceDetails`` there,
+        and, if the position moved, forget the catalogue's last published
+        revision so it republishes at the new topic. Publishes here go out
+        without waiting (franzmq detects the network thread itself)."""
+        old_filter = self._signal_filter
+        old_topic = str(self._catalogue_topic)
+        if not self._external:
+            door = self._door
+            identity = resolve_local_identity(
+                self.name, host=door.host, http_port=door.http_port, mount=self._mount,
+            )
+            with self._lock:
+                self._apply_placement(identity.mount, identity.hierarchy, identity.system_element_id or None)
+                if str(self._catalogue_topic) != old_topic:
+                    self._catalogue.mount = self._resolved_mount
+                    self._catalogue.last_published_revision = None
+                    self._catalogue.dirty = True
+        if str(old_filter) != str(self._signal_filter):
+            client.unsubscribe(old_filter)
+        client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
+        with self._lock:
+            details = self._build_service_details(is_active=True, status=self._last_status,
+                                                  detail=self._last_detail)
+        client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
+        self._placement_reannounced()
+
+    def _placement_reannounced(self) -> None:
+        """Hook: a reconnect re-announced this service (catalogue may be due)."""
+
+    def _previous_catalogue(self) -> Optional[dict[str, Any]]:
+        """The retained ``_DataTags`` record this service published last time,
+        read back from the node's KV under its own path — the memory that
+        lets tag ids survive a restart with no local state (design §6).
+        ``None`` when this service has never published one at this topic.
+        A transport failure is raised, never read as "no previous
+        catalogue": that would mint fresh ids and orphan every binding."""
+        prefix = "/".join(self._hierarchy)
+        wanted = str(self._catalogue_topic)
+        for entry in self._http.kv(prefix, contract="_DataTags"):
+            if entry.topic != wanted:
+                continue
+            payload = entry.payload
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return payload or None
+        return None
 
     def _reset_after_failed_connect(self) -> None:
         if self._client is not None:
@@ -541,6 +661,8 @@ class Service:
                 pass
         self._client = None
         self._connected = False
+        self._connected_event.clear()
+        self._connect_outcome = None
         self._close_http()
 
     def _close_http(self) -> None:
@@ -549,11 +671,39 @@ class Service:
             self._http = None
 
     def _after_connect(self) -> None:
-        mount_parts = tuple(p for p in self._mount.split("/") if p)
-        filter_context = (*mount_parts, "#") if mount_parts else ("#",)
-        signal_filter = Topic(payload_type=SignalRecord, node_id=self._node_id, context=filter_context)
-        self._client.subscribe(signal_filter, qos=1, callback=self._on_signal)
+        # The previous catalogue BEFORE the subscription: the retained
+        # _Signal records that arrive on SUBSCRIBE name the ids of the last
+        # run, and a binding for an id the catalogue does not know is
+        # dropped as someone else's (see _on_signal).
+        with self._lock:
+            self._catalogue.load_previous(self._previous_catalogue())
+        self._client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         self._publish_details(self._build_service_details(is_active=True, status="healthy"))
+
+    @property
+    def node_id(self) -> Optional[str]:
+        """The node this service is registered at — level 4 of every topic
+        it writes. ``None`` before :meth:`start`."""
+        return self._node_id
+
+    @property
+    def service_id(self) -> Optional[str]:
+        """This service's identity at the node: the registry ULID minted at
+        self-registration (local) or the pinned one (external) — what the
+        catalogue's ``connector`` field carries. ``None`` before :meth:`start`."""
+        return self._service_id
+
+    @property
+    def mount(self) -> str:
+        """Where the node currently has this service (re-resolved on every
+        reconnect for a local service)."""
+        return self._resolved_mount
+
+    def is_broker_connected(self) -> bool:
+        """Whether the MQTT door is currently reachable — the fact a health
+        endpoint reports. False before :meth:`start`; afterwards the real
+        socket state, including an outage the caller is buffering against."""
+        return self._client is not None and bool(self._client.is_connected())
 
     def enroll_hint(self) -> str:
         """The exact one-liner an operator runs to enroll this identity
@@ -618,21 +768,27 @@ class Service:
                 "chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()"
             )
         with self._lock:
-            tag_id, changed = self._catalogue.ensure(path, value, unit)
+            tag_id, _changed = self._catalogue.ensure(path, value, unit)
             self._seen.add(path)
-            catalogue = self._catalogue_to_publish() if changed else None
-            binding = self._bindings.get(tag_id)
-            if binding is None:
+            catalogue = self._catalogue_to_publish()
+            bound = self._bindings_for(tag_id)
+            targets = [(b.topic, b.signal.id) for b in bound if b.signal.is_published]
+            if not bound:
                 self._buffer_sample(path, value, timestamp)
         # Outside the lock — see _publish_outside_the_lock. The catalogue goes
         # first either way: it is what makes the node mint the Signal this
         # sample binds to, so a buffered sample still has to publish it.
         if catalogue is not None:
             self._publish_catalogue(catalogue)
-        if binding is None:
-            return
-        topic, signal_id = binding
-        self._publish_metric(topic, signal_id, value, timestamp)
+        # Bound to a Signal the node has switched off (is_published false):
+        # the node said not to publish it, so the sample is neither sent nor
+        # kept — buffering would hold it for a binding that already exists.
+        for topic, signal_id in targets:
+            self._publish_metric(topic, signal_id, value, timestamp)
+
+    def _bindings_for(self, tag_id: str) -> list[Binding]:
+        """Under the lock: every Signal currently bound to ``tag_id``."""
+        return [b for b in self._bindings.values() if b.tag_id == tag_id]
 
     def _publish_metric(
         self, topic: Topic, signal_id: str, value: Any, timestamp: Optional[Any], *, wait: bool = True
@@ -722,7 +878,7 @@ class Service:
         with self._lock:
             connector_id = self._catalogue.connector if self._catalogue is not None else ""
             return [
-                (path, _pending_reason(path, self._mount, connector_id, connected=self._connected))
+                (path, _pending_reason(path, self._resolved_mount, connector_id, connected=self._connected))
                 for path in self._buffer
             ]
 
@@ -760,28 +916,34 @@ class Service:
         parts = topic_str.split("/")
         if len(parts) < 5:
             return
-        path = "/".join(parts[4:])
         signal = message.payload
         if signal is None:
-            # Tombstone: unbind whichever tag_id this exact SIGNAL topic
-            # (not the _Metric topic _bindings stores — a different contract,
-            # hence the separate reverse index) was bound to.
+            # Tombstone: the signal was retired and its binding goes with it.
             with self._lock:
-                tag_id = self._signal_topic_of.pop(topic_str, None)
-                if tag_id is not None:
-                    self._bindings.pop(tag_id, None)
+                if self._bindings.pop(topic_str, None) is not None:
+                    logger.info("chaski.Service: binding retired: %s", topic_str)
+                    self._bindings_changed()
             return
         tag_id = getattr(signal, "data_tag", None)
-        if not tag_id:
-            return
         with self._lock:
-            source = self._catalogue.source_for_tag(tag_id)
+            source = self._catalogue.source_for_tag(tag_id) if tag_id else None
             if source is None:
-                return  # a _Signal bound to a tag this service does not own
-            metric_topic = Topic(payload_type=Metric, node_id=self._node_id, context=tuple(path.split("/")))
-            self._bindings[tag_id] = (metric_topic, signal.id)
-            self._signal_topic_of[topic_str] = tag_id
+                # Names a tag this service never minted — someone else's
+                # binding, or a signal that was unbound from one of ours.
+                if self._bindings.pop(topic_str, None) is not None:
+                    self._bindings_changed()
+                return
+            # The metric belongs at the SIGNAL's own position: same node,
+            # same path — no service-local address, no translation (design §6).
+            metric_topic = Topic(payload_type=Metric, node_id=parts[3], context=tuple(parts[4:]))
+            self._bindings[topic_str] = Binding(tag_id, metric_topic, signal)
+            self._bindings_changed()
+            # The buffer held samples for a path with no binding; it has one
+            # now. Switched off by the node (is_published false), they are
+            # dropped rather than kept for a binding that already exists.
             queued = self._buffer.pop(source, None)
+            if not signal.is_published:
+                queued = None
         if queued:
             # Always the MQTT network/callback thread here: franzmq.Client's
             # own qos>=1 wait-for-PUBACK is a deadlock on this thread by
@@ -793,16 +955,24 @@ class Service:
             for value, timestamp in queued:
                 self._publish_metric(metric_topic, signal.id, value, timestamp, wait=False)
 
+    def _bindings_changed(self) -> None:
+        """Hook, under the lock: the binding table changed."""
+
     # -- catalogue ---------------------------------------------------------
 
     def _catalogue_to_publish(self) -> Optional[tuple[Any, Any]]:
         """Under the caller's lock: the catalogue that still needs publishing
-        (payload and its revision), or None when the last publish already
-        carried this content. Decides only — the publish itself belongs
-        outside the lock (:meth:`_publish_catalogue`)."""
+        (payload and its revision), or None when nothing changed since the
+        last decision or the last publish already carried this content.
+        Decides only — the publish itself belongs outside the lock
+        (:meth:`_publish_catalogue`)."""
+        if not self._catalogue.dirty:
+            return None
         payload = self._catalogue.payload()
-        revision = payload.version
+        revision = self._catalogue.revision(payload)
         if revision == self._catalogue.last_published_revision:
+            self._catalogue.dirty = False
+            logger.debug("chaski.Service: catalogue unchanged (%s), not republished", payload.version[:12])
             return None
         return payload, revision
 
@@ -816,12 +986,14 @@ class Service:
     # -- ServiceDetails --------------------------------------------------
 
     def _build_service_details(self, *, is_active: bool, status: str, detail: str = "") -> ServiceDetails:
-        metadata: dict[str, Any] = {}
+        metadata: dict[str, Any] = dict(self.metadata)
         if self.version:
             metadata["version"] = self.version
-        architecture_metadata: dict[str, Any] = {"status": status}
+        architecture_metadata: dict[str, Any] = {**self.architecture_metadata, "status": status}
         if detail:
             architecture_metadata["detail"] = detail
+        else:
+            architecture_metadata.pop("detail", None)
         return ServiceDetails(
             id=self._service_id,
             name=self.name,
@@ -852,11 +1024,10 @@ class Service:
         self._closed = True
         with self._lock:
             client = self._client
-            catalogue = (
-                self._catalogue_to_publish()
-                if client is not None and self._catalogue.seal(self._seen)
-                else None
-            )
+            catalogue = None
+            if client is not None:
+                self._seal_catalogue()
+                catalogue = self._catalogue_to_publish()
             details = (
                 self._build_service_details(is_active=False, status=self._last_status)
                 if client is not None
@@ -868,6 +1039,13 @@ class Service:
         if details is not None:
             self._publish_details(details)
         self._disconnect_client()
+
+    def _seal_catalogue(self) -> None:
+        """Under the lock, at close: the ``publish()`` path's end-of-run rule
+        — a path not published this run goes stale. A discovery-driven
+        catalogue (``ConnectorService``) has no such rule: what is stale
+        there is decided by discovery, never by a shutdown."""
+        self._catalogue.seal(self._seen)
 
     def retire(self, token: Optional[str] = None) -> None:
         """A deliberate end, not a restart: tombstone this service's own

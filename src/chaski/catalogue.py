@@ -1,20 +1,37 @@
-"""Stable id-per-path catalogue for :class:`chaski.Service` (SDK design §3,
-§7 gap 3).
+"""The one DataTag catalogue every :class:`chaski.Service` publishes (SDK
+design §3, §7 gap 3; service families design 2026-09-07 §3.4 and §4).
 
-Mirrors ``connector/src/reader.py``'s ``_finalize_catalogue`` /
-``publish_catalogue`` id-stability and content-hash republish guard, but
-keyed off explicit ``publish()`` calls rather than protocol discovery, and
-persisted to a small local JSON file (rather than re-derived from the node's
-retained catalogue) so a restarted ``Service`` process reuses the same
-``DataTag`` id for the same path without needing to reach the node first.
+A catalogue is the set of sources a service offers, each with an id that
+never changes for as long as the source is known. Two things grow it and
+they are the only two:
+
+* ``ensure(path, value, unit)`` — the ``publish()`` path: a never-seen path
+  mints a tag, a stale one is revived.
+* ``declare(tags)`` — the discovery path (``ConnectorService``): the whole
+  discovered set at once. Ids are reused by ``source``, new sources mint,
+  and a source that vanished is carried forward marked ``is_stale`` rather
+  than dropped, so a Signal bound to it stays bound instead of silently
+  rebinding (local-service-trust design §6).
+
+**The memory is the node, not a local file.** A service holds no catalogue
+state of its own: the retained ``_DataTags`` record it published last time
+is already in the node's KV, readable through the same door it publishes at,
+and ``load_previous`` seeds the catalogue from it before the service
+subscribes to its ``_Signal`` records — the bindings that arrive on that
+subscription name the ids of the PREVIOUS run, so the catalogue must know
+them first. That seed is also what arms the republish guard: an unchanged
+catalogue after a restart hashes to the revision already on record and is
+not re-appended and re-replicated.
+
+This used to exist twice — here as a JSON file next to the service's state
+directory, and in ``connector/src/reader.py`` reading the node — with the
+content-hash guard implemented in both. There is one now.
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional
+from dataclasses import replace
+from typing import Any, Mapping, Optional
 
 import ulid as ulid_lib
 
@@ -51,134 +68,174 @@ def element_for(path: str, mount: str = "") -> str:
     return f"{mount}/{parent}"
 
 
-@dataclass
-class _Entry:
-    id: str
-    data_type: Optional[str] = None
-    is_stale: bool = False
-    unit: Optional[str] = None
+def _tag_from_record(raw: Mapping[str, Any]) -> DataTag:
+    return DataTag(
+        id=str(raw["id"]),
+        name=str(raw.get("name", "")),
+        source=str(raw["source"]),
+        is_writable=bool(raw.get("is_writable", False)),
+        is_readable=bool(raw.get("is_readable", False)),
+        data_type=raw.get("data_type"),
+        is_stale=bool(raw.get("is_stale", False)),
+        meta=dict(raw.get("meta") or {}),
+    )
 
 
 class Catalogue:
-    """The path -> DataTag mapping for one Service, persisted at ``path``.
+    """The source -> DataTag mapping for one service.
 
-    ``ensure(path, value, unit)`` is the mutator ``publish()`` needs: it
-    mints a new id the first time a path is seen — a path's id never changes
-    afterward, the same natural-key rule the connector's own catalogue keeps
-    (``source`` is the natural key) — and revives a path that had gone
-    stale. ``seal(seen)`` is the restart-shaped half: any known path NOT in
-    ``seen`` (not published at all during this process's lifetime) is marked
-    stale, carrying it forward rather than deleting it — exactly what
-    ``_finalize_catalogue`` does with a vanished connector tag.
+    ``connector`` is the identity the published ``DataTags.connector`` field
+    carries — the node-minted registry ULID of a local service, the pinned
+    ULID of an external one. ``mount`` is where the service sits, used only
+    to make a ``publish()``-path parent node-local (:func:`element_for`).
     """
 
-    def __init__(self, path: Path, *, connector: str, mount: str = "") -> None:
-        self._path = path
+    def __init__(self, *, connector: str, mount: str = "") -> None:
         self.connector = connector
-        self._mount = mount
-        self._entries: dict[str, _Entry] = {}
+        self.mount = mount
+        self._tags: dict[str, DataTag] = {}
+        #: The revision (:meth:`revision`) the last successful publish
+        #: carried, or the one seeded from the node's retained record.
         self.last_published_revision: Optional[str] = None
-        self._load()
+        #: Whether anything changed since the last publish decision. A
+        #: dirty catalogue is hashed once and compared against
+        #: ``last_published_revision``; a clean one is not hashed at all.
+        self.dirty = False
 
-    def _load(self) -> None:
-        if not self._path.exists():
+    # -- memory --------------------------------------------------------
+
+    def load_previous(self, payload: Optional[Mapping[str, Any]]) -> None:
+        """Seed from the retained ``_DataTags`` payload the node holds for
+        this service (as ``GET /kv`` returns it: ``data_tags``, ``connector``,
+        ``version``). Nothing to seed from is a valid first run."""
+        if not payload:
             return
-        raw = json.loads(self._path.read_text(encoding="utf-8"))
-        for source, item in raw.get("tags", {}).items():
-            self._entries[source] = _Entry(
-                id=item["id"],
-                data_type=item.get("data_type"),
-                is_stale=bool(item.get("is_stale", False)),
-                unit=item.get("unit"),
-            )
-        self.last_published_revision = raw.get("last_published_revision")
+        for raw in payload.get("data_tags") or []:
+            if not raw.get("source") or not raw.get("id"):
+                continue
+            tag = _tag_from_record(raw)
+            self._tags[tag.source] = tag
+        version = payload.get("version")
+        if version:
+            self.last_published_revision = f"{payload.get('connector')}\x00{version}"
+        self.dirty = False
 
-    def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "tags": {
-                source: {
-                    "id": e.id,
-                    "data_type": e.data_type,
-                    "is_stale": e.is_stale,
-                    "unit": e.unit,
-                }
-                for source, e in self._entries.items()
-            },
-            "last_published_revision": self.last_published_revision,
-        }
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self._path)
+    # -- the two mutators ------------------------------------------------
 
     def ensure(self, path: str, value: Any, unit: Optional[str] = None) -> tuple[str, bool]:
-        """Return (tag_id, changed) for `path`, minting or reviving it."""
-        entry = self._entries.get(path)
-        if entry is None:
-            entry = _Entry(id=str(ulid_lib.new()), data_type=infer_data_type(value), unit=unit)
-            self._entries[path] = entry
-            self._save()
-            return entry.id, True
-        changed = entry.is_stale
-        entry.is_stale = False
-        if entry.data_type is None:
-            entry.data_type = infer_data_type(value)
+        """The ``publish()`` path: return ``(tag_id, changed)`` for ``path``,
+        minting a tag the first time the path is seen or reviving a stale
+        one. ``data_type`` is inferred from the first value; ``unit`` lands
+        in ``meta.unit``; a multi-segment path's parent becomes
+        ``meta.element`` (node-local)."""
+        tag = self._tags.get(path)
+        if tag is None:
+            meta: dict[str, Any] = {}
+            element = element_for(path, self.mount)
+            if element:
+                meta["element"] = element
+            if unit is not None:
+                meta["unit"] = unit
+            tag = DataTag(
+                id=str(ulid_lib.new()),
+                name=path.rsplit("/", 1)[-1],
+                source=path,
+                is_writable=False,
+                is_readable=True,
+                data_type=infer_data_type(value),
+                is_stale=False,
+                meta=meta,
+            )
+            self._tags[path] = tag
+            self.dirty = True
+            return tag.id, True
+        changed = tag.is_stale
+        data_type = tag.data_type
+        if data_type is None:
+            data_type = infer_data_type(value)
             changed = True
-        if unit is not None and entry.unit != unit:
-            entry.unit = unit
+        meta = dict(tag.meta)
+        if unit is not None and meta.get("unit") != unit:
+            meta["unit"] = unit
             changed = True
         if changed:
-            self._save()
-        return entry.id, changed
+            self._tags[path] = replace(tag, is_stale=False, data_type=data_type, meta=meta)
+            self.dirty = True
+        return tag.id, changed
+
+    def declare(self, tags: Mapping[str, DataTag]) -> None:
+        """The discovery path: the complete set of sources a discovery
+        found, keyed by ``source``. Each keeps the id it already had (or
+        mints one); every known source NOT in ``tags`` is carried forward
+        marked stale. The ``id`` on the given tags is ignored — the
+        catalogue is the one place ids are minted."""
+        merged: dict[str, DataTag] = {}
+        for source, raw in tags.items():
+            old = self._tags.get(source)
+            merged[source] = DataTag(
+                id=old.id if old is not None else str(ulid_lib.new()),
+                name=raw.name,
+                source=source,
+                is_writable=raw.is_writable,
+                is_readable=raw.is_readable,
+                data_type=raw.data_type,
+                is_stale=False,
+                meta=raw.meta,
+            )
+        for source, old in self._tags.items():
+            if source not in merged:
+                merged[source] = old if old.is_stale else replace(old, is_stale=True)
+        self._tags = merged
+        self.dirty = True
 
     def seal(self, seen: set[str]) -> bool:
-        """Mark every known path NOT in `seen` stale. True if anything changed."""
+        """Mark every known path NOT in ``seen`` stale — the ``publish()``
+        path's end-of-run rule (a path not published this run is gone).
+        True if anything changed."""
         changed = False
-        for source, entry in self._entries.items():
-            if source not in seen and not entry.is_stale:
-                entry.is_stale = True
+        for source, tag in list(self._tags.items()):
+            if source not in seen and not tag.is_stale:
+                self._tags[source] = replace(tag, is_stale=True)
                 changed = True
         if changed:
-            self._save()
+            self.dirty = True
         return changed
 
-    def tag_id(self, path: str) -> Optional[str]:
-        entry = self._entries.get(path)
-        return entry.id if entry else None
+    # -- reads -----------------------------------------------------------
+
+    def tag_id(self, source: str) -> Optional[str]:
+        tag = self._tags.get(source)
+        return tag.id if tag else None
 
     def source_for_tag(self, tag_id: str) -> Optional[str]:
-        for source, entry in self._entries.items():
-            if entry.id == tag_id:
+        for source, tag in self._tags.items():
+            if tag.id == tag_id:
                 return source
         return None
 
+    def tag(self, source: str) -> Optional[DataTag]:
+        return self._tags.get(source)
+
+    def __contains__(self, tag_id: object) -> bool:
+        return any(tag.id == tag_id for tag in self._tags.values())
+
+    def __len__(self) -> int:
+        return len(self._tags)
+
     def data_tags(self) -> list[DataTag]:
-        tags = []
-        for source, entry in self._entries.items():
-            leaf = source.rsplit("/", 1)[-1]
-            meta: dict[str, Any] = {}
-            element = element_for(source, self._mount)
-            if element:
-                meta["element"] = element
-            if entry.unit is not None:
-                meta["unit"] = entry.unit
-            tags.append(
-                DataTag(
-                    id=entry.id,
-                    name=leaf,
-                    source=source,
-                    is_writable=False,
-                    is_readable=True,
-                    data_type=entry.data_type,
-                    is_stale=entry.is_stale,
-                    meta=meta,
-                )
-            )
-        return tags
+        return list(self._tags.values())
 
     def payload(self) -> DataTags:
         return DataTags(data_tags=self.data_tags(), connector=self.connector)
 
+    def revision(self, payload: Optional[DataTags] = None) -> str:
+        """What the republish guard compares: the identity the record is
+        published under plus the content hash of its tags. A re-registered
+        service (new ULID, same tags) republishes; a restart that
+        rediscovers the same source does not."""
+        payload = payload if payload is not None else self.payload()
+        return f"{self.connector}\x00{payload.version}"
+
     def record_published(self, revision: str) -> None:
         self.last_published_revision = revision
-        self._save()
+        self.dirty = False

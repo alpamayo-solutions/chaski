@@ -100,7 +100,7 @@ def test_a_single_segment_path_binds_at_the_connectors_mount_not_at_the_source(t
     tag_id = _minted_tag_id(client)
 
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
-    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id))
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
 
     metrics = [p for _t, p in client.published if isinstance(p, Metric)]
     assert len(metrics) == 1, client.published
@@ -120,7 +120,7 @@ def test_a_multi_segment_path_binds_under_the_subscribed_mount_and_still_matches
     tag_id = _minted_tag_id(client)
 
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "press3", "temp"))
-    client.deliver(signal_topic, Signal(id="sig-2", name="temp", data_tag=tag_id))
+    client.deliver(signal_topic, Signal(id="sig-2", name="temp", data_tag=tag_id, is_published=True))
 
     metrics = [p for _t, p in client.published if isinstance(p, Metric)]
     assert len(metrics) == 1, client.published
@@ -132,7 +132,7 @@ def test_publish_after_binding_goes_straight_to_metric(tmp_path, monkeypatch):
     svc.publish("temp", 1.0)
     tag_id = _minted_tag_id(client)
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
-    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id))
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
 
     svc.publish("temp", 2.0)
 
@@ -155,9 +155,31 @@ def test_a_signal_tombstone_unbinds(tmp_path, monkeypatch):
     svc.publish("temp", 1.0)
     tag_id = _minted_tag_id(client)
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
-    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id))
-    assert tag_id in svc._bindings
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
+    assert svc._bindings_for(tag_id)
 
     client.deliver(signal_topic, None)
 
-    assert tag_id not in svc._bindings
+    assert not svc._bindings_for(tag_id)
+
+
+def test_a_signal_the_node_switched_off_is_bound_but_publishes_nothing(tmp_path, monkeypatch):
+    """``is_published`` is the node's say over whether a Signal's values go
+    out (the same flag the connector's poll loop honours). A sample for a
+    switched-off Signal is neither published nor kept: buffering would hold
+    it for a binding that already exists."""
+    svc, client = _service(tmp_path, monkeypatch)
+    svc.publish("temp", 1.0)
+    tag_id = _minted_tag_id(client)
+    signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=False))
+
+    svc.publish("temp", 2.0)
+
+    assert not [p for _t, p in client.published if isinstance(p, Metric)]
+    assert svc.pending() == [], "a bound path is not pending, published or not"
+
+    # Denominator: switching it on publishes from then on.
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
+    svc.publish("temp", 3.0)
+    assert [m.value for _t, m in client.published if isinstance(m, Metric)] == [3.0]

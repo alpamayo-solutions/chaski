@@ -11,7 +11,18 @@ producers (``chaski.dataops``) -- resolved lazily because it needs the
 
 from typing import Any
 
+from colca_data_contracts.payload import DataTag
+
 from .client import Client
+from .connector import (
+    ConnectorService,
+    Discovery,
+    Driver,
+    Reading,
+    SourceDisconnectedError,
+    Target,
+    Telemetry,
+)
 from .door import Door, Gap, KvEntry, Page, Record, Stream
 from .errors import CommandRejected, Forbidden, NotANode, NotFound, NotLoggedIn, ChaskiError
 from .handles import Alarm, Annotation, Element, Sample, Samples, Signal, Watch
@@ -22,6 +33,14 @@ from .service import LocalDoor, NotEnrolled, Service
 __all__ = [
     "Client",
     "Service",
+    "ConnectorService",
+    "Driver",
+    "DataTag",
+    "Discovery",
+    "Target",
+    "Reading",
+    "Telemetry",
+    "SourceDisconnectedError",
     "Node",
     "Door",
     "Stream",

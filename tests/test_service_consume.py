@@ -306,7 +306,8 @@ def test_stream_passes_signal_ids_through_to_the_metrics_fetch(tmp_path, monkeyp
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
     list(svc.stream("metrics", signal_ids=["sig-1", "sig-2"], max=10))
-    assert door.calls[0] == ("fetch", "metrics", "c/erp-bridge/metrics", 10, ["sig-1", "sig-2"])
+    fetches = [c for c in door.calls if c[0] == "fetch"]
+    assert fetches[0] == ("fetch", "metrics", "c/erp-bridge/metrics", 10, ["sig-1", "sig-2"])
 
 
 def test_follow_drains_until_stopped(tmp_path, monkeypatch, fake_door):

@@ -1,10 +1,31 @@
-"""Level-2 pin for SDK design §9: the synthesised catalogue is stable across
-restarts (same source -> same tag id), grows monotonically, and marks
-vanished paths is_stale."""
+"""Level-2 pin for the one catalogue every Service publishes (SDK design §9;
+service families design §3.4/§4): a source keeps its id for as long as it
+is known — across restarts, because the memory is the node's retained
+record, not the process — the set grows monotonically, a vanished source
+is carried forward stale, and the republish guard is armed from what is
+already on record."""
 
 from __future__ import annotations
 
+import re
+
+import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
+from colca_data_contracts.payload import DataTag
+
 from chaski.catalogue import Catalogue, element_for, infer_data_type
+
+ULID = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
+
+
+def _tag(name: str, source: str | None = None, data_type: str = "float", **meta) -> DataTag:
+    return DataTag(id="", name=name, source=source or name, is_writable=False, is_readable=True,
+                   data_type=data_type, meta=meta)
+
+
+def _retained(cat: Catalogue) -> dict:
+    """What the node hands back from ``/kv`` for the record ``cat`` published:
+    the payload's own dict form, ``version`` included."""
+    return cat.payload().__dict__
 
 
 def test_infer_data_type_orders_bool_before_int():
@@ -34,74 +55,58 @@ def test_element_for_joins_the_mount_to_make_the_parent_node_local():
     assert element_for("press3/temp", mount="") == "press3"
 
 
-def test_data_tags_emit_the_mount_joined_element_for_a_mounted_catalogue(tmp_path):
-    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1", mount="line1")
-    cat.ensure("press3/temp", 21.5)
+# -- the publish() path: ensure ------------------------------------------
 
+
+def test_ensure_emits_the_mount_joined_element_and_the_unit_for_a_published_path():
+    cat = Catalogue(connector="svc1", mount="line1")
+    cat.ensure("press3/temp", 21.5, unit="°C")
     tag = cat.data_tags()[0]
-    assert tag.meta["element"] == "line1/press3"
+    assert tag.meta == {"element": "line1/press3", "unit": "°C"}
+    assert tag.name == "temp" and tag.source == "press3/temp" and tag.data_type == "float"
 
 
-def test_data_tags_emit_no_element_for_a_top_level_path_on_a_mounted_catalogue(tmp_path):
+def test_ensure_emits_no_element_for_a_top_level_path_on_a_mounted_catalogue():
     # No parent means the tag stays placed at the service's own mount, which
     # the node already does by default when meta.element is absent —
     # sending "line1" here would wrongly narrow it to the mount itself.
-    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1", mount="line1")
+    cat = Catalogue(connector="svc1", mount="line1")
     cat.ensure("temp", 21.5)
-
-    tag = cat.data_tags()[0]
-    assert "element" not in tag.meta
+    assert "element" not in cat.data_tags()[0].meta
 
 
-def test_a_new_path_mints_a_stable_id_reused_across_restarts(tmp_path):
-    path = tmp_path / "catalogue.json"
-
-    first = Catalogue(path, connector="svc1")
-    tag_id, changed = first.ensure("orders/open", 42)
-    assert changed is True
-
-    # "restart": a fresh Catalogue instance reading the same state file.
-    second = Catalogue(path, connector="svc1")
-    same_id, changed_again = second.ensure("orders/open", 43)
-    assert same_id == tag_id
-    assert changed_again is False  # already known, not stale: nothing changed
-
-
-def test_the_catalogue_grows_monotonically_as_new_paths_are_published(tmp_path):
-    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1")
+def test_the_catalogue_grows_monotonically_as_new_paths_are_published():
+    cat = Catalogue(connector="svc1")
     id_a, grew_a = cat.ensure("a", 1)
     id_b, grew_b = cat.ensure("b", 2)
     assert grew_a and grew_b
-    assert id_a != id_b
+    assert id_a != id_b and ULID.fullmatch(id_a) and ULID.fullmatch(id_b)
     assert {tag.source for tag in cat.data_tags()} == {"a", "b"}
-    # Publishing "a" again does not remint or drop it.
     same_id_a, grew_again = cat.ensure("a", 1)
     assert same_id_a == id_a
     assert grew_again is False
     assert {tag.source for tag in cat.data_tags()} == {"a", "b"}
 
 
-def test_seal_marks_a_path_not_seen_this_run_stale_and_a_seen_one_survives(tmp_path):
-    path = tmp_path / "catalogue.json"
-    cat = Catalogue(path, connector="svc1")
+def test_seal_marks_a_path_not_seen_this_run_stale_and_a_seen_one_survives():
+    cat = Catalogue(connector="svc1")
     cat.ensure("kept", 1)
     cat.ensure("vanished", 2)
 
-    changed = cat.seal(seen={"kept"})
+    assert cat.seal(seen={"kept"}) is True
 
-    assert changed is True
     tags = {tag.source: tag for tag in cat.data_tags()}
     # Presence check first (testing.md: an absence assertion needs a
     # denominator) — "kept" must NOT be stale before trusting "vanished" is.
     assert tags["kept"].is_stale is False
     assert tags["vanished"].is_stale is True
+    assert cat.seal(seen={"kept"}) is False, "sealing again with nothing new to stale changes nothing"
 
 
-def test_a_revived_path_is_un_staled_and_reported_as_changed(tmp_path):
-    path = tmp_path / "catalogue.json"
-    cat = Catalogue(path, connector="svc1")
+def test_a_revived_path_is_un_staled_and_reported_as_changed():
+    cat = Catalogue(connector="svc1")
     cat.ensure("flaky", 1)
-    cat.seal(seen=set())  # nothing published this "run" -> flaky goes stale
+    cat.seal(seen=set())
     assert cat.data_tags()[0].is_stale is True
 
     tag_id, changed = cat.ensure("flaky", 2)
@@ -111,18 +116,98 @@ def test_a_revived_path_is_un_staled_and_reported_as_changed(tmp_path):
     assert cat.tag_id("flaky") == tag_id
 
 
-def test_seal_with_nothing_vanished_reports_no_change(tmp_path):
-    cat = Catalogue(tmp_path / "catalogue.json", connector="svc1")
-    cat.ensure("a", 1)
-    assert cat.seal(seen={"a"}) is False
+# -- the discovery path: declare -----------------------------------------
 
 
-def test_record_published_persists_the_republish_guard_across_restarts(tmp_path):
-    path = tmp_path / "catalogue.json"
-    first = Catalogue(path, connector="svc1")
-    first.ensure("a", 1)
-    revision = first.payload().version
-    first.record_published(revision)
+def test_declare_mints_an_id_per_source_and_the_id_is_reused_by_a_later_declare():
+    cat = Catalogue(connector="svc1")
+    cat.declare({"Axis1/Temperature": _tag("Temperature", "Axis1/Temperature")})
+    first = cat.tag_id("Axis1/Temperature")
+    assert first and ULID.fullmatch(first)
 
-    second = Catalogue(path, connector="svc1")
-    assert second.last_published_revision == revision
+    cat.declare({
+        "Axis1/Temperature": _tag("Temperature", "Axis1/Temperature"),
+        "Axis2/Temperature": _tag("Temperature", "Axis2/Temperature"),
+    })
+    assert cat.tag_id("Axis1/Temperature") == first, "rediscovery minted a new id; every bound signal just broke"
+    assert cat.tag_id("Axis2/Temperature") not in (None, first)
+
+
+def test_declare_carries_a_vanished_source_forward_stale_and_revives_it_when_it_returns():
+    cat = Catalogue(connector="svc1")
+    cat.declare({"a": _tag("a"), "b": _tag("b")})
+    id_b = cat.tag_id("b")
+
+    cat.declare({"a": _tag("a")})
+    tags = {t.source: t for t in cat.data_tags()}
+    assert tags["a"].is_stale is False
+    assert tags["b"].is_stale is True and tags["b"].id == id_b, "a vanished tag must keep its identity"
+
+    cat.declare({"a": _tag("a"), "b": _tag("b")})
+    back = cat.tag("b")
+    assert back.id == id_b and back.is_stale is False, "coming back must not mint a new id either"
+
+
+def test_declare_ignores_the_id_a_driver_puts_on_a_tag():
+    """The catalogue is the one place ids are minted: a driver that
+    restates a tag with some id of its own does not get to change the
+    identity a Signal is bound to."""
+    cat = Catalogue(connector="svc1")
+    cat.declare({"a": _tag("a")})
+    minted = cat.tag_id("a")
+    forged = _tag("a")
+    forged.id = "01FORGED00000000000000000"
+    cat.declare({"a": forged})
+    assert cat.tag_id("a") == minted
+
+
+# -- the memory: the node's retained record ------------------------------
+
+
+def test_a_restart_reuses_every_id_from_the_retained_record_and_the_guard_is_armed():
+    """A fresh process seeded from what the node holds must (a) hand every
+    source its previous id and (b) hash to the revision on record, so an
+    unchanged catalogue is NOT republished after a restart (one fat record, re-appended and re-replicated)."""
+    first = Catalogue(connector="svc1")
+    first.declare({"a": _tag("a", meta_key=1), "b": _tag("b", data_type="int")})
+    first.declare({"a": _tag("a", meta_key=1)})  # b vanishes -> stale, carried forward
+    first.record_published(first.revision())
+    retained = _retained(first)
+    assert set(retained) >= {"data_tags", "connector", "version"}
+
+    second = Catalogue(connector="svc1")
+    second.load_previous(retained)
+    assert second.dirty is False
+    assert {t.source: t.id for t in second.data_tags()} == {t.source: t.id for t in first.data_tags()}
+    assert second.tag("b").is_stale is True
+
+    # The same discovery again: same ids, same content, same revision.
+    second.declare({"a": _tag("a", meta_key=1)})
+    assert second.dirty is True
+    assert second.revision() == second.last_published_revision == first.last_published_revision
+
+    # Denominator: a genuinely changed catalogue does NOT match.
+    second.declare({"a": _tag("a", meta_key=2)})
+    assert second.revision() != second.last_published_revision
+
+
+def test_the_revision_carries_the_publishing_identity_so_a_re_registered_service_republishes():
+    """The content hash alone is not the guard: the record's ``connector``
+    field is the service's identity, and a re-registration that minted a
+    new ULID must publish again even with identical tags."""
+    old = Catalogue(connector="ulid-old")
+    old.declare({"a": _tag("a")})
+    old.record_published(old.revision())
+
+    new = Catalogue(connector="ulid-new")
+    new.load_previous(_retained(old))
+    new.declare({"a": _tag("a")})
+    assert new.revision() != new.last_published_revision
+    assert new.payload().connector == "ulid-new"
+
+
+def test_loading_nothing_is_a_valid_first_run():
+    cat = Catalogue(connector="svc1")
+    cat.load_previous(None)
+    cat.load_previous({})
+    assert len(cat) == 0 and cat.last_published_revision is None and cat.dirty is False

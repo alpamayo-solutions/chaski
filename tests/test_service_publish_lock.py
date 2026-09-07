@@ -148,7 +148,7 @@ def _signal_for(client: _NetworkThreadClient) -> tuple[Topic, Signal]:
     tag_id = _minted_tag_id(client)
     return (
         Topic(payload_type=Signal, node_id="n-edge1", context=("orders",)),
-        Signal(id="sig-1", name="orders", data_tag=tag_id),
+        Signal(id="sig-1", name="orders", data_tag=tag_id, is_published=True),
     )
 
 
