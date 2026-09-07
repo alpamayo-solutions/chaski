@@ -291,7 +291,9 @@ class ConnectorService(Service):
         **service_kwargs: Any,
     ) -> None:
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
-        super().__init__(name, mount, metadata=metadata, **service_kwargs)
+        if max_pending < 1:
+            raise ValueError("max_pending must be positive")
+        super().__init__(name, mount, metadata=metadata, max_queued_messages=int(max_pending), **service_kwargs)
         self.driver = driver
         self.interval = float(interval)
         self.heartbeat_interval = float(heartbeat_interval)
@@ -363,11 +365,8 @@ class ConnectorService(Service):
         self._log.info("[STARTUP] Connector starting: protocol=%s, interval=%.1fs",
                        self.driver.protocol, self.interval)
         self.start()
-        # paho's own outgoing queue is unbounded by default: during a long
-        # broker outage every changed value keeps queuing in-process on top
-        # of the pending buffer, so RSS grows without limit. One bound, the
-        # same one the pending buffer enforces — not two disagreeing ones.
-        self._client.max_queued_messages_set(self.max_pending)
+        # Service configures Paho's queue before connecting. Its limit is
+        # the same as our pending buffer; Paho refuses changing it afterwards.
         self.telemetry.broker_healthy(True)
         try:
             await self._startup_discovery()

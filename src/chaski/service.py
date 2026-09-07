@@ -296,8 +296,11 @@ def _read_node_id(healthz_url: str, timeout: float = 10.0) -> str:
 def _connect_external_mqtt(
     host: str, port: int, ulid: str, key_path: Path, cert_path: Path,
     *, will: Optional[tuple[Topic, ServiceDetails]] = None,
+    max_queued_messages: int = 0,
 ) -> Client:
     client = Client(client_id=ulid, protocol=pahomqtt.MQTTv5)
+    if max_queued_messages:
+        client.max_queued_messages_set(max_queued_messages)
     client.username_pw_set(ulid)
     ctx = _insecure_ssl_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -350,6 +353,7 @@ class Service:
         metadata: Optional[dict[str, Any]] = None,
         architecture_metadata: Optional[dict[str, Any]] = None,
         health_metrics: Optional[Iterable[HealthMetricDeclaration]] = None,
+        max_queued_messages: int = 0,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -381,6 +385,7 @@ class Service:
         node. See :meth:`start`.
         """
         self.name = name
+        self._max_queued_messages = max_queued_messages
         self._mount = mount
         self.display_name = display_name
         self.description = description
@@ -507,6 +512,7 @@ class Service:
                 self.name, host=door.host, http_port=door.http_port, mqtt_port=door.mqtt_port,
                 mount=self._mount, identity=identity, publish_logs=self.logs,
                 will=(self._details_topic, will_payload),
+                max_queued_messages=self._max_queued_messages,
             )
         except Exception:
             self._reset_after_failed_connect()
@@ -535,6 +541,7 @@ class Service:
         self._client = _connect_external_mqtt(
             host, port, self.ulid, self._key_path, self._cert_path,
             will=(self._details_topic, will_payload),
+            max_queued_messages=self._max_queued_messages,
         )
         try:
             self._connect_and_wait(connect_timeout)

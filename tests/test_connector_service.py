@@ -256,7 +256,10 @@ def make_service(node: FakeNode, driver: Driver, monkeypatch, *, mount: str = ""
         system_element_id="el-1" if mount else "", mount=mount,
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
-    monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (node, identity))
+    def connect(*args, **kwargs):
+        node.max_queued_messages_set(kwargs["max_queued_messages"])
+        return node, identity
+    monkeypatch.setattr("chaski.service.connect_local_mqtt", connect)
     monkeypatch.setattr("chaski.service.Door", node.door)
     clock = kwargs.pop("clock", None) or Clock()
     svc = ConnectorService(NAME, mount, driver=driver, interval=0.0, **kwargs)
@@ -276,7 +279,6 @@ def started(node: FakeNode, driver: Driver, monkeypatch, **kwargs) -> ConnectorS
     does before the first poll."""
     svc = make_service(node, driver, monkeypatch, **kwargs)
     svc.start()
-    svc._client.max_queued_messages_set(svc.max_pending)
     asyncio.run(svc._startup_discovery())
     return svc
 
