@@ -4,8 +4,12 @@
 access to the editor API: read the tree, run commands (rename, move,
 annotate, acknowledge an alarm), and watch live values. ``Service`` and
 ``Node`` publish data: a ``Service`` on the local or external door, a
-``Node`` an embedded colcad.
+``Node`` an embedded colcad. ``DataOpsService`` is a ``Service`` that runs
+producers (``chaski.dataops``) -- resolved lazily because it needs the
+``chaski[dataops]`` extra.
 """
+
+from typing import Any
 
 from .client import Client
 from .door import Door, Gap, KvEntry, Page, Record, Stream
@@ -42,4 +46,20 @@ __all__ = [
     "CommandRejected",
     "LocalDoor",
     "NotEnrolled",
+    "DataOpsService",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    # `chaski.DataOpsService` without importing pandas/APScheduler into every
+    # `import colca` — a process that only wants Client or Service pays
+    # nothing, and one without the extra gets an ImportError that names it.
+    if name == "DataOpsService":
+        try:
+            from .dataops import DataOpsService
+        except ImportError as exc:
+            raise ImportError(
+                "chaski.DataOpsService needs the dataops extra: pip install \"chaski[dataops]\""
+            ) from exc
+        return DataOpsService
+    raise AttributeError(f"module 'colca' has no attribute {name!r}")

@@ -81,7 +81,13 @@ from colca_data_contracts.local_service import (
     resolve_local_identity,
     service_details_topic,
 )
-from colca_data_contracts.payload import DataTags, Metric, ServiceDetails, ServiceType
+from colca_data_contracts.payload import (
+    DataTags,
+    HealthMetricDeclaration,
+    Metric,
+    ServiceDetails,
+    ServiceType,
+)
 from colca_data_contracts.payload import Signal as SignalRecord
 from colca_data_contracts.service_topics import service_context
 
@@ -133,9 +139,9 @@ class LocalDoor:
 def _epoch(ts: Any) -> float:
     """Accept a datetime, a float/int epoch, or None (-> now). The wire
     contract's timestamp is a number — a datetime would encode as an ISO
-    string, which the door refuses (see dataops/src/dataops/outputs.py's own
-    _epoch, the same rule restated here because a Service has no door client
-    to borrow it from)."""
+    string, which the door refuses. ``chaski.dataops.outputs`` applies the
+    same rule to a producer's output (it cannot import this one without
+    pulling the MQTT publisher into a module that never uses it)."""
     if ts is None:
         return time.time()
     if hasattr(ts, "timestamp") and not isinstance(ts, (int, float)):
@@ -314,6 +320,7 @@ class Service:
         state_dir: Optional[Path] = None,
         mqtt_port: Optional[int] = None,
         api_port: Optional[int] = None,
+        health_metrics: Optional[Iterable[HealthMetricDeclaration]] = None,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -327,6 +334,13 @@ class Service:
         deployment) — mirrors ``Service.external``'s equivalent keyword
         arguments in the prior design.
 
+        ``health_metrics`` declares which Prometheus-scraped metrics describe
+        this service's health in the Edit (``_ServiceDetails.
+        health_metrics``) — a fact about where the service RUNS, not about
+        what kind of service it is: a containerised deployment passes
+        ``colca_data_contracts.container_resource_health_metrics()``, a
+        host process nothing.
+
         Construction never touches the network except to load or mint an
         external identity's own key material on disk — it does not dial the
         node. See :meth:`start`.
@@ -337,6 +351,7 @@ class Service:
         self.description = description
         self.version = version
         self.logs = logs
+        self.health_metrics = list(health_metrics or [])
         self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
         self._mqtt_port_override = mqtt_port
         self._api_port_override = api_port
@@ -819,6 +834,7 @@ class Service:
             is_active=is_active,
             metadata=metadata,
             architecture_metadata=architecture_metadata,
+            health_metrics=list(self.health_metrics),
         )
 
     def _publish_details(self, details: ServiceDetails) -> None:

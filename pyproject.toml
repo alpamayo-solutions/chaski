@@ -29,6 +29,17 @@ test = [
   # source instead (scripts/build_edit_client.py, matching how a
   # generated deployment's Docker build copies it too). Tests resolve it via [tool.uv.sources] below.
   "colca-data-contracts",
+  # The suite covers chaski.dataops too.
+  "chaski[dataops]",
+]
+# `chaski[dataops]` (service families design 2026-09-07 §3.5, D11): what
+# `chaski.dataops` — DataOpsService and the producer runtime — needs beyond
+# the base SDK. No database driver: the historian is a port the shipped
+# dataops image implements over TimescaleDB, not something the SDK opens.
+dataops = [
+  "apscheduler>=3.10,<4",
+  "pandas>=2.1",
+  "python-decouple>=3.8",
 ]
 # `chaski[node]` (SDK design §6/§7 gap 5): the colcad binary, per platform,
 # so `chaski.Node` needs no separate download or system install. Locally
