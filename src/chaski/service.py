@@ -26,6 +26,28 @@ Construction never connects — it stores configuration and, outside a
 deployment, loads-or-mints the identity. ``start()`` (or the context
 manager) is what opens the door; see the design's lifecycle table for what
 happens at each stage.
+
+**The consume lane** (service families design 2026-09-07 §3.3, D7). A
+started Service also reads: ``kv(prefix, contract=)`` is a bounded snapshot
+of the node's retained state, and ``stream(name)`` a named, durable cursor
+over one of its streams — ``metrics``, ``annotations``, ``alarms``, ... —
+with the same fetch → process → ack contract the shipped dataops service
+follows (``chaski.door.Stream``). Both speak the same door ``publish()``
+registers at, with the same identity: ``X-Colca-Service`` on the local door,
+the pinned client certificate on the published one.
+
+**A bridge is a Service whose protocol is HTTP** (design §3.6, D8). There is
+no ``BridgeService`` class, deliberately. A bridge to an ERP/MES has two
+lanes and neither is bridge-shaped: its *reference* lane polls the foreign
+system and ``publish()``-es what it learns — a connector whose protocol
+happens to be HTTP — and its *writeback* lane follows a stream with
+``stream()`` and makes idempotent foreign writes. "Never commands machines"
+is not a base class either: an external identity holds the ``write:``
+grants its enrollment gave it and no ``cmd:`` — position is authority
+(architecture principle 6). What a bridge genuinely owns — the foreign
+system's client and its idempotency keys — is shaped by that system, so
+start from the ``bridge`` starter (``chaski new bridge``) rather than a class
+that would wrap a dictionary.
 """
 
 from __future__ import annotations
@@ -40,9 +62,10 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import urlsplit
 
 import paho.mqtt.client as pahomqtt
@@ -63,6 +86,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from colca_data_contracts.service_topics import service_context
 
 from .catalogue import Catalogue, element_for
+from .door import Door, KvEntry, Stream
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +359,11 @@ class Service:
         # publishing say so in their own docstrings.
         self._lock = threading.RLock()
         self._client: Optional[Client] = None
+        # The door's HTTP client — the consume lane (kv/stream). Opened by
+        # start() beside the MQTT client, on the same door with the same
+        # identity, so a read is never made under a name the node has not
+        # yet registered at its mount.
+        self._http: Optional[Door] = None
         self._connected = False
         self._closed = False
         self._node_id: Optional[str] = None
@@ -415,6 +444,7 @@ class Service:
         )
         self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
         self._details_topic = service_details_topic(identity)
+        self._http = Door(f"http://{door.host}:{door.http_port}", service=self.name)
 
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
         try:
@@ -447,6 +477,10 @@ class Service:
         self._details_topic = Topic(
             payload_type=ServiceDetails, node_id=self._node_id, context=self._hierarchy + ("_service",),
         )
+        # The published API door authenticates the same pinned key the MQTT
+        # door does, presented as a client certificate ("Node
+        # doors": API 443, credential "cert").
+        self._http = Door(base, service=self.ulid, cert=(self._cert_path, self._key_path))
 
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
         port = self._mqtt_port_override or _DEFAULT_EXTERNAL_MQTT_PORT
@@ -492,6 +526,12 @@ class Service:
                 pass
         self._client = None
         self._connected = False
+        self._close_http()
+
+    def _close_http(self) -> None:
+        if self._http is not None:
+            self._http.close()
+            self._http = None
 
     def _after_connect(self) -> None:
         mount_parts = tuple(p for p in self._mount.split("/") if p)
@@ -596,6 +636,70 @@ class Service:
                 "chaski.Service: %r has no bound Signal yet — buffering (%d queued, capped at %d)",
                 path, len(queue), _MAX_BUFFERED_PER_PATH,
             )
+
+    # -- consuming ---------------------------------------------------------
+
+    def _require_http(self, method: str) -> Door:
+        if self._closed:
+            raise RuntimeError("chaski.Service is closed")
+        if self._http is None:
+            raise RuntimeError(
+                f"chaski.Service: call start() (or use `with Service(...) as svc:`) before {method}()"
+            )
+        return self._http
+
+    @property
+    def cursor_prefix(self) -> str:
+        """The cursor namespace this identity owns at the door — what
+        :meth:`stream` prepends to a cursor name. ``c/{name}/`` for a local
+        service, ``{ulid}/`` for an external one: the node's own rule
+        (``plugins/uns`` ``Entry.CursorPrefix``), restated here only so a
+        caller never has to know it — a cursor outside this prefix is
+        refused by the door."""
+        if self._external:
+            return f"{self.ulid}/"
+        return f"c/{self.name}/"
+
+    def kv(
+        self,
+        prefix: str = "",
+        *,
+        contract: Union[str, Iterable[str], None] = None,
+    ) -> list[KvEntry]:
+        """A snapshot of the node's retained state under ``prefix`` — every
+        page of ``GET /kv`` followed to the end — optionally narrowed to one
+        or more uns contracts (``contract="_Signal"``,
+        ``contract=["_SystemElement", "_Group"]``), which the node filters
+        before decoding any payload. Only entries this identity may read
+        are returned. Requires :meth:`start`."""
+        return self._require_http("kv").kv(prefix, contract=contract)
+
+    def stream(
+        self,
+        name: str,
+        *,
+        cursor: Optional[str] = None,
+        max: int = 1000,
+        signal_ids: Iterable[str] | None = None,
+    ) -> Stream:
+        """A named, durable cursor over the node's stream ``name``
+        (``metrics``, ``annotations``, ``alarms``, ...) — see
+        :class:`chaski.door.Stream` for the fetch → process → ack contract.
+
+        ``cursor`` names the cursor within this service's own namespace
+        (:attr:`cursor_prefix`) and defaults to the stream's name, so one
+        consumer per stream needs no naming at all; a service following
+        the same stream twice, or rebuilding its local state and wanting a
+        fresh start (dataops' generational cursor), passes its own —
+        ``svc.stream("metrics", cursor="ingest-02")`` — and retires the
+        old one with ``Stream.retire()``. ``max`` bounds one page.
+        ``signal_ids`` filters the ``metrics`` stream server-side (the door
+        refuses it on any other stream). Requires :meth:`start`.
+        """
+        door = self._require_http("stream")
+        return Stream(
+            door, name, self.cursor_prefix + (cursor or name), max=max, signal_ids=signal_ids,
+        )
 
     def pending(self) -> list[tuple[str, str]]:
         """``(path, reason)`` for every published path with no bound Signal
@@ -784,6 +888,7 @@ class Service:
             except Exception:  # noqa: BLE001 - best-effort teardown
                 logger.debug("chaski.Service: disconnect raised during teardown", exc_info=True)
         self._connected = False
+        self._close_http()
 
     def __enter__(self) -> "Service":
         return self.start()

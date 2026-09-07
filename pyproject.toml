@@ -13,6 +13,10 @@ dependencies = [
   # chaski.Service's own external-identity minting (ed25519 key + self-signed
   # cert, mirroring colca-keygen -cert — SDK design §3.2).
   "cryptography>=42",
+  # The door's HTTP client (chaski.door: /fetch, /ack, /kv, /publish) — the
+  # consume lane behind Service.stream()/kv(), and what the shipped dataops
+  # service imports (service families design 2026-09-07 §3.3, D7).
+  "httpx>=0.27",
 ]
 
 [project.scripts]

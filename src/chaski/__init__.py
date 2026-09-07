@@ -8,6 +8,7 @@ annotate, acknowledge an alarm), and watch live values. ``Service`` and
 """
 
 from .client import Client
+from .door import Door, Gap, KvEntry, Page, Record, Stream
 from .errors import CommandRejected, Forbidden, NotANode, NotFound, NotLoggedIn, ChaskiError
 from .handles import Alarm, Annotation, Element, Sample, Samples, Signal, Watch
 from .node import Node
@@ -18,6 +19,12 @@ __all__ = [
     "Client",
     "Service",
     "Node",
+    "Door",
+    "Stream",
+    "Record",
+    "Page",
+    "Gap",
+    "KvEntry",
     "Profile",
     "ProfileStore",
     "Signal",
