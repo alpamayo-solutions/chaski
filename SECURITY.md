@@ -20,3 +20,16 @@ prefer not to be named.
 
 Security fixes go into the latest release. There are no long-term support
 branches yet.
+
+## Supply chain
+
+Each release carries an SBOM of chaski's runtime dependencies in SPDX and
+CycloneDX format. The wheel, the sdist and the SBOM come with signed
+attestations:
+
+```bash
+gh attestation verify chaski-<version>-py3-none-any.whl --owner alpamayo-solutions
+```
+
+Every night, CI builds fresh SBOMs of the latest release and of `main` and scans
+them for known vulnerabilities.
