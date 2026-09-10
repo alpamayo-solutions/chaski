@@ -415,8 +415,13 @@ class Stream:
                 log.warning(
                     "Gap on stream=%s cursor=%s: offsets %d..%d were pruned (first_ts=%s last_ts=%s "
                     "approx=%s) — continuing from the low-water mark",
-                    self.name, self.cursor, page.gap.from_offset, page.gap.to_offset,
-                    page.gap.first_ts, page.gap.last_ts, page.gap.approx,
+                    self.name,
+                    self.cursor,
+                    page.gap.from_offset,
+                    page.gap.to_offset,
+                    page.gap.first_ts,
+                    page.gap.last_ts,
+                    page.gap.approx,
                 )
             yield from page.records
             ack_offset = page.ack_offset
@@ -424,9 +429,7 @@ class Stream:
                 return
             self._door.ack(self.name, self.cursor, ack_offset)
 
-    def follow(
-        self, *, poll_interval: float = 1.0, stop: Optional[threading.Event] = None
-    ) -> Iterator[Record]:
+    def follow(self, *, poll_interval: float = 1.0, stop: Optional[threading.Event] = None) -> Iterator[Record]:
         """:meth:`drain` forever — after an empty page, sleep ``poll_interval``
         (waking early when ``stop`` is set) and drain again. Ends when
         ``stop`` is set."""

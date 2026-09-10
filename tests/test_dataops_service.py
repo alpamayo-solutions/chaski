@@ -52,10 +52,12 @@ def buffer(tmp_path):
 
 @pytest.fixture
 def door():
-    return FakeDoor([
-        signal_entry("sig-tick", "tick_only_signal"),
-        signal_entry("sig-event", "on_metric_signal"),
-    ])
+    return FakeDoor(
+        [
+            signal_entry("sig-tick", "tick_only_signal"),
+            signal_entry("sig-event", "on_metric_signal"),
+        ]
+    )
 
 
 @pytest.fixture
@@ -208,7 +210,12 @@ async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(run
 
     with patch.object(service_module, "build_dispatch", fake_build):
         await service_module.reresolve_loop(
-            runtime, [], ingest, stop, lambda: started.append("ingest"), interval_s=0.01,
+            runtime,
+            [],
+            ingest,
+            stop,
+            lambda: started.append("ingest"),
+            interval_s=0.01,
         )
 
     assert ingest.bound == [({"sig-late": ["handler"]}, ["sig-late"])]
@@ -234,7 +241,12 @@ async def test_the_retry_stops_once_everything_resolves(runtime):
     with patch.object(service_module, "build_dispatch", fake_build):
         await asyncio.wait_for(
             service_module.reresolve_loop(
-                runtime, [], _Ingest(), asyncio.Event(), lambda: None, interval_s=0.01,
+                runtime,
+                [],
+                _Ingest(),
+                asyncio.Event(),
+                lambda: None,
+                interval_s=0.01,
             ),
             timeout=2,
         )
@@ -313,8 +325,8 @@ def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runti
     than the horizon is deleted, a point inside it survives. Plain function,
     like the job itself: sqlite work stays off the event loop."""
     now = time.time()
-    buffer.append("sig-event", now - 20.0, "old")     # older than the 10s window
-    buffer.append("sig-event", now - 1.0, "recent")    # inside the 10s window
+    buffer.append("sig-event", now - 20.0, "old")  # older than the 10s window
+    buffer.append("sig-event", now - 1.0, "recent")  # inside the 10s window
 
     instances = _instantiate(runtime, ShortWindowProducer)
 
@@ -368,9 +380,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
 
     trim_buffer(buffer, instances, retention_s=1.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
-    assert list(df["value"]) == [], (
-        "a late-resolved input must be trimmed on the very next trim run, without a restart"
-    )
+    assert list(df["value"]) == [], "a late-resolved input must be trimmed on the very next trim run, without a restart"
 
 
 def test_the_doorbell_rings_for_a_metric_franzmq_cannot_decode():
@@ -451,9 +461,15 @@ def test_a_periodic_tick_is_scheduled_as_a_plain_function_not_a_coroutine():
 
 def _metric_record(payload: dict, ts: float) -> Record:
     return Record(
-        offset=1, origin_offset=1, topic="colca/v1/_Metric/n-1/line1/x",
-        payload=payload, ts=ts,
-        written_by="connector", actor_id="svc-1", actor_label="connector", actor_kind="local",
+        offset=1,
+        origin_offset=1,
+        topic="colca/v1/_Metric/n-1/line1/x",
+        payload=payload,
+        ts=ts,
+        written_by="connector",
+        actor_id="svc-1",
+        actor_label="connector",
+        actor_kind="local",
     )
 
 

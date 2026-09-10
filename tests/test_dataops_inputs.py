@@ -37,8 +37,9 @@ class _FakeHistorian:
 
     def window(self, signal_id, start, end):
         self.window_calls.append((signal_id, start, end))
-        return pd.DataFrame({"ts": [r[0] for r in self.window_rows], "value": [r[1] for r in self.window_rows]},
-                            columns=["ts", "value"])
+        return pd.DataFrame(
+            {"ts": [r[0] for r in self.window_rows], "value": [r[1] for r in self.window_rows]}, columns=["ts", "value"]
+        )
 
     def latest_before(self, signal_id, before):
         return self.latest
@@ -270,9 +271,7 @@ def test_the_ingest_hot_path_does_not_re_read_kv(door, runtime):
     for _ in range(200):
         assert signal.signal_id == first
 
-    assert door.kv_calls == 1, (
-        f"{door.kv_calls} KV scans for 201 reads of one id — colca allows 5 per second"
-    )
+    assert door.kv_calls == 1, f"{door.kv_calls} KV scans for 201 reads of one id — colca allows 5 per second"
 
 
 def test_forget_makes_the_next_read_resolve_again(door, runtime):

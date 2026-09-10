@@ -225,8 +225,7 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
         elif isinstance(spec, OnMetricSpec):
             continue  # handled by the ingest dispatch table
         else:
-            log.warning("Unknown trigger spec %r on %s.%s — skipped",
-                        spec, instance.name, method_name)
+            log.warning("Unknown trigger spec %r on %s.%s — skipped", spec, instance.name, method_name)
             continue
 
         job_id = f"{instance.name}.{method_name}::{kind}"
@@ -236,8 +235,8 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
             id=job_id,
             name=job_id,
             replace_existing=True,
-            coalesce=True,             # if late, run once not N times
-            max_instances=1,            # never overlap a slow method with itself
+            coalesce=True,  # if late, run once not N times
+            max_instances=1,  # never overlap a slow method with itself
             misfire_grace_time=60,
         )
         log.info("Scheduled %s.%s with %s", instance.name, method_name, kind)
@@ -363,7 +362,10 @@ def _resolve_dispatch(
                 log.warning(
                     "%s.%s: cannot resolve signal_id for declared input %r yet (%s) — "
                     "excluded from the fetch filter and dispatch until it resolves",
-                    instance.name, attr_name, input_attr.signal_name, exc,
+                    instance.name,
+                    attr_name,
+                    input_attr.signal_name,
+                    exc,
                 )
                 unresolved += 1
                 continue
@@ -377,7 +379,10 @@ def _resolve_dispatch(
                 if getattr(instance, spec.input_name, None) is None:
                     log.error(
                         "%s.%s declares @on_metric(%r) but %r is not a class attribute — skipped",
-                        instance.name, method_name, spec.input_name, spec.input_name,
+                        instance.name,
+                        method_name,
+                        spec.input_name,
+                        spec.input_name,
                     )
                 # else: a declared input that failed resolution above —
                 # already warned there, skip this handler silently.
@@ -386,8 +391,13 @@ def _resolve_dispatch(
             signal_id = resolved[spec.input_name]
             method = getattr(instance, method_name)
             dispatch.setdefault(signal_id, []).append(make_handler(method))
-            log.info("Will dispatch %s.%s for signal_id=%s (input %s)",
-                     instance.name, method_name, signal_id, spec.input_name)
+            log.info(
+                "Will dispatch %s.%s for signal_id=%s (input %s)",
+                instance.name,
+                method_name,
+                signal_id,
+                spec.input_name,
+            )
 
     return dispatch, list(signal_ids), unresolved
 
@@ -428,8 +438,7 @@ async def reresolve_loop(
             ingest.rebind(dispatch, signal_ids)
             ensure_running()
         if not unresolved:
-            log.info("Every declared input resolved — dispatch now covers %d signal(s).",
-                     len(dispatch))
+            log.info("Every declared input resolved — dispatch now covers %d signal(s).", len(dispatch))
             return
 
 
@@ -454,7 +463,10 @@ def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict
                 log.debug(
                     "%s.%s: cannot resolve signal_id for declared input %r yet (%s) — "
                     "excluded from the trim horizon until it resolves",
-                    instance.name, attr_name, input_attr.signal_name, exc,
+                    instance.name,
+                    attr_name,
+                    input_attr.signal_name,
+                    exc,
                 )
                 continue
             horizon = max(input_attr.window_s, retention_s)
@@ -529,9 +541,15 @@ def synthetic_record(signal_id: str, ts: float, value: Any, *, actor: str = "rep
     reads something honest rather than an empty string.
     """
     return Record(
-        offset=-1, origin_offset=-1, topic="",
+        offset=-1,
+        origin_offset=-1,
+        topic="",
         payload={"signal_id": signal_id, "timestamp": ts, "value": value},
-        ts=ts, written_by=f"dataops-{actor}", actor_id="", actor_label="", actor_kind=actor,
+        ts=ts,
+        written_by=f"dataops-{actor}",
+        actor_id="",
+        actor_label="",
+        actor_kind=actor,
     )
 
 
@@ -603,7 +621,11 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
 
         log.info(
             "%s: code hash changed (%s -> %s) — replaying buffered window [%.3f, %.3f)",
-            instance.name, (old_hash or "none")[:12], new_hash[:12], start, now,
+            instance.name,
+            (old_hash or "none")[:12],
+            new_hash[:12],
+            start,
+            now,
         )
 
         rows: list[tuple[float, str, Any]] = []
@@ -627,7 +649,9 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
                     failures += 1
                     log.exception(
                         "%s: on_metric handler failed replaying signal_id=%s at ts=%.3f — continuing",
-                        instance.name, signal_id, ts,
+                        instance.name,
+                        signal_id,
+                        ts,
                     )
 
         # Persisted unconditionally, exactly like a live page is always
@@ -640,7 +664,10 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
         log_fn = log.warning if failures else log.info
         log_fn(
             "%s: replay complete (%d record(s), %d failure(s)) — watermark=%.3f",
-            instance.name, len(rows), failures, final_position,
+            instance.name,
+            len(rows),
+            failures,
+            final_position,
         )
 
 
@@ -679,8 +706,11 @@ def ring_even_if_undecodable(client) -> None:
         try:
             return typed_dispatch(message)
         except Exception:  # noqa: BLE001 — anything the decode raises, by design
-            log.warning("undecodable message on %s — ringing the doorbell without reading it",
-                        getattr(message, "topic", "?"), exc_info=True)
+            log.warning(
+                "undecodable message on %s — ringing the doorbell without reading it",
+                getattr(message, "topic", "?"),
+                exc_info=True,
+            )
             return raw_dispatch(client, message)
 
     client._handle_on_message = guarded
@@ -769,8 +799,12 @@ class DataOpsService(Service):
         if not name:
             raise ValueError(f"{producer_cls.__name__} has no `name` — every producer needs one")
         if name in self._producers and self._producers[name] is not producer_cls:
-            log.warning("Producer name %r added twice — %s replaces %s",
-                        name, producer_cls.__name__, self._producers[name].__name__)
+            log.warning(
+                "Producer name %r added twice — %s replaces %s",
+                name,
+                producer_cls.__name__,
+                self._producers[name].__name__,
+            )
         self._producers[name] = producer_cls
         return self
 
@@ -865,9 +899,12 @@ class DataOpsService(Service):
         :meth:`start`."""
         door = self.door
         result = build_catalogue(
-            instances, door,
-            node_id=self._node_id, mount=self._mount,
-            service_name=self.name, service_ulid=self._service_id,
+            instances,
+            door,
+            node_id=self._node_id,
+            mount=self._mount,
+            service_name=self.name,
+            service_ulid=self._service_id,
         )
         bind_annotation_outputs(instances, node_id=self._node_id, mount=self._mount)
         return result
@@ -937,7 +974,8 @@ class DataOpsService(Service):
         #    metrics retention, with no historian to cover the gap, fails loud
         #    here rather than showing up later as a silently shrinking frame.
         validate_windows(
-            instances, retention_s=self.retention_s,
+            instances,
+            retention_s=self.retention_s,
             historian_configured=self._historian is not None,
         )
 
@@ -953,7 +991,8 @@ class DataOpsService(Service):
         # 7) Retire the previous generation's cursor (if any) and build the
         #    ingest loop over this service's own consume lane.
         ingest = Ingest(
-            self._open_ingest_stream, self.buffer,
+            self._open_ingest_stream,
+            self.buffer,
             dispatch=dispatch,
             signal_ids=signal_ids or None,
             poll_interval_s=self._poll_interval_s,
@@ -979,8 +1018,7 @@ class DataOpsService(Service):
             health_state.ingest_task = ingest_task
             log.info("Ingest loop started: cursor=%s signal_ids=%d", ingest.cursor, len(signal_ids))
         else:
-            log.warning("No producer declared a resolved input — ingest loop not started "
-                        "(nothing to fetch yet).")
+            log.warning("No producer declared a resolved input — ingest loop not started (nothing to fetch yet).")
 
         def _ensure_ingest_running() -> None:
             """Start the loop if nothing resolved at startup and something has now."""
@@ -992,8 +1030,7 @@ class DataOpsService(Service):
 
         reresolve_task: Optional[asyncio.Task] = None
         if unresolved:
-            log.info("%d declared input(s) unresolved — retrying until they are commissioned.",
-                     unresolved)
+            log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
             reresolve_task = asyncio.ensure_future(
                 reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
             )

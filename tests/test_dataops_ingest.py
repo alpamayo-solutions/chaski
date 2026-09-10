@@ -70,6 +70,7 @@ async def test_records_processed_in_order_and_acked_only_after(door, buffer):
     def make_handler(name):
         async def _h(record):
             events.append(f"handled:{name}:{record.payload['signal_id']}")
+
         return _h
 
     door.queue(Page(records=[_record(5, "sig-1", 1.0, 10.0), _record(6, "sig-2", 2.0, 20.0)], next=7))
@@ -82,7 +83,8 @@ async def test_records_processed_in_order_and_acked_only_after(door, buffer):
     door.ack = _tracking_ack
 
     ingest = _ingest(
-        door, buffer,
+        door,
+        buffer,
         dispatch={
             "sig-1": [make_handler("h1")],
             "sig-2": [make_handler("h2")],
@@ -154,10 +156,15 @@ async def test_a_record_with_no_payload_timestamp_buffers_colca_ts_converted_to_
     ~50,000 years in the future and wedging `latest_before`/`is_fresh`/
     `trim` for that signal forever."""
     r = Record(
-        offset=1, origin_offset=1, topic="colca/v1/_Metric/n-1/line1/x",
+        offset=1,
+        origin_offset=1,
+        topic="colca/v1/_Metric/n-1/line1/x",
         payload={"signal_id": "sig-1", "value": 1.0},  # no "timestamp" field
         ts=1_700_000_000_000.0,  # milliseconds, as colca sends it
-        written_by="connector", actor_id="svc-1", actor_label="connector", actor_kind="local",
+        written_by="connector",
+        actor_id="svc-1",
+        actor_label="connector",
+        actor_kind="local",
     )
     door.queue(Page(records=[r], next=2))
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])
@@ -166,8 +173,7 @@ async def test_a_record_with_no_payload_timestamp_buffers_colca_ts_converted_to_
 
     df = buffer.window("sig-1", 0.0, 2_000_000_000.0)
     assert df["ts"].tolist() == pytest.approx([1_700_000_000.0]), (
-        "a payload with no timestamp must buffer record.ts CONVERTED to "
-        "seconds, not the raw colca milliseconds"
+        "a payload with no timestamp must buffer record.ts CONVERTED to seconds, not the raw colca milliseconds"
     )
 
 
@@ -272,10 +278,12 @@ async def test_handler_invocations_never_overlap(door, buffer):
         await asyncio.sleep(0.01)
         active -= 1
 
-    door.queue(Page(
-        records=[_record(1, "sig-1", 1.0, 10.0), _record(2, "sig-1", 2.0, 20.0)],
-        next=3,
-    ))
+    door.queue(
+        Page(
+            records=[_record(1, "sig-1", 1.0, 10.0), _record(2, "sig-1", 2.0, 20.0)],
+            next=3,
+        )
+    )
     ingest = _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"])
 
     await ingest.run_once()
@@ -516,9 +524,7 @@ async def test_a_drain_runs_off_the_loop_so_timers_keep_firing(buffer):
     )
 
 
-def test_the_rollup_says_what_a_window_ingested_and_that_an_empty_one_ingested_nothing(
-    door, buffer, caplog
-):
+def test_the_rollup_says_what_a_window_ingested_and_that_an_empty_one_ingested_nothing(door, buffer, caplog):
     """One INFO line per 60s window — records, drains, cursor — mirroring the
     connectors' [DATA] rollup. An empty window still logs: on a node whose
     connectors publish every second, "0 records" is the stalled-lane signal

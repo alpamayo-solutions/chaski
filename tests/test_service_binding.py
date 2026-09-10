@@ -74,8 +74,11 @@ class _FakeClient:
 def _service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "line1") -> tuple[Service, _FakeClient]:
     client = _FakeClient()
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="svc1", node_id="n-edge1",
-        system_element_id="el-1", mount=mount,
+        service_id="svc-ulid",
+        service_name="svc1",
+        node_id="n-edge1",
+        system_element_id="el-1",
+        mount=mount,
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))

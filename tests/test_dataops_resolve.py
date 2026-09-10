@@ -36,10 +36,12 @@ class FakeDoor:
 
 
 def test_resolve_signal_unscoped_matches_by_name():
-    door = FakeDoor([
-        _entry("colca/v1/_Signal/n-1/line1/heartbeat", {"id": "sig-1", "name": "heartbeat"}),
-        _entry("colca/v1/_Signal/n-1/line1/part_counter", {"id": "sig-2", "name": "part_counter"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry("colca/v1/_Signal/n-1/line1/heartbeat", {"id": "sig-1", "name": "heartbeat"}),
+            _entry("colca/v1/_Signal/n-1/line1/part_counter", {"id": "sig-2", "name": "part_counter"}),
+        ]
+    )
 
     assert resolve.resolve_signal(door, "heartbeat") == "sig-1"
     assert resolve.resolve_signal(door, "part_counter") == "sig-2"
@@ -52,21 +54,25 @@ def test_resolve_signal_returns_none_when_no_match():
 
 
 def test_resolve_signal_ignores_non_signal_entries():
-    door = FakeDoor([
-        # Same "name" field, but not a _Signal record — must not match.
-        _entry("colca/v1/_Metric/n-1/line1/heartbeat", {"signal_id": "sig-1", "name": "heartbeat"}),
-        _entry("colca/v1/_SystemElement/n-1/line1", {"id": "se-1", "name": "heartbeat"}),
-    ])
+    door = FakeDoor(
+        [
+            # Same "name" field, but not a _Signal record — must not match.
+            _entry("colca/v1/_Metric/n-1/line1/heartbeat", {"signal_id": "sig-1", "name": "heartbeat"}),
+            _entry("colca/v1/_SystemElement/n-1/line1", {"id": "se-1", "name": "heartbeat"}),
+        ]
+    )
 
     assert resolve.resolve_signal(door, "heartbeat") is None
 
 
 def test_resolve_signal_skips_tombstones():
     # A retired _Signal is a retained EMPTY payload — must never match.
-    door = FakeDoor([
-        _entry("colca/v1/_Signal/n-1/line1/heartbeat", {}),
-        _entry("colca/v1/_Signal/n-1/line1/heartbeat2", {"id": "sig-2", "name": "heartbeat"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry("colca/v1/_Signal/n-1/line1/heartbeat", {}),
+            _entry("colca/v1/_Signal/n-1/line1/heartbeat2", {"id": "sig-2", "name": "heartbeat"}),
+        ]
+    )
 
     assert resolve.resolve_signal(door, "heartbeat") == "sig-2"
 
@@ -75,24 +81,34 @@ def test_resolve_signal_skips_tombstones():
 
 
 def test_resolve_signal_scoped_to_system_element():
-    door = FakeDoor([
-        _entry("colca/v1/_SystemElement/n-1/press01", {"id": "se-1", "name": "Press01"}),
-        _entry("colca/v1/_SystemElement/n-1/press02", {"id": "se-2", "name": "Press02"}),
-        _entry("colca/v1/_Signal/n-1/press01/machine_status",
-               {"id": "sig-p1", "name": "machine_status", "system_element_id": "se-1"}),
-        _entry("colca/v1/_Signal/n-1/press02/machine_status",
-               {"id": "sig-p2", "name": "machine_status", "system_element_id": "se-2"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry("colca/v1/_SystemElement/n-1/press01", {"id": "se-1", "name": "Press01"}),
+            _entry("colca/v1/_SystemElement/n-1/press02", {"id": "se-2", "name": "Press02"}),
+            _entry(
+                "colca/v1/_Signal/n-1/press01/machine_status",
+                {"id": "sig-p1", "name": "machine_status", "system_element_id": "se-1"},
+            ),
+            _entry(
+                "colca/v1/_Signal/n-1/press02/machine_status",
+                {"id": "sig-p2", "name": "machine_status", "system_element_id": "se-2"},
+            ),
+        ]
+    )
 
     assert resolve.resolve_signal(door, "machine_status", "Press01") == "sig-p1"
     assert resolve.resolve_signal(door, "machine_status", "Press02") == "sig-p2"
 
 
 def test_resolve_signal_scoped_to_unknown_element_returns_none():
-    door = FakeDoor([
-        _entry("colca/v1/_Signal/n-1/press01/machine_status",
-               {"id": "sig-p1", "name": "machine_status", "system_element_id": "se-1"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry(
+                "colca/v1/_Signal/n-1/press01/machine_status",
+                {"id": "sig-p1", "name": "machine_status", "system_element_id": "se-1"},
+            ),
+        ]
+    )
 
     assert resolve.resolve_signal(door, "machine_status", "NoSuchElement") is None
 
@@ -102,9 +118,11 @@ def test_resolve_signal_scoped_to_unknown_element_returns_none():
 
 def test_a_rebind_is_reflected_on_the_very_next_call():
     """The rule the whole module exists for: no resolved id is remembered."""
-    door = FakeDoor([
-        _entry("colca/v1/_Signal/n-1/line1/heartbeat", {"id": "sig-old", "name": "heartbeat"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry("colca/v1/_Signal/n-1/line1/heartbeat", {"id": "sig-old", "name": "heartbeat"}),
+        ]
+    )
 
     # Denominator: prove resolution actually finds the OLD id first —
     # a staleness claim is only meaningful next to this.
@@ -129,10 +147,12 @@ def test_one_pass_over_many_inputs_costs_one_scan():
     """
     entries = [_entry("colca/v1/_SystemElement/n-1/line1", {"id": "el-1", "name": "line1"})]
     for index in range(30):
-        entries.append(_entry(
-            f"colca/v1/_Signal/n-1/line1/sig{index}",
-            {"id": f"sig-{index}", "name": f"sig{index}", "system_element_id": "el-1"},
-        ))
+        entries.append(
+            _entry(
+                f"colca/v1/_Signal/n-1/line1/sig{index}",
+                {"id": f"sig-{index}", "name": f"sig{index}", "system_element_id": "el-1"},
+            )
+        )
     door = FakeDoor(entries)
 
     with resolve.one_pass(door):
@@ -151,6 +171,7 @@ def test_a_pass_that_cannot_read_is_not_fatal():
     crash-looped dataops on the demo. The pass now declines to pin and every
     resolver reads on its own, failing exactly where it failed before.
     """
+
     class RefusingDoor(FakeDoor):
         def kv(self, prefix):
             self.calls += 1
@@ -158,7 +179,7 @@ def test_a_pass_that_cannot_read_is_not_fatal():
 
     door = RefusingDoor([])
 
-    with resolve.one_pass(door):          # must not raise
+    with resolve.one_pass(door):  # must not raise
         with pytest.raises(RuntimeError):  # ... and the resolver still reports it
             resolve.resolve_signal(door, "heartbeat")
 
@@ -200,9 +221,11 @@ def test_the_pin_does_not_outlive_its_pass():
 
 
 def test_resolve_annotation_type_matches_by_name():
-    door = FakeDoor([
-        _entry("colca/v1/_AnnotationType/n-1/downtime", {"id": "at-1", "name": "downtime"}),
-    ])
+    door = FakeDoor(
+        [
+            _entry("colca/v1/_AnnotationType/n-1/downtime", {"id": "at-1", "name": "downtime"}),
+        ]
+    )
 
     assert resolve.resolve_annotation_type(door, "downtime") == "at-1"
 

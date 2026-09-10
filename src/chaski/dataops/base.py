@@ -124,8 +124,7 @@ class Producer(ABC):
         # (ABCMeta sets it later); default to empty if absent.
         abstract = getattr(cls, "__abstractmethods__", frozenset())
         if abstract:
-            log.debug("Skipping abstract producer %s (abstract methods: %s)",
-                      cls.__name__, sorted(abstract))
+            log.debug("Skipping abstract producer %s (abstract methods: %s)", cls.__name__, sorted(abstract))
             return
 
         if not getattr(cls, "system_element_name", None):

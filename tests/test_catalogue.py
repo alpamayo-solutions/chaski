@@ -18,8 +18,9 @@ ULID = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
 
 
 def _tag(name: str, source: str | None = None, data_type: str = "float", **meta) -> DataTag:
-    return DataTag(id="", name=name, source=source or name, is_writable=False, is_readable=True,
-                   data_type=data_type, meta=meta)
+    return DataTag(
+        id="", name=name, source=source or name, is_writable=False, is_readable=True, data_type=data_type, meta=meta
+    )
 
 
 def _retained(cat: Catalogue) -> dict:
@@ -125,10 +126,12 @@ def test_declare_mints_an_id_per_source_and_the_id_is_reused_by_a_later_declare(
     first = cat.tag_id("Axis1/Temperature")
     assert first and ULID.fullmatch(first)
 
-    cat.declare({
-        "Axis1/Temperature": _tag("Temperature", "Axis1/Temperature"),
-        "Axis2/Temperature": _tag("Temperature", "Axis2/Temperature"),
-    })
+    cat.declare(
+        {
+            "Axis1/Temperature": _tag("Temperature", "Axis1/Temperature"),
+            "Axis2/Temperature": _tag("Temperature", "Axis2/Temperature"),
+        }
+    )
     assert cat.tag_id("Axis1/Temperature") == first, "rediscovery minted a new id; every bound signal just broke"
     assert cat.tag_id("Axis2/Temperature") not in (None, first)
 

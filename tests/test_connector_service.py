@@ -134,11 +134,17 @@ class FakeNode:
         pass
 
     # -- what a test drives --
-    def deliver_signal(self, *, path: str, signal_id: str, data_tag: str, is_published: bool = True,
-                       precision: int | None = None) -> str:
+    def deliver_signal(
+        self, *, path: str, signal_id: str, data_tag: str, is_published: bool = True, precision: int | None = None
+    ) -> str:
         topic = f"colca/v1/_Signal/{NODE}/{path}"
-        signal = Signal(id=signal_id, name=path.rsplit("/", 1)[-1], data_tag=data_tag,
-                        is_published=is_published, precision=precision)
+        signal = Signal(
+            id=signal_id,
+            name=path.rsplit("/", 1)[-1],
+            data_tag=data_tag,
+            is_published=is_published,
+            precision=precision,
+        )
         self._deliver(topic, signal)
         return topic
 
@@ -194,8 +200,15 @@ class FakeDriver(Driver):
         if self.fail_discover:
             raise RuntimeError("browse failed")
         tags = {
-            source: DataTag(id="", name=spec["name"], source=source, is_writable=False, is_readable=True,
-                            data_type=spec["data_type"], meta={})
+            source: DataTag(
+                id="",
+                name=spec["name"],
+                source=source,
+                is_writable=False,
+                is_readable=True,
+                data_type=spec["data_type"],
+                meta={},
+            )
             for source, spec in self.tags.items()
         }
         return Discovery(tags=tags, handles={source: source for source in self.tags})
@@ -204,8 +217,7 @@ class FakeDriver(Driver):
         if self.fail_reads:
             raise SourceDisconnectedError("link down")
         self.reads.append([handle for _s, handle, _t in targets])
-        return [(topic, self.values[handle], signal) for signal, handle, topic in targets
-                if handle in self.values]
+        return [(topic, self.values[handle], signal) for signal, handle, topic in targets if handle in self.values]
 
     async def close(self) -> None:
         self.closes += 1
@@ -251,13 +263,18 @@ def driver() -> FakeDriver:
 
 def make_service(node: FakeNode, driver: Driver, monkeypatch, *, mount: str = "", **kwargs) -> ConnectorService:
     identity = LocalServiceIdentity(
-        service_id="01J00000000000000000000000", service_name=NAME, node_id=NODE,
-        system_element_id="el-1" if mount else "", mount=mount,
+        service_id="01J00000000000000000000000",
+        service_name=NAME,
+        node_id=NODE,
+        system_element_id="el-1" if mount else "",
+        mount=mount,
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
+
     def connect(*args, **kwargs):
         node.max_queued_messages_set(kwargs["max_queued_messages"])
         return node, identity
+
     monkeypatch.setattr("chaski.service.connect_local_mqtt", connect)
     monkeypatch.setattr("chaski.service.Door", node.door)
     clock = kwargs.pop("clock", None) or Clock()
@@ -628,8 +645,10 @@ def test_exhausted_reconnects_stay_alive_and_try_again_next_poll(node, driver, m
 
 def _batch(n: int) -> list[tuple[Topic, Metric]]:
     return [
-        (Topic(payload_type=Metric, node_id=NODE, context=("line1", f"tag{i}")),
-         Metric(value=float(i), timestamp=0.0, signal_id=f"sig-{i}"))
+        (
+            Topic(payload_type=Metric, node_id=NODE, context=("line1", f"tag{i}")),
+            Metric(value=float(i), timestamp=0.0, signal_id=f"sig-{i}"),
+        )
         for i in range(n)
     ]
 
@@ -728,7 +747,10 @@ def test_a_long_outage_reports_once_then_on_the_interval(node, driver, monkeypat
 
 
 def test_recovery_is_reported_once_with_what_it_cost_and_a_second_outage_is_news_again(
-    node, driver, monkeypatch, caplog,
+    node,
+    driver,
+    monkeypatch,
+    caplog,
 ):
     clock = Clock()
     svc = make_service(node, driver, monkeypatch, clock=clock)
@@ -752,8 +774,14 @@ def test_recovery_is_reported_once_with_what_it_cost_and_a_second_outage_is_news
 
 def test_registration_carries_the_drivers_protocol_and_the_given_presentation(node, driver, monkeypatch):
     health = [SimpleNamespace(key="source_healthy")]
-    svc = started(node, driver, monkeypatch, metadata={"demo": "line1"},
-                  architecture_metadata={"icon": "svc-opcua.webp", "status": "stale"}, health_metrics=health)
+    svc = started(
+        node,
+        driver,
+        monkeypatch,
+        metadata={"demo": "line1"},
+        architecture_metadata={"icon": "svc-opcua.webp", "status": "stale"},
+        health_metrics=health,
+    )
     details = node.details()[-1]
     assert details.id == "01J00000000000000000000000" and details.name == NAME and details.colca_node_id == NODE
     assert details.metadata == {"protocol": "FAKE", "demo": "line1"}
@@ -763,9 +791,9 @@ def test_registration_carries_the_drivers_protocol_and_the_given_presentation(no
     assert details.health_metrics == health and details.is_active is True
     svc.close()
     assert node.details()[-1].is_active is False
-    assert len(node.catalogues()) == 0 or all(
-        not t.is_stale for t in node.catalogues()[-1].data_tags
-    ), "closing a connector stales nothing: discovery decides what is stale"
+    assert len(node.catalogues()) == 0 or all(not t.is_stale for t in node.catalogues()[-1].data_tags), (
+        "closing a connector stales nothing: discovery decides what is stale"
+    )
 
 
 def test_a_reconnect_re_resolves_placement_and_republishes_at_the_new_position(node, driver, monkeypatch):
@@ -776,8 +804,11 @@ def test_a_reconnect_re_resolves_placement_and_republishes_at_the_new_position(n
     poll(svc)
     assert len(node.catalogues()) == 1
     moved = LocalServiceIdentity(
-        service_id="01J00000000000000000000000", service_name=NAME, node_id=NODE,
-        system_element_id="el-press3", mount="line1/press3",
+        service_id="01J00000000000000000000000",
+        service_name=NAME,
+        node_id=NODE,
+        system_element_id="el-press3",
+        mount="line1/press3",
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: moved)
 
@@ -804,8 +835,9 @@ def test_the_local_door_is_opened_with_the_log_publisher_attached(node, driver, 
         calls.update(kwargs, name=name)
         return node, kwargs["identity"]
 
-    identity = LocalServiceIdentity(service_id="svc-ulid", service_name=NAME, node_id=NODE,
-                                    system_element_id="", mount="")
+    identity = LocalServiceIdentity(
+        service_id="svc-ulid", service_name=NAME, node_id=NODE, system_element_id="", mount=""
+    )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", connect)
     monkeypatch.setattr("chaski.service.Door", node.door)

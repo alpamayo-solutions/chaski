@@ -121,8 +121,7 @@ def _read_source(module: Any) -> str | None:
     try:
         return Path(file).read_text(encoding="utf-8")
     except OSError:
-        log.warning("Could not read source of %s at %s — excluded from the hash",
-                    module.__name__, file)
+        log.warning("Could not read source of %s at %s — excluded from the hash", module.__name__, file)
         return None
 
 
@@ -188,8 +187,11 @@ def _transitive_project_local_modules(root_module: Any) -> dict[str, Any]:
         try:
             tree = ast.parse(source)
         except SyntaxError:
-            log.warning("Could not parse %s for import discovery — its own "
-                        "source is still hashed, but its imports are not walked", name)
+            log.warning(
+                "Could not parse %s for import discovery — its own "
+                "source is still hashed, but its imports are not walked",
+                name,
+            )
             continue
 
         for candidate in _imported_module_names(tree, module):

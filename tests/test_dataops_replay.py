@@ -30,10 +30,15 @@ def buffer(tmp_path):
 
 @pytest.fixture
 def runtime(buffer):
-    return FakeRuntime(FakeDoor([
-        signal_entry("sig-event", "on_metric_signal"),
-        signal_entry("sig-tick", "tick_only_signal"),
-    ]), buffer)
+    return FakeRuntime(
+        FakeDoor(
+            [
+                signal_entry("sig-event", "on_metric_signal"),
+                signal_entry("sig-tick", "tick_only_signal"),
+            ]
+        ),
+        buffer,
+    )
 
 
 @pytest.fixture(autouse=True)

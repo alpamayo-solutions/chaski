@@ -56,8 +56,6 @@ def __getattr__(name: str) -> Any:
         try:
             from .dataops import DataOpsService
         except ImportError as exc:
-            raise ImportError(
-                "chaski.DataOpsService needs the dataops extra: pip install \"chaski[dataops]\""
-            ) from exc
+            raise ImportError('chaski.DataOpsService needs the dataops extra: pip install "chaski[dataops]"') from exc
         return DataOpsService
     raise AttributeError(f"module 'chaski' has no attribute {name!r}")

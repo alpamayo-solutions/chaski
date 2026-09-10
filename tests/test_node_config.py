@@ -273,9 +273,16 @@ def test_status_is_starting_while_healthz_is_unreachable(tmp_path, monkeypatch):
 
 def test_status_is_awaiting_enrollment_when_uplink_is_unauthorized(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "unauthorized"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "unauthorized"},
+        },
+    )
     status = node.status()
     assert status.state == "awaiting_enrollment"
     assert "POST /enroll" in status.detail
@@ -283,38 +290,73 @@ def test_status_is_awaiting_enrollment_when_uplink_is_unauthorized(tmp_path, mon
 
 def test_status_is_enrolled_once_uplink_connects(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "connected"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "connected"},
+        },
+    )
     assert node.status().state == "enrolled"
 
 
 def test_status_is_offline_after_having_connected_and_then_losing_the_link(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "connected"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "connected"},
+        },
+    )
     assert node.status().state == "enrolled"  # marks _ever_connected
 
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "connecting"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "connecting"},
+        },
+    )
     assert node.status().state == "offline"
 
 
 def test_status_is_awaiting_enrollment_when_never_connected_and_connecting(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "connecting"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "connecting"},
+        },
+    )
     assert node.status().state == "awaiting_enrollment"
 
 
 def test_status_is_enrolled_for_a_root_node_with_no_parent(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path, parent=None)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-root", "pubkey": "rootpub", "uplink": {"state": "none"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-root",
+            "pubkey": "rootpub",
+            "uplink": {"state": "none"},
+        },
+    )
     assert node.status().state == "enrolled"
 
 
@@ -349,9 +391,16 @@ def test_wait_enrolled_raises_node_crashed_immediately_on_a_crashed_process(tmp_
 
 def test_wait_enrolled_times_out_with_the_status_detail(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(node_mod, "_fetch_json", lambda url, timeout: {
-        "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "unauthorized"},
-    })
+    monkeypatch.setattr(
+        node_mod,
+        "_fetch_json",
+        lambda url, timeout: {
+            "ok": True,
+            "ulid": "n-child",
+            "pubkey": "childpub",
+            "uplink": {"state": "unauthorized"},
+        },
+    )
     monkeypatch.setattr(node_mod.time, "sleep", lambda s: None)
     with pytest.raises(TimeoutError, match="POST /enroll"):
         node.wait_enrolled(timeout=0.01)
@@ -390,7 +439,10 @@ def test_enroll_hint_before_start_is_refused(tmp_path):
 
 def test_retire_hint_names_the_parent_and_this_nodes_ulid(tmp_path):
     node = _node_with_fake_process(tmp_path, parent="https://hub.example")
-    assert node.retire_hint() == 'curl -sk -X DELETE https://hub.example/enroll/n-child -H "X-Colca-Token: $COLCA_ADMIN_TOKEN"'
+    assert (
+        node.retire_hint()
+        == 'curl -sk -X DELETE https://hub.example/enroll/n-child -H "X-Colca-Token: $COLCA_ADMIN_TOKEN"'
+    )
 
 
 def test_retire_hint_without_a_parent_is_refused(tmp_path):
@@ -475,7 +527,7 @@ def test_start_wait_healthy_stop_against_a_fake_binary(tmp_path, fake_colcad):
     # is `[python, script.py]`, so a tiny shell wrapper stands in as "the
     # colcad binary" the same way a real platform wheel's entry point would.
     wrapper = tmp_path / "colcad"
-    wrapper.write_text(f"#!/bin/sh\nexec {fake_colcad[0]} {fake_colcad[1]} \"$@\"\n")
+    wrapper.write_text(f'#!/bin/sh\nexec {fake_colcad[0]} {fake_colcad[1]} "$@"\n')
     wrapper.chmod(0o755)
     node = Node("fake", data_dir=tmp_path / "n", binary=str(wrapper))
 
@@ -495,7 +547,7 @@ def test_a_crashing_binary_is_reported_as_crashed(tmp_path):
     script = tmp_path / "dies.py"
     script.write_text("import sys; sys.stderr.write('boom: could not bind\\n'); sys.exit(7)\n")
     wrapper = tmp_path / "colcad"
-    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n")
+    wrapper.write_text(f'#!/bin/sh\nexec {sys.executable} {script} "$@"\n')
     wrapper.chmod(0o755)
     node = Node("fake", data_dir=tmp_path / "n", binary=str(wrapper))
 

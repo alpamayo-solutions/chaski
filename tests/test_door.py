@@ -183,9 +183,7 @@ def test_fetch_parses_gap_object(stub_server, door):
 
     page = door.fetch("metrics", "c/dataops/ingest-01")
 
-    assert page.gap == Gap(
-        stream="metrics", from_offset=1, to_offset=499, first_ts=900.0, last_ts=1200.0, approx=True
-    )
+    assert page.gap == Gap(stream="metrics", from_offset=1, to_offset=499, first_ts=900.0, last_ts=1200.0, approx=True)
 
 
 def test_fetch_default_max_is_sent_as_query_param(stub_server, door):
@@ -333,8 +331,12 @@ def test_kv_builds_prefix_query_and_parses_entries(stub_server, door):
 
 def _kv_entry(path: str, contract: str = "_SystemElement") -> dict:
     return {
-        "path": path, "node_id": "n-1", "topic": f"colca/v1/{contract}/n-1/{path}",
-        "payload": {"name": path}, "ts": 1.0, "offset": 1,
+        "path": path,
+        "node_id": "n-1",
+        "topic": f"colca/v1/{contract}/n-1/{path}",
+        "payload": {"name": path},
+        "ts": 1.0,
+        "offset": 1,
     }
 
 

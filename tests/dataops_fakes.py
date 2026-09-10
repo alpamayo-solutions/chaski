@@ -26,6 +26,7 @@ def run_async(coro_fn):
     @functools.wraps(coro_fn)
     def _wrapper(*args, **kwargs):
         return asyncio.run(coro_fn(*args, **kwargs))
+
     return _wrapper
 
 
@@ -35,7 +36,9 @@ def kv_entry(topic: str, payload: dict | None, *, node_id: str = NODE_ID) -> KvE
 
 def signal_entry(signal_id: str, name: str, *, path: str | None = None, node_id: str = NODE_ID) -> KvEntry:
     return kv_entry(
-        f"colca/v1/_Signal/{node_id}/{path or name}", {"id": signal_id, "name": name}, node_id=node_id,
+        f"colca/v1/_Signal/{node_id}/{path or name}",
+        {"id": signal_id, "name": name},
+        node_id=node_id,
     )
 
 
@@ -44,8 +47,9 @@ class FakeDoor:
     calls to simulate a KV change), recorded ``publish()`` calls, fixed
     ``self_info()``, and queued pages for ``fetch``/``ack``/``delete_cursor``."""
 
-    def __init__(self, entries: list[KvEntry] | None = None, *, ulid: str = "svc-1",
-                 name: str = "dataops", mount: str = "") -> None:
+    def __init__(
+        self, entries: list[KvEntry] | None = None, *, ulid: str = "svc-1", name: str = "dataops", mount: str = ""
+    ) -> None:
         self.entries = list(entries or [])
         self.published: list[tuple[str, str]] = []
         self.kv_calls = 0
@@ -76,9 +80,7 @@ class FakeDoor:
         self._pages.append(page)
 
     def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
-        self.fetch_calls.append(
-            {"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids}
-        )
+        self.fetch_calls.append({"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids})
         if self._pages:
             return self._pages.pop(0)
         return Page(records=[], next=1)

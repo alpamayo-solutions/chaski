@@ -99,10 +99,13 @@ def test_unbound_output_log_is_rate_limited(caplog, monkeypatch):
 
 
 def test_binding_not_marked_is_published_counts_as_unbound():
-    door = FakeDoor([
-        _signal_entry("colca/v1/_Signal/n-1/line1/computed", signal_id="sig-1", data_tag="tag-1",
-                      is_published=False),
-    ])
+    door = FakeDoor(
+        [
+            _signal_entry(
+                "colca/v1/_Signal/n-1/line1/computed", signal_id="sig-1", data_tag="tag-1", is_published=False
+            ),
+        ]
+    )
     out = _bound_output(door)
 
     out.publish(1.0)
@@ -111,11 +114,13 @@ def test_binding_not_marked_is_published_counts_as_unbound():
 
 
 def test_bound_output_publishes_metric_at_the_bound_position():
-    door = FakeDoor([
-        _signal_entry("colca/v1/_Signal/n-1/line1/computed", signal_id="sig-99", data_tag="tag-1"),
-        # A binding for a DIFFERENT tag must not be picked up.
-        _signal_entry("colca/v1/_Signal/n-1/line1/other", signal_id="sig-other", data_tag="tag-2"),
-    ])
+    door = FakeDoor(
+        [
+            _signal_entry("colca/v1/_Signal/n-1/line1/computed", signal_id="sig-99", data_tag="tag-1"),
+            # A binding for a DIFFERENT tag must not be picked up.
+            _signal_entry("colca/v1/_Signal/n-1/line1/other", signal_id="sig-other", data_tag="tag-2"),
+        ]
+    )
     out = _bound_output(door)
 
     out.publish(3.14, timestamp=1000.0)
@@ -139,9 +144,11 @@ def test_rebind_is_picked_up_on_the_next_resolution_pass():
     a RETIRED signal indefinitely, and `forget` on each resolution pass is
     what prevents that.
     """
-    door = FakeDoor([
-        _signal_entry("colca/v1/_Signal/n-1/line1/computed", signal_id="sig-old", data_tag="tag-1"),
-    ])
+    door = FakeDoor(
+        [
+            _signal_entry("colca/v1/_Signal/n-1/line1/computed", signal_id="sig-old", data_tag="tag-1"),
+        ]
+    )
     out = _bound_output(door)
     out.publish(1.0)
     assert json.loads(door.published[-1][1])["signal_id"] == "sig-old"
@@ -152,8 +159,7 @@ def test_rebind_is_picked_up_on_the_next_resolution_pass():
     ]
     out.publish(2.0)
     assert json.loads(door.published[-1][1])["signal_id"] == "sig-old", (
-        "a bound output re-read KV on a publish — that is the scan per value "
-        "this replaced"
+        "a bound output re-read KV on a publish — that is the scan per value this replaced"
     )
 
     out.forget()
@@ -190,8 +196,7 @@ def _catalogue_topic() -> str:
 
 
 def _build(door, producer):
-    return build_catalogue([producer], door, node_id=NODE_ID, mount="",
-                           service_name="dataops", service_ulid="svc-1")
+    return build_catalogue([producer], door, node_id=NODE_ID, mount="", service_name="dataops", service_ulid="svc-1")
 
 
 def test_build_catalogue_mints_ids_and_publishes_when_none_retained():
@@ -246,7 +251,8 @@ def test_build_catalogue_republishes_when_declared_outputs_actually_change():
 
     door2 = FakeDoor([kv_entry(published_topic, json.loads(published_json))])
     producer2 = _producer(
-        "press", FakeRuntime(door2, None),
+        "press",
+        FakeRuntime(door2, None),
         computed=SignalOutput("computed", "float"),
         extra=SignalOutput("extra", "int"),  # a genuinely new declared output
     )
@@ -257,8 +263,7 @@ def test_build_catalogue_republishes_when_declared_outputs_actually_change():
 
 def test_build_catalogue_carries_a_removed_source_forward_as_stale():
     door1 = FakeDoor()
-    producer1 = _producer("press", FakeRuntime(door1, None),
-                          a=SignalOutput("a", "float"), b=SignalOutput("b", "float"))
+    producer1 = _producer("press", FakeRuntime(door1, None), a=SignalOutput("a", "float"), b=SignalOutput("b", "float"))
     result1 = _build(door1, producer1)
     published_topic, published_json = door1.published[0]
 
@@ -419,7 +424,8 @@ def test_a_refused_scan_idles_the_publish_instead_of_killing_the_tick():
         def kv(self, prefix="", *, contract=None):
             request = httpx.Request("GET", "http://colca/kv")
             raise httpx.HTTPStatusError(
-                f"{self.status}", request=request,
+                f"{self.status}",
+                request=request,
                 response=httpx.Response(self.status, request=request),
             )
 

@@ -318,7 +318,9 @@ class Node:
             if existing and existing.get("url") == url and existing.get("pubkey") != pubkey:
                 logger.info(
                     "chaski.Node: re-pinning %s from %s to %s (explicit parent= given)",
-                    url, _short(existing["pubkey"]), _short(pubkey),
+                    url,
+                    _short(existing["pubkey"]),
+                    _short(pubkey),
                 )
             self._write_pin(url, pubkey)
             self.parent_url, self.parent_pubkey = _api_url(url), pubkey
@@ -334,8 +336,10 @@ class Node:
         except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
             if existing and existing.get("url") == url:
                 logger.warning(
-                    "chaski.Node: could not reach %s to re-verify its pinned key (%s) — "
-                    "using the pin from %s", url, exc, self._pin_path(),
+                    "chaski.Node: could not reach %s to re-verify its pinned key (%s) — using the pin from %s",
+                    url,
+                    exc,
+                    self._pin_path(),
                 )
                 self.parent_url, self.parent_pubkey = url, existing["pubkey"]
                 return {"url": _repl_url(url), "pubkey": existing["pubkey"]}
@@ -427,7 +431,9 @@ class Node:
             stderr=subprocess.STDOUT,
         )
         self._log_thread = threading.Thread(
-            target=self._drain_log, args=(self._process.stdout,), daemon=True,
+            target=self._drain_log,
+            args=(self._process.stdout,),
+            daemon=True,
         )
         self._log_thread.start()
         try:
@@ -457,9 +463,7 @@ class Node:
                 }
                 return
             time.sleep(0.05)
-        raise TimeoutError(
-            f"chaski.Node: colcad did not report its door addresses at {path} within {timeout:.0f}s"
-        )
+        raise TimeoutError(f"chaski.Node: colcad did not report its door addresses at {path} within {timeout:.0f}s")
 
     def _drain_log(self, pipe: Any) -> None:
         """Runs on its own thread for the process's whole life: colcad's
@@ -640,5 +644,3 @@ class Node:
         svc = Service(name, mount, node=door, state_dir=self.data_dir / "services" / name)
         svc.start()
         return svc
-
-

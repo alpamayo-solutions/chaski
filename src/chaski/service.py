@@ -121,6 +121,7 @@ class Binding(NamedTuple):
     topic: Topic
     signal: SignalRecord
 
+
 # How long a not-yet-bound path may keep buffering before its "still
 # unbound" line repeats — mirrors colca's own 5-minute reminder shape
 # (unbound.go on the node side of this same gap).
@@ -142,9 +143,7 @@ class NotEnrolled(RuntimeError):
     enrolls it; also available bare via :meth:`Service.enroll_hint`."""
 
     def __init__(self, name: str, node_url: str, command: str) -> None:
-        super().__init__(
-            f"{name} is not enrolled at {node_url}. To enroll it:\n  {command}"
-        )
+        super().__init__(f"{name} is not enrolled at {node_url}. To enroll it:\n  {command}")
         self.command = command
 
 
@@ -265,10 +264,14 @@ def _mint_identity(identity_dir: Path) -> tuple[str, str, Path, Path]:
         ulid_path.write_text(ulid, encoding="utf-8")
         ulid_path.chmod(0o600)
 
-    pubkey_hex = key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    ).hex()
+    pubkey_hex = (
+        key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        .hex()
+    )
     return ulid, pubkey_hex, key_path, cert_path
 
 
@@ -293,8 +296,13 @@ def _read_node_id(healthz_url: str, timeout: float = 10.0) -> str:
 
 
 def _connect_external_mqtt(
-    host: str, port: int, ulid: str, key_path: Path, cert_path: Path,
-    *, will: Optional[tuple[Topic, ServiceDetails]] = None,
+    host: str,
+    port: int,
+    ulid: str,
+    key_path: Path,
+    cert_path: Path,
+    *,
+    will: Optional[tuple[Topic, ServiceDetails]] = None,
     max_queued_messages: int = 0,
 ) -> Client:
     client = Client(client_id=ulid, protocol=pahomqtt.MQTTv5)
@@ -314,19 +322,20 @@ def _connect_external_mqtt(
     return client
 
 
-def _revoke_external(node_url: str, ulid: str, token: str, *, api_port: Optional[int] = None,
-                      timeout: float = 15.0) -> None:
+def _revoke_external(
+    node_url: str, ulid: str, token: str, *, api_port: Optional[int] = None, timeout: float = 15.0
+) -> None:
     """``DELETE /enroll/{ulid}`` on the node's admin door."""
     _, base = _node_admin_base(node_url, api_port)
     request = urllib.request.Request(
-        f"{base}/enroll/{ulid}", method="DELETE", headers={"X-Colca-Token": token},
+        f"{base}/enroll/{ulid}",
+        method="DELETE",
+        headers={"X-Colca-Token": token},
     )
     try:
         urllib.request.urlopen(request, timeout=timeout, context=_insecure_ssl_context())  # noqa: S310
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"chaski.Service.retire(): revoking {ulid} at {node_url} failed: HTTP {exc.code}"
-        ) from exc
+        raise RuntimeError(f"chaski.Service.retire(): revoking {ulid} at {node_url} failed: HTTP {exc.code}") from exc
 
 
 class Service:
@@ -460,13 +469,9 @@ class Service:
             self._external = True
             self._door = None
             self._node_url = node
-            self.ulid, self.pubkey, self._key_path, self._cert_path = _mint_identity(
-                self._state_dir / "identity"
-            )
+            self.ulid, self.pubkey, self._key_path, self._cert_path = _mint_identity(self._state_dir / "identity")
         else:
-            raise TypeError(
-                f"chaski.Service: node= must be None, a URL string, or LocalDoor, got {node!r}"
-            )
+            raise TypeError(f"chaski.Service: node= must be None, a URL string, or LocalDoor, got {node!r}")
 
     # -- lifecycle -----------------------------------------------------
 
@@ -492,7 +497,10 @@ class Service:
         door = self._door
         assert door is not None  # local mode always carries a door
         identity = resolve_local_identity(
-            self.name, host=door.host, http_port=door.http_port, mount=self._mount,
+            self.name,
+            host=door.host,
+            http_port=door.http_port,
+            mount=self._mount,
         )
         self._node_id = identity.node_id
         self._service_id = identity.service_id
@@ -503,8 +511,13 @@ class Service:
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
         try:
             client, _ = connect_local_mqtt(
-                self.name, host=door.host, http_port=door.http_port, mqtt_port=door.mqtt_port,
-                mount=self._mount, identity=identity, publish_logs=self.logs,
+                self.name,
+                host=door.host,
+                http_port=door.http_port,
+                mqtt_port=door.mqtt_port,
+                mount=self._mount,
+                identity=identity,
+                publish_logs=self.logs,
                 will=(self._details_topic, will_payload),
                 max_queued_messages=self._max_queued_messages,
             )
@@ -533,7 +546,11 @@ class Service:
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
         port = self._mqtt_port_override or _DEFAULT_EXTERNAL_MQTT_PORT
         self._client = _connect_external_mqtt(
-            host, port, self.ulid, self._key_path, self._cert_path,
+            host,
+            port,
+            self.ulid,
+            self._key_path,
+            self._cert_path,
             will=(self._details_topic, will_payload),
             max_queued_messages=self._max_queued_messages,
         )
@@ -557,7 +574,9 @@ class Service:
         self._system_element_id = element_id
         self._catalogue_topic = Topic(payload_type=DataTags, node_id=self._node_id, context=self._hierarchy)
         self._details_topic = Topic(
-            payload_type=ServiceDetails, node_id=self._node_id, context=self._hierarchy + ("_service",),
+            payload_type=ServiceDetails,
+            node_id=self._node_id,
+            context=self._hierarchy + ("_service",),
         )
         mount_parts = tuple(p for p in mount.split("/") if p)
         filter_context = (*mount_parts, "#") if mount_parts else ("#",)
@@ -576,8 +595,7 @@ class Service:
             raise RuntimeError(f"chaski.Service: broker refused CONNECT ({reason_code})")
         self._connected = True
 
-    def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any,
-                    _properties: Any = None) -> None:
+    def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any = None) -> None:
         """paho's CONNACK callback, on its network thread. The first one
         releases :meth:`start`, which finishes the setup on the caller's
         thread (:meth:`_after_connect`). Every later one is a RECONNECT —
@@ -615,7 +633,10 @@ class Service:
         if not self._external:
             door = self._door
             identity = resolve_local_identity(
-                self.name, host=door.host, http_port=door.http_port, mount=self._mount,
+                self.name,
+                host=door.host,
+                http_port=door.http_port,
+                mount=self._mount,
             )
             with self._lock:
                 self._apply_placement(identity.mount, identity.hierarchy, identity.system_element_id or None)
@@ -627,8 +648,7 @@ class Service:
             client.unsubscribe(old_filter)
         client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         with self._lock:
-            details = self._build_service_details(is_active=True, status=self._last_status,
-                                                  detail=self._last_detail)
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
         self._placement_reannounced()
 
@@ -711,9 +731,7 @@ class Service:
         (also the text of a raised :class:`NotEnrolled`). Outside a
         deployment only."""
         if not self._external:
-            raise RuntimeError(
-                "chaski.Service.enroll_hint() only applies outside a deployment (node=<url>)"
-            )
+            raise RuntimeError("chaski.Service.enroll_hint() only applies outside a deployment (node=<url>)")
         position = f" at {self._mount!r}" if self._mount else ""
         return (
             f"enroll {self.name} at {self._node_url}: author an element{position} there, then "
@@ -725,9 +743,7 @@ class Service:
         """Poll ``start()`` — reconnecting — until the operator enrolls this
         identity, or ``timeout`` elapses. Outside a deployment only."""
         if not self._external:
-            raise RuntimeError(
-                "chaski.Service.wait_enrolled() only applies outside a deployment (node=<url>)"
-            )
+            raise RuntimeError("chaski.Service.wait_enrolled() only applies outside a deployment (node=<url>)")
         deadline = time.monotonic() + timeout
         last_exc: Optional[Exception] = None
         while True:
@@ -766,9 +782,7 @@ class Service:
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
         if self._client is None:
-            raise RuntimeError(
-                "chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()"
-            )
+            raise RuntimeError("chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()")
         with self._lock:
             tag_id, _changed = self._catalogue.ensure(path, value, unit)
             self._seen.add(path)
@@ -807,7 +821,9 @@ class Service:
             self._unbound_log_at[path] = now
             logger.warning(
                 "chaski.Service: %r has no bound Signal yet — buffering (%d queued, capped at %d)",
-                path, len(queue), _MAX_BUFFERED_PER_PATH,
+                path,
+                len(queue),
+                _MAX_BUFFERED_PER_PATH,
             )
 
     # -- consuming ---------------------------------------------------------
@@ -816,9 +832,7 @@ class Service:
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
         if self._http is None:
-            raise RuntimeError(
-                f"chaski.Service: call start() (or use `with Service(...) as svc:`) before {method}()"
-            )
+            raise RuntimeError(f"chaski.Service: call start() (or use `with Service(...) as svc:`) before {method}()")
         return self._http
 
     @property
@@ -871,7 +885,11 @@ class Service:
         """
         door = self._require_http("stream")
         return Stream(
-            door, name, self.cursor_prefix + (cursor or name), max=max, signal_ids=signal_ids,
+            door,
+            name,
+            self.cursor_prefix + (cursor or name),
+            max=max,
+            signal_ids=signal_ids,
         )
 
     def pending(self) -> list[tuple[str, str]]:
@@ -892,9 +910,7 @@ class Service:
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
         if self._client is None:
-            raise RuntimeError(
-                "chaski.Service: call start() (or use `with Service(...) as svc:`) before status()"
-            )
+            raise RuntimeError("chaski.Service: call start() (or use `with Service(...) as svc:`) before status()")
         self._last_status = "healthy" if ok else "unhealthy"
         self._last_detail = detail
         with self._lock:
@@ -1030,9 +1046,7 @@ class Service:
                 self._seal_catalogue()
                 catalogue = self._catalogue_to_publish()
             details = (
-                self._build_service_details(is_active=False, status=self._last_status)
-                if client is not None
-                else None
+                self._build_service_details(is_active=False, status=self._last_status) if client is not None else None
             )
         # Outside the lock — see _publish_outside_the_lock.
         if catalogue is not None:

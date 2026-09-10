@@ -51,9 +51,15 @@ class _FakeClient:
 
 def _record(offset: int, stream: str = "annotations") -> Record:
     return Record(
-        offset=offset, origin_offset=offset, topic=f"colca/v1/_X/n-1/{stream}/{offset}",
-        payload={"n": offset}, ts=float(offset) * 1000, written_by="svc",
-        actor_id="a", actor_label="svc", actor_kind="local",
+        offset=offset,
+        origin_offset=offset,
+        topic=f"colca/v1/_X/n-1/{stream}/{offset}",
+        payload={"n": offset},
+        ts=float(offset) * 1000,
+        written_by="svc",
+        actor_id="a",
+        actor_label="svc",
+        actor_kind="local",
     )
 
 
@@ -87,8 +93,9 @@ class _FakeDoor:
         lwm = self.lwm.get(stream, 1)
         gap = None
         if position + 1 < lwm:
-            gap = Gap(stream=stream, from_offset=position + 1, to_offset=lwm - 1,
-                      first_ts=None, last_ts=None, approx=False)
+            gap = Gap(
+                stream=stream, from_offset=position + 1, to_offset=lwm - 1, first_ts=None, last_ts=None, approx=False
+            )
         records = [r for r in self.streams.get(stream, []) if r.offset > position and r.offset >= lwm][:max]
         if records:
             next_offset = records[-1].offset + 1
@@ -125,8 +132,11 @@ def fake_door(monkeypatch):
 
 def _local_service(tmp_path: Path, monkeypatch, *, mount: str = "line1") -> Service:
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="erp-bridge", node_id="n-edge1",
-        system_element_id="el-1", mount=mount,
+        service_id="svc-ulid",
+        service_name="erp-bridge",
+        node_id="n-edge1",
+        system_element_id="el-1",
+        mount=mount,
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (_FakeClient(), identity))
@@ -191,7 +201,9 @@ def test_stream_names_its_cursor_inside_the_services_namespace(tmp_path, monkeyp
 
 
 def test_drain_yields_every_record_in_order_and_acks_per_page_after_consumption(
-    tmp_path, monkeypatch, fake_door,
+    tmp_path,
+    monkeypatch,
+    fake_door,
 ):
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
@@ -235,7 +247,9 @@ def test_a_second_drain_resumes_from_the_acked_position(tmp_path, monkeypatch, f
 
 
 def test_a_consumer_that_dies_mid_page_never_acks_it_so_the_page_is_redelivered(
-    tmp_path, monkeypatch, fake_door,
+    tmp_path,
+    monkeypatch,
+    fake_door,
 ):
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
@@ -333,8 +347,14 @@ def test_kv_passes_prefix_and_contract_filter_to_the_door(tmp_path, monkeypatch,
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
     door.kv_entries = [
-        KvEntry(path="line1/press1", node_id="n", topic="colca/v1/_SystemElement/n/line1/press1",
-                payload={}, ts=0.0, offset=1),
+        KvEntry(
+            path="line1/press1",
+            node_id="n",
+            topic="colca/v1/_SystemElement/n/line1/press1",
+            payload={},
+            ts=0.0,
+            offset=1,
+        ),
         KvEntry(path="line2/x", node_id="n", topic="colca/v1/_Signal/n/line2/x", payload={}, ts=0.0, offset=2),
     ]
 

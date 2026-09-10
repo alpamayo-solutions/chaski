@@ -226,8 +226,9 @@ class Ingest:
     async def _process_record(self, record: Record) -> None:
         signal_id = self._signal_id_of(record)
         if signal_id is None:
-            log.warning("Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it",
-                        record.offset, record.topic)
+            log.warning(
+                "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
+            )
             return
 
         ts = self._timestamp_of(record)
@@ -243,7 +244,8 @@ class Ingest:
                 # this event.
                 log.exception(
                     "on_metric handler failed for signal_id=%s at offset=%d — continuing",
-                    signal_id, record.offset,
+                    signal_id,
+                    record.offset,
                 )
 
     @staticmethod
@@ -275,7 +277,12 @@ class Ingest:
         log.warning(
             "Gap on stream=%s: offsets %d..%d were pruned (first_ts=%s last_ts=%s approx=%s) — "
             "continuing from the low-water mark; deep-backfill from the historian is the repair tool.",
-            gap.stream, gap.from_offset, gap.to_offset, gap.first_ts, gap.last_ts, gap.approx,
+            gap.stream,
+            gap.from_offset,
+            gap.to_offset,
+            gap.first_ts,
+            gap.last_ts,
+            gap.approx,
         )
 
     # ------------------------------------------------------------------ doorbell
@@ -375,7 +382,9 @@ class Ingest:
                 backoff = self._error_backoff_s(consecutive_errors)
                 log.warning(
                     "Ingest drain failed (attempt %d): %s — retrying in %.1fs",
-                    consecutive_errors, exc, backoff,
+                    consecutive_errors,
+                    exc,
+                    backoff,
                 )
                 await self._sleep_or_stop(backoff, stop)
                 continue

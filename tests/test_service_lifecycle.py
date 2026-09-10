@@ -61,11 +61,16 @@ class _FakeClient:
         self.tombstoned.append(str(topic))
 
 
-def _local_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "line1", **kwargs) -> tuple[Service, _FakeClient]:
+def _local_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "line1", **kwargs
+) -> tuple[Service, _FakeClient]:
     client = _FakeClient()
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="svc1", node_id="n-edge1",
-        system_element_id="el-1", mount=mount,
+        service_id="svc-ulid",
+        service_name="svc1",
+        node_id="n-edge1",
+        system_element_id="el-1",
+        mount=mount,
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))
@@ -76,7 +81,11 @@ def _local_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: st
 
 
 def _external_service(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "site1/erp", fails: bool = False,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mount: str = "site1/erp",
+    fails: bool = False,
 ) -> tuple[Service, _FakeClient]:
     client = _FakeClient(reason_code=_FakeReasonCode(is_failure=fails))
     monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")  # noqa: ARG005
@@ -95,7 +104,11 @@ def _details(client: _FakeClient) -> list[ServiceDetails]:
 
 def test_start_publishes_one_active_healthy_service_details(tmp_path, monkeypatch):
     svc, client = _local_service(
-        tmp_path, monkeypatch, display_name="ERP Bridge", description="pushes ERP orders", version="1.2.3",
+        tmp_path,
+        monkeypatch,
+        display_name="ERP Bridge",
+        description="pushes ERP orders",
+        version="1.2.3",
     )
     details = _details(client)
     assert len(details) == 1
@@ -142,8 +155,11 @@ def test_status_transitions_health_without_deactivating(tmp_path, monkeypatch):
 def test_local_start_sets_a_last_will_before_connect(tmp_path, monkeypatch):
     captured: dict = {}
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="svc1", node_id="n-edge1",
-        system_element_id="el-1", mount="line1",
+        service_id="svc-ulid",
+        service_name="svc1",
+        node_id="n-edge1",
+        system_element_id="el-1",
+        mount="line1",
     )
     client = _FakeClient()
 

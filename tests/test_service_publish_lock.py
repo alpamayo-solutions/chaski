@@ -54,9 +54,7 @@ class _NetworkThreadClient:
         self.subscriptions: dict[str, object] = {}
         self.on_connect = None
         self.node_id = None
-        self._net = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fake-mqtt-net"
-        )
+        self._net = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="fake-mqtt-net")
         self._armed: list[tuple[Topic, object]] = []
 
     # -- franzmq surface ------------------------------------------------
@@ -125,8 +123,11 @@ class _NetworkThreadClient:
 def service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     client = _NetworkThreadClient()
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="erp", node_id="n-edge1",
-        system_element_id=None, mount="",
+        service_id="svc-ulid",
+        service_name="erp",
+        node_id="n-edge1",
+        system_element_id=None,
+        mount="",
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))
@@ -215,8 +216,7 @@ def test_the_lock_is_free_while_a_publish_waits(service):
     def publish_and_probe(*args, **kwargs):
         threading.Thread(target=grab_the_lock, daemon=True).start()
         assert taken.wait(_PUBACK_TIMEOUT), (
-            "Service._lock was held while a publish waited for its PUBACK "
-            "(service.py _publish_outside_the_lock)"
+            "Service._lock was held while a publish waited for its PUBACK (service.py _publish_outside_the_lock)"
         )
         return original(*args, **kwargs)
 

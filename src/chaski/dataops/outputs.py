@@ -114,8 +114,7 @@ class SignalOutput(_PerInstance):
     this tag to.
     """
 
-    def __init__(self, signal_name: str, data_type: str, description: str = "",
-                 system_element_name: str | None = None):
+    def __init__(self, signal_name: str, data_type: str, description: str = "", system_element_name: str | None = None):
         self.signal_name = signal_name
         self.data_type = data_type
         self.description = description
@@ -158,8 +157,7 @@ class SignalOutput(_PerInstance):
     def tag_id(self) -> str:
         if self._tag_id is None:
             raise RuntimeError(
-                f"SignalOutput[{self.signal_name!r}] has no catalogue tag id — "
-                "not bound yet (see build_catalogue())"
+                f"SignalOutput[{self.signal_name!r}] has no catalogue tag id — not bound yet (see build_catalogue())"
             )
         return self._tag_id
 
@@ -209,8 +207,7 @@ class SignalOutput(_PerInstance):
 
         metric = Metric(value=value, timestamp=_epoch(timestamp), signal_id=signal_id)
         door.publish(topic, metric.encode())
-        log.debug("SignalOutput[%s]: published %r @ %s on %s",
-                  self.signal_name, value, metric.timestamp, topic)
+        log.debug("SignalOutput[%s]: published %r @ %s on %s", self.signal_name, value, metric.timestamp, topic)
 
     def _log_unbound(self) -> None:
         now = time.time()
@@ -218,9 +215,10 @@ class SignalOutput(_PerInstance):
             return
         self._last_unbound_log_ts = now
         log.warning(
-            "SignalOutput[%s] (source=%s, tag=%s) has no bound _Signal yet — "
-            "publish is idle until it is commissioned",
-            self.signal_name, self._source, self._tag_id,
+            "SignalOutput[%s] (source=%s, tag=%s) has no bound _Signal yet — publish is idle until it is commissioned",
+            self.signal_name,
+            self._source,
+            self._tag_id,
         )
 
 
@@ -280,11 +278,13 @@ class AnnotationOutput(_PerInstance):
     def _topic(self, annotation_id: str) -> str:
         if self._node_id is None or self._topic_prefix is None:
             raise RuntimeError(f"AnnotationOutput[{self.annotation_name!r}] is not bound yet")
-        return str(Topic(
-            payload_type=AnnotationPayload,
-            node_id=self._node_id,
-            context=(*self._topic_prefix, annotation_id),
-        ))
+        return str(
+            Topic(
+                payload_type=AnnotationPayload,
+                node_id=self._node_id,
+                context=(*self._topic_prefix, annotation_id),
+            )
+        )
 
     # ─── write path ─────────────────────────────────────────────────────
 
@@ -324,8 +324,7 @@ class AnnotationOutput(_PerInstance):
         )
         runtime.door.publish(self._topic(annotation_id), payload.encode())
         runtime.buffer.record_emitted_annotation(source, annotation_id, ts_start)
-        log.debug("AnnotationOutput[%s]: published %s @ %s..%s",
-                  self.annotation_name, annotation_id, ts_start, ts_end)
+        log.debug("AnnotationOutput[%s]: published %s @ %s..%s", self.annotation_name, annotation_id, ts_start, ts_end)
         return annotation_id
 
     def clear_window(self, start: Any, end: Any) -> int:
@@ -352,8 +351,13 @@ class AnnotationOutput(_PerInstance):
             )
             runtime.door.publish(self._topic(annotation_id), payload.encode())
         if pairs:
-            log.info("AnnotationOutput[%s]: cleared %d annotation(s) in %s..%s",
-                     self.annotation_name, len(pairs), start_s, end_s)
+            log.info(
+                "AnnotationOutput[%s]: cleared %d annotation(s) in %s..%s",
+                self.annotation_name,
+                len(pairs),
+                start_s,
+                end_s,
+            )
         return len(pairs)
 
 
@@ -438,16 +442,16 @@ def build_catalogue(
     Returns ``{source: tag_id}`` for every declared output (bound or not).
     """
     mount_parts = tuple(p for p in mount.split("/") if p)
-    catalogue_topic = str(Topic(
-        payload_type=DataTags, node_id=node_id, context=(*mount_parts, service_name),
-    ))
+    catalogue_topic = str(
+        Topic(
+            payload_type=DataTags,
+            node_id=node_id,
+            context=(*mount_parts, service_name),
+        )
+    )
 
     previous_payload = _read_previous_catalogue(door, catalogue_topic)
-    previous = {
-        t.get("source"): t
-        for t in (previous_payload.get("data_tags") or [])
-        if t.get("source")
-    }
+    previous = {t.get("source"): t for t in (previous_payload.get("data_tags") or []) if t.get("source")}
 
     declared = list(_iter_signal_outputs(instances))
     seen_sources: set[str] = set()
@@ -494,13 +498,15 @@ def build_catalogue(
     new_state = (catalogue_topic, payload.connector, payload.version)
     old_state = (
         (catalogue_topic, previous_payload.get("connector"), previous_payload.get("version"))
-        if previous_payload else None
+        if previous_payload
+        else None
     )
 
     if new_state != old_state:
         door.publish(catalogue_topic, payload.encode())
-        log.info("Published output catalogue to %s: %d tag(s), revision %s",
-                 catalogue_topic, len(tags), payload.version[:12])
+        log.info(
+            "Published output catalogue to %s: %d tag(s), revision %s", catalogue_topic, len(tags), payload.version[:12]
+        )
     else:
         log.debug("Output catalogue unchanged (%s), not republished", payload.version[:12])
 

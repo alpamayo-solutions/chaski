@@ -169,9 +169,7 @@ class Buffer:
         with self._lock:
             for signal_id, horizon in horizons.items():
                 cutoff = now - horizon
-                cur = self._conn.execute(
-                    "DELETE FROM points WHERE signal_id = ? AND ts < ?", (signal_id, cutoff)
-                )
+                cur = self._conn.execute("DELETE FROM points WHERE signal_id = ? AND ts < ?", (signal_id, cutoff))
                 deleted += cur.rowcount
             self._conn.commit()
         return deleted
@@ -181,17 +179,13 @@ class Buffer:
     def watermark(self, producer: str) -> float | None:
         """The producer's last-processed position, or ``None`` if never set."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT position FROM watermarks WHERE producer = ?", (producer,)
-            ).fetchone()
+            row = self._conn.execute("SELECT position FROM watermarks WHERE producer = ?", (producer,)).fetchone()
         return row[0] if row is not None else None
 
     def code_hash(self, producer: str) -> str | None:
         """The code hash last stored for the producer, or ``None`` if never set."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT code_hash FROM watermarks WHERE producer = ?", (producer,)
-            ).fetchone()
+            row = self._conn.execute("SELECT code_hash FROM watermarks WHERE producer = ?", (producer,)).fetchone()
         return row[0] if row is not None else None
 
     def set_watermark(self, producer: str, position: float, code_hash: str) -> None:
@@ -221,8 +215,7 @@ class Buffer:
         """
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO emitted_annotations (source, annotation_id, time_start) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO emitted_annotations (source, annotation_id, time_start) VALUES (?, ?, ?)",
                 (source, annotation_id, time_start),
             )
             self._conn.commit()

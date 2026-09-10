@@ -83,16 +83,28 @@ class _FakeNodeDoor:
     def __init__(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None) -> None:
         self.service = service
         self.entries: list[KvEntry] = [
-            KvEntry(path="oven/temperature", node_id=NODE_ID,
-                    topic=f"colca/v1/_Signal/{NODE_ID}/oven/temperature",
-                    payload={"id": "sig-in", "name": "temperature"}, ts=0.0, offset=1),
+            KvEntry(
+                path="oven/temperature",
+                node_id=NODE_ID,
+                topic=f"colca/v1/_Signal/{NODE_ID}/oven/temperature",
+                payload={"id": "sig-in", "name": "temperature"},
+                ts=0.0,
+                offset=1,
+            ),
         ]
         self.published: list[tuple[str, dict]] = []
         self.records: list[Record] = [
-            Record(offset=1, origin_offset=1, topic=f"colca/v1/_Metric/{NODE_ID}/oven/temperature",
-                   payload={"signal_id": "sig-in", "value": 21.5, "timestamp": 1_700_000_000.0},
-                   ts=1_700_000_000_000.0, written_by="connector", actor_id="c", actor_label="c",
-                   actor_kind="local"),
+            Record(
+                offset=1,
+                origin_offset=1,
+                topic=f"colca/v1/_Metric/{NODE_ID}/oven/temperature",
+                payload={"signal_id": "sig-in", "value": 21.5, "timestamp": 1_700_000_000.0},
+                ts=1_700_000_000_000.0,
+                written_by="connector",
+                actor_id="c",
+                actor_label="c",
+                actor_kind="local",
+            ),
         ]
         self.cursors: dict[str, int] = {}
         self.acks: list[tuple[str, str, int]] = []
@@ -111,19 +123,25 @@ class _FakeNodeDoor:
         if "/_DataTags/" in topic:
             # The node's part of the commissioning act: bind the catalogue.
             for tag in body["data_tags"]:
-                self.entries.append(KvEntry(
-                    path=f"oven/{tag['name']}", node_id=NODE_ID,
-                    topic=f"colca/v1/_Signal/{NODE_ID}/oven/{tag['name']}",
-                    payload={"id": "sig-out", "name": tag["name"], "data_tag": tag["id"],
-                             "is_published": True},
-                    ts=0.0, offset=2,
-                ))
+                self.entries.append(
+                    KvEntry(
+                        path=f"oven/{tag['name']}",
+                        node_id=NODE_ID,
+                        topic=f"colca/v1/_Signal/{NODE_ID}/oven/{tag['name']}",
+                        payload={"id": "sig-out", "name": tag["name"], "data_tag": tag["id"], "is_published": True},
+                        ts=0.0,
+                        offset=2,
+                    )
+                )
 
     def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
         self.fetches.append((stream, cursor, signal_ids))
         position = self.cursors.get(cursor, 0)
-        records = [r for r in self.records if r.offset > position
-                   and (signal_ids is None or r.payload["signal_id"] in signal_ids)][:max]
+        records = [
+            r
+            for r in self.records
+            if r.offset > position and (signal_ids is None or r.payload["signal_id"] in signal_ids)
+        ][:max]
         return Page(records=records, next=(records[-1].offset + 1) if records else position + 1)
 
     def ack(self, stream, cursor, offset) -> bool:
@@ -158,8 +176,11 @@ class Doubler(Producer):
 @pytest.fixture(autouse=True)
 def _fake_node(monkeypatch):
     identity = LocalServiceIdentity(
-        service_id="svc-ulid", service_name="dataops", node_id=NODE_ID,
-        system_element_id="", mount="",
+        service_id="svc-ulid",
+        service_name="dataops",
+        node_id=NODE_ID,
+        system_element_id="",
+        mount="",
     )
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
@@ -174,6 +195,7 @@ def _fake_node(monkeypatch):
 def _connect(client: _FakeClient, monkeypatch):
     def _connect_local_mqtt(name, **kwargs):
         return client, kwargs["identity"]
+
     monkeypatch.setattr("chaski.service.connect_local_mqtt", _connect_local_mqtt)
 
 
@@ -191,8 +213,7 @@ async def _poll_until(predicate, timeout: float = 10.0) -> None:
 async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Path, monkeypatch):
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data",
-                         poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
     svc.add(Doubler)
 
     stop = asyncio.Event()
@@ -212,10 +233,12 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
     assert (tag["source"], tag["name"], tag["data_type"]) == ("doubler.doubled", "doubled", "float")
 
     # Exactly one computed value, at the bound Signal's own position, twice the input.
-    assert door.metrics() == [(
-        f"colca/v1/_Metric/{NODE_ID}/oven/doubled",
-        {"signal_id": "sig-out", "value": 43.0, "timestamp": 1_700_000_000.0},
-    )]
+    assert door.metrics() == [
+        (
+            f"colca/v1/_Metric/{NODE_ID}/oven/doubled",
+            {"signal_id": "sig-out", "value": 43.0, "timestamp": 1_700_000_000.0},
+        )
+    ]
 
     # It came in through the SDK's consume lane: the generational cursor
     # inside this identity's namespace, filtered to the declared input, and

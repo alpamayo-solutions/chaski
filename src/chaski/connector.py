@@ -360,8 +360,7 @@ class ConnectorService(Service):
         """Register, discover, poll. Returns when :meth:`stop` is called;
         raises if the node cannot be reached at all (a connector without a
         node has nothing to do — the container restarts it)."""
-        self._log.info("[STARTUP] Connector starting: protocol=%s, interval=%.1fs",
-                       self.driver.protocol, self.interval)
+        self._log.info("[STARTUP] Connector starting: protocol=%s, interval=%.1fs", self.driver.protocol, self.interval)
         self.start()
         # Service configures Paho's queue before connecting. Its limit is
         # the same as our pending buffer; Paho refuses changing it afterwards.
@@ -383,8 +382,7 @@ class ConnectorService(Service):
             source_connected = True
         except Exception as exc:  # noqa: BLE001 - the loop retries; the reason is logged
             self._set_source_healthy(False)
-            self._log.warning("Source connect failed during startup: %s — staying alive, "
-                              "polling loop will retry.", exc)
+            self._log.warning("Source connect failed during startup: %s — staying alive, polling loop will retry.", exc)
         discovery: Optional[Discovery] = None
         if source_connected or not self.driver.catalogue_requires_connection:
             try:
@@ -394,8 +392,9 @@ class ConnectorService(Service):
                     self._set_source_healthy(True)
             except Exception as exc:  # noqa: BLE001 - same: retried by the loop
                 self._set_source_healthy(False)
-                self._log.warning("Source discovery failed during startup: %s — staying alive, "
-                                  "polling loop will retry.", exc)
+                self._log.warning(
+                    "Source discovery failed during startup: %s — staying alive, polling loop will retry.", exc
+                )
         self._declare_discovery(discovery)
 
     async def _retry_discovery(self) -> None:
@@ -413,12 +412,12 @@ class ConnectorService(Service):
             self._declare_discovery(discovery)
             self._discovered = True
             self._set_source_healthy(True)
-            self._log.info("[STARTUP-RETRY] Source discovery recovered: %d tags catalogued.",
-                           len(self._catalogue))
+            self._log.info("[STARTUP-RETRY] Source discovery recovered: %d tags catalogued.", len(self._catalogue))
         except Exception as exc:  # noqa: BLE001 - reported, retried on the next interval
             self._set_source_healthy(False)
-            self._log.warning("Source discovery retry failed: %s — next attempt in %.0fs.",
-                              exc, DISCOVERY_RETRY_SECONDS)
+            self._log.warning(
+                "Source discovery retry failed: %s — next attempt in %.0fs.", exc, DISCOVERY_RETRY_SECONDS
+            )
 
     def _declare_discovery(self, discovery: Optional[Discovery]) -> None:
         """The discovered tags plus the two synthetic ones become the
@@ -427,13 +426,21 @@ class ConnectorService(Service):
         tags: dict[str, DataTag] = dict(discovery.tags) if discovery else {}
         handles: Mapping[str, Any] = discovery.handles if discovery else {}
         tags[HEARTBEAT_TAG_SOURCE] = DataTag(
-            id="", name=HEARTBEAT_TAG_NAME, source=HEARTBEAT_TAG_SOURCE,
-            is_writable=False, is_readable=True, data_type="boolean",
+            id="",
+            name=HEARTBEAT_TAG_NAME,
+            source=HEARTBEAT_TAG_SOURCE,
+            is_writable=False,
+            is_readable=True,
+            data_type="boolean",
             meta={"synthetic": True, "purpose": "liveness"},
         )
         tags[IS_CONNECTED_TAG_SOURCE] = DataTag(
-            id="", name=IS_CONNECTED_TAG_NAME, source=IS_CONNECTED_TAG_SOURCE,
-            is_writable=False, is_readable=True, data_type="boolean",
+            id="",
+            name=IS_CONNECTED_TAG_NAME,
+            source=IS_CONNECTED_TAG_SOURCE,
+            is_writable=False,
+            is_readable=True,
+            data_type="boolean",
             meta={"synthetic": True, "purpose": "source-connectivity"},
         )
         with self._lock:
@@ -499,8 +506,7 @@ class ConnectorService(Service):
             heartbeat_id = self._catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
             is_connected_id = self._catalogue.tag_id(IS_CONNECTED_TAG_SOURCE)
             heartbeat_targets = [t for t in targets if t.signal.data_tag == heartbeat_id]
-            protocol_targets = [t for t in targets
-                                if t.signal.data_tag not in (heartbeat_id, is_connected_id)]
+            protocol_targets = [t for t in targets if t.signal.data_tag not in (heartbeat_id, is_connected_id)]
 
             raw_batch: list[tuple[Topic, Any, SignalRecord]] = []
             # A lost source must not cost the heartbeat: the connector is
@@ -611,9 +617,13 @@ class ConnectorService(Service):
         now = self._now()
         if now - self._summary_last < self.summary_interval:
             return
-        self._log.info("[DATA] Published %d metrics in %d tags over %d polls (%.0fs)",
-                       self._summary_published, target_count, self._summary_polls,
-                       now - self._summary_last)
+        self._log.info(
+            "[DATA] Published %d metrics in %d tags over %d polls (%.0fs)",
+            self._summary_published,
+            target_count,
+            self._summary_polls,
+            now - self._summary_last,
+        )
         self._summary_published = 0
         self._summary_polls = 0
         self._summary_last = now
@@ -642,8 +652,12 @@ class ConnectorService(Service):
         except Exception as exc:  # noqa: BLE001 - reported; retried next iteration
             self._log.exception("Failed to publish the catalogue: %s", exc)
             return
-        self._log.info("[SYNC] Published %d data tags to %s (revision %s)",
-                       len(payload.data_tags), str(self._catalogue_topic), payload.version[:12])
+        self._log.info(
+            "[SYNC] Published %d data tags to %s (revision %s)",
+            len(payload.data_tags),
+            str(self._catalogue_topic),
+            payload.version[:12],
+        )
 
     def _placement_reannounced(self) -> None:
         # Nothing to do: a moved catalogue is already dirty with its
@@ -704,8 +718,7 @@ class ConnectorService(Service):
         memory."""
         if len(pending) > self.max_pending:
             drop = len(pending) - self.max_pending
-            self._log.warning("Dropping %d buffered metrics (backpressure). Max pending: %d.",
-                              drop, self.max_pending)
+            self._log.warning("Dropping %d buffered metrics (backpressure). Max pending: %d.", drop, self.max_pending)
             pending = pending[drop:]
         self._pending = pending
 
@@ -768,8 +781,12 @@ class ConnectorService(Service):
         if now - self._mqtt_down_last_report < self.outage_reminder:
             return
         self._mqtt_down_last_report = now
-        self._log.error("MQTT still disconnected after %.0fs and %d attempts: %s",
-                        now - self._mqtt_down_since, self._mqtt_down_attempts, error)
+        self._log.error(
+            "MQTT still disconnected after %.0fs and %d attempts: %s",
+            now - self._mqtt_down_since,
+            self._mqtt_down_attempts,
+            error,
+        )
 
     def _report_mqtt_recovered(self) -> None:
         """The other half: a lane that came back says so, once, with the cost."""
