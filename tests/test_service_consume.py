@@ -1,5 +1,5 @@
 """Level-2 pin for the consume lane on ``chaski.Service`` (service families
-design 2026-09-07 §3.3, D7): ``stream()`` and ``kv()`` against a fake door
+design §3.3): ``stream()`` and ``kv()`` against a fake door
 that models what colcad actually does with a named cursor — stores its
 position server-side, serves ``/fetch`` from it, moves it only on ``/ack``.
 

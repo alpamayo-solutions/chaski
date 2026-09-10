@@ -14,8 +14,8 @@ walks the whole retained window.
 **One lane, and it is the SDK's.** The cursor is a
 :class:`chaski.door.Stream` — what ``Service.stream("metrics", cursor=...,
 signal_ids=...)`` returns — so the ingest loop reads through exactly the
-consume lane every other service uses (service families design 2026-09-07
-§3.3, D7), not a private door client. The loop asks its ``open_stream``
+consume lane every other service uses (service families design
+§3.3), not a private door client. The loop asks its ``open_stream``
 factory for the stream once, and again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name stays, so its server-side position
 does.

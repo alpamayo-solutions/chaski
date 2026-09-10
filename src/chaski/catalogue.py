@@ -1,5 +1,5 @@
 """The one DataTag catalogue every :class:`chaski.Service` publishes (SDK
-design §3, §7 gap 3; service families design 2026-09-07 §3.4 and §4).
+design §3, §7 gap 3; service families design §3.4 and §4).
 
 A catalogue is the set of sources a service offers, each with an id that
 never changes for as long as the source is known. Two things grow it and

@@ -164,8 +164,8 @@ def test_rebind_is_picked_up_on_the_next_resolution_pass():
 def test_an_unbound_output_keeps_looking():
     """A MISS is never held: nothing tells this service it has been bound.
 
-    An output is commissioned by a separate act — `signal/autobind`, the
-    Edit binding UI — that dataops neither performs nor is notified of.
+    An output is commissioned by a separate act — `signal/autobind`, or an
+    editor — that dataops neither performs nor is notified of.
     Holding "not bound yet" would idle the output until the next resolution
     pass for no reason, and at startup that is every output at once.
     """

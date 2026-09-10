@@ -2,7 +2,7 @@
 — the wire envelope of ``/fetch``, ``/ack``, ``/kv`` (paging + contract
 filter), ``/self`` and ``/publish``, exactly as colcad's httpapi answers
 them. Moved here from ``dataops/tests/test_door.py`` with the client itself
-(service families design 2026-09-07 D7); the dataops suite exercises the
+(service families design D7); the dataops suite exercises the
 same class through its ingest/resolve/output tests."""
 
 from __future__ import annotations

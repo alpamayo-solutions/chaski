@@ -19,7 +19,7 @@ historian through that one reference (``self.runtime``). This used to be
 three module globals in the shipped ``dataops`` service
 (``inputs.bind(door, buffer)`` / ``Producer.bind_buffer(buffer)``), correct
 for one container and wrong for an SDK where two services may share a
-process (service families design 2026-09-07 §3.5). The runtime is instance
+process (service families design §3.5). The runtime is instance
 state now, and nothing here is process-global except the discovery record.
 """
 

@@ -1,5 +1,5 @@
 """``chaski.ConnectorService``: a :class:`chaski.Service` that polls a source
-(service families design 2026-09-07 §3.4, D10).
+(service families design §3.4).
 
 A connector is a Service whose tags come from DISCOVERY rather than from
 ``publish()`` calls, read on an interval from a source a protocol driver
@@ -9,9 +9,7 @@ a fixed cadence, rounding to the Signal's precision, publishing on change,
 keeping a liveness heartbeat and a source-connectivity flag, buffering
 through a broker outage, reconnecting to the source with backoff — is the
 same for OPC UA, Modbus, S7, Jetter and an HTTP status endpoint. That is
-this class. It used to be ``connector/src/reader.py``'s ``PollingReader``;
-the four shipped drivers now ride on this, and this is where a customer's
-own connector starts.
+this class, and this is where a connector for a new protocol starts.
 
 The driver protocol is four ``async`` methods (:class:`Driver`):
 
@@ -36,8 +34,8 @@ keeps its metrics — bounded at ``max_pending``, oldest dropped — and
 prepends them to the next cycle's batch.
 
 **What is NOT here.** Prometheus exposition: the loop reports its events to
-a :class:`Telemetry` (a no-op by default) and the shipped connector image
-plugs its Prometheus gauges in. Durability across a restart: the pending
+a :class:`Telemetry` (a no-op by default), where a process can plug in
+Prometheus gauges. Durability across a restart: the pending
 buffer is memory, by design — the answer for durability is ``chaski.Node``
 (design §3.4). Configuration from the environment: this is a library; the
 process that builds one reads its own environment.

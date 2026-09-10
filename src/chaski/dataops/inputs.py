@@ -31,7 +31,7 @@ optional historian through ``self.runtime`` — the
 :class:`~chaski.dataops.base.Runtime` the producer is attached to. This
 replaces the module-level ``bind(door, buffer)`` the shipped ``dataops``
 service used: correct for one container, wrong for an SDK where two
-services may share a process (service families design 2026-09-07 §3.5).
+services may share a process (service families design §3.5).
 Read on the class (``MyMachine.part_counter``) the descriptor is the
 declaration itself — what :func:`validate_windows` and the dispatch
 builder walk.

@@ -234,7 +234,7 @@ def test_binary_resolution_falls_through_a_wheel_with_no_binary_populated(monkey
 def test_binary_resolution_failure_names_the_node_extra(monkeypatch):
     monkeypatch.delenv(node_mod._COLCAD_ENV, raising=False)
     monkeypatch.setattr(node_mod.shutil, "which", lambda name: None)
-    with pytest.raises(RuntimeError, match=r"colca\[node\]"):
+    with pytest.raises(RuntimeError, match=r"chaski\[node\]"):
         node_mod._resolve_colcad_binary()
 
 
@@ -278,7 +278,7 @@ def test_status_is_awaiting_enrollment_when_uplink_is_unauthorized(tmp_path, mon
     })
     status = node.status()
     assert status.state == "awaiting_enrollment"
-    assert "colca node enroll" in status.detail
+    assert "POST /enroll" in status.detail
 
 
 def test_status_is_enrolled_once_uplink_connects(tmp_path, monkeypatch):
@@ -353,7 +353,7 @@ def test_wait_enrolled_times_out_with_the_status_detail(tmp_path, monkeypatch):
         "ok": True, "ulid": "n-child", "pubkey": "childpub", "uplink": {"state": "unauthorized"},
     })
     monkeypatch.setattr(node_mod.time, "sleep", lambda s: None)
-    with pytest.raises(TimeoutError, match="colca node enroll"):
+    with pytest.raises(TimeoutError, match="POST /enroll"):
         node.wait_enrolled(timeout=0.01)
 
 
@@ -364,14 +364,15 @@ def test_enroll_hint_names_pubkey_ulid_and_a_default_mount(tmp_path):
     node = _node_with_fake_process(tmp_path, parent="https://hub.example")
     hint = node.enroll_hint()
     assert hint == (
-        "colca node enroll https://hub.example --pubkey childpub --ulid n-child "
-        '--mount erp-bridge --token "$COLCA_ADMIN_TOKEN"'
+        "enroll this node at https://hub.example: author an element at 'erp-bridge' there, then "
+        "POST /enroll with the admin token ($COLCA_ADMIN_TOKEN) and "
+        '{"ulid": "n-child", "kind": "node", "element": "<that element id>", "pubkey": "childpub"}'
     )
 
 
 def test_enroll_hint_accepts_an_explicit_mount(tmp_path):
     node = _node_with_fake_process(tmp_path)
-    assert "--mount site1/erp " in node.enroll_hint(mount="site1/erp") + " "
+    assert "'site1/erp'" in node.enroll_hint(mount="site1/erp")
 
 
 def test_enroll_hint_without_a_parent_is_refused(tmp_path):
@@ -389,7 +390,7 @@ def test_enroll_hint_before_start_is_refused(tmp_path):
 
 def test_retire_hint_names_the_parent_and_this_nodes_ulid(tmp_path):
     node = _node_with_fake_process(tmp_path, parent="https://hub.example")
-    assert node.retire_hint() == 'colca node revoke https://hub.example n-child --token "$COLCA_ADMIN_TOKEN"'
+    assert node.retire_hint() == 'curl -sk -X DELETE https://hub.example/enroll/n-child -H "X-Colca-Token: $COLCA_ADMIN_TOKEN"'
 
 
 def test_retire_hint_without_a_parent_is_refused(tmp_path):

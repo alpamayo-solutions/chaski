@@ -1,5 +1,5 @@
 """Level-2 pin for ``chaski.DataOpsService`` as a whole (service families
-design 2026-09-07 §3.5, D9): a minimal user-defined service with one
+design §3.5): a minimal user-defined service with one
 ``@on_metric`` producer, fed by a fake door, publishes one computed value —
 and it is a :class:`chaski.Service` to the node, not a kind of its own (§3.1).
 

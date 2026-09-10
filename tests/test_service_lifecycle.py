@@ -174,8 +174,9 @@ def test_external_connect_refused_raises_not_enrolled_with_the_exact_command(tmp
         svc.start()
 
     expected_command = (
-        f"colca external enroll https://edge1.example --ulid {svc.ulid} "
-        f"--pubkey {svc.pubkey} --mount site1/erp"
+        f"enroll {svc.name} at https://edge1.example: author an element at 'site1/erp' there, then "
+        f"POST /enroll with the admin token and "
+        f'{{"ulid": "{svc.ulid}", "kind": "external", "element": "<that element id>", "pubkey": "{svc.pubkey}"}}'
     )
     assert svc.enroll_hint() == expected_command
     assert expected_command in str(excinfo.value)

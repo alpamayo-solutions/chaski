@@ -1,5 +1,5 @@
 """The colca door's HTTP client — the SDK's consume lane (service families
-design 2026-09-07 §3.3, decision D7).
+design §3.3).
 
 One implementation of ``GET /fetch`` (named cursors), ``POST /ack``,
 ``GET /kv`` (paged, contract-filtered), ``GET /self`` and ``POST /publish``,

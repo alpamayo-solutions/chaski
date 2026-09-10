@@ -1,8 +1,6 @@
 """``chaski.dataops``: computed signals and annotations as a service family.
 
-The evaluator runtime of the dataops evaluator design,
-lifted out of the shipped ``dataops`` service into the SDK (service families
-design 2026-09-07 §3.5, D9) so any process can run producers:
+The evaluator runtime as a library, so any process can run producers:
 
     from chaski.dataops import DataOpsService, Producer, SignalRangeInput, SignalOutput, every
 

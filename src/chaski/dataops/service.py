@@ -1,22 +1,19 @@
 """``chaski.DataOpsService``: a :class:`chaski.Service` that runs producers.
 
 A service family is a base class offering a lane, never a kind the node
-knows about (service families design 2026-09-07 §3.1, architecture
+knows about (service families design §3.1, architecture
 principle 6): a ``DataOpsService`` registers, publishes ``_ServiceDetails``
 and opens the door exactly as a bare ``Service`` does — the node sees one
-more local service — and adds only the evaluator runtime the dataops design
-describes (the dataops evaluator design).
-The shipped ``dataops`` image is its first user: ``dataops/service.py``
-there is env-driven wiring around this class and nothing else.
+more local service — and adds only the evaluator runtime.
 
-Where each invariant of that design lives now:
+Where each of its invariants lives:
 
 * **One ingest lane** (§3) — :class:`~chaski.dataops.ingest.Ingest`, over
   ``self.stream("metrics", cursor="ingest-<generation>", signal_ids=...)``:
   the SDK's own consume lane, a generational named cursor, ack after
   process. There is no second polling or direct-DB path.
 * **MQTT is a doorbell only** — :meth:`DataOpsService._ring_doorbell`
-  subscribes ``colca/v1/_Metric/#`` at qos 0 on the base class's own MQTT
+  subscribes ``<root>/v1/_Metric/#`` at qos 0 on the base class's own MQTT
   client for exactly one purpose: waking the ingest loop instead of waiting
   out the poll interval. The payload is never read; reading it would open a
   second lane into data the ingest loop already owns. The same connection
@@ -29,8 +26,8 @@ Where each invariant of that design lives now:
   interval.
 * **The historian is optional and read-only** (§7) — the ``historian=``
   argument, a :class:`~chaski.dataops.inputs.Historian` port or ``None``
-  (the default). The SDK imports no database driver; the shipped image
-  implements the port over TimescaleDB and passes it in.
+  (the default). The SDK imports no database driver; a deployment
+  implements the port, for example over TimescaleDB, and passes it in.
 * **Outputs are catalogue-provisioned** (§5) —
   :func:`~chaski.dataops.outputs.build_catalogue`, a ``_DataTags`` record
   like a connector's, commissioned by ``signal/autobind``; annotations are
@@ -89,7 +86,7 @@ from typing import Any, Callable, Iterable, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from colca_data_contracts import Metric
+from colca_data_contracts import Metric, topic_prefix
 
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
@@ -104,7 +101,7 @@ from .triggers import CronSpec, IntervalSpec, OnMetricSpec
 
 log = logging.getLogger("chaski.dataops")
 
-DOORBELL_WILDCARD = "colca/v1/_Metric/#"
+DOORBELL_WILDCARD = f"{topic_prefix()}_Metric/#"
 #: colca's default metrics retention — what a declared window is checked
 #: against when the service is given no ``retention=`` of its own.
 DEFAULT_RETENTION_S = 14 * 24 * 3600.0
@@ -345,8 +342,8 @@ def _resolve_dispatch(
     filter and the dispatch table — startup is not aborted, so one
     unresolved input doesn't take every other producer down with it.
     Whatever fails here is retried by :func:`reresolve_loop` until it
-    resolves — a signal is commissioned by a separate act (`colca dm
-    deploy`, the editor binding UI), so a producer routinely starts
+    resolves — a signal is commissioned by a separate act (`signal/autobind`,
+    or an editor), so a producer routinely starts
     before the tree it reads exists.
     """
     dispatch: dict[str, list] = {}
@@ -409,8 +406,8 @@ async def reresolve_loop(
     rule is that nothing caches a resolved id — "a signal that moves or is
     rebound is picked up on the very next call". The dispatch table was the
     one place that did cache, and it cached the WORST possible moment:
-    startup, before `colca dm deploy` or the editor had commissioned
-    anything. A producer that lost that race kept an empty table for the
+    startup, before any signal had been
+    commissioned. A producer that lost that race kept an empty table for the
     life of the process and fell back to its timers, so its outputs tracked
     its inputs at the timer's cadence instead of the data's.
 
@@ -473,7 +470,7 @@ def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -
     Horizons are recomputed from the CURRENTLY resolved inputs on every
     run, not once at startup. They used to be computed once, before
     `reresolve_loop` had resolved anything (a producer routinely starts
-    before `colca dm deploy`/the editor commissions its signals), so a
+    before its signals are commissioned), so a
     signal that resolved later never appeared in the horizons dict —
     `Buffer.trim` keeps every point for a signal absent from it — and grew
     without bound for the life of the volume. Recomputing here costs
@@ -695,7 +692,7 @@ def ring_even_if_undecodable(client) -> None:
 class DataOpsService(Service):
     """A :class:`chaski.Service` that runs :class:`~chaski.dataops.Producer`
     classes — the evaluator runtime as an SDK family (service families
-    design 2026-09-07 §3.5). Everything the base does, it does unchanged:
+    design §3.5). Everything the base does, it does unchanged:
     one constructor, ``node=None`` for the local door inside a deployment
     or a URL for the published one, ``_ServiceDetails`` registration, log
     publishing, ``kv()``/``stream()``. What it adds is the runtime a

@@ -177,8 +177,8 @@ def test_unresolvable_input_is_skipped_not_raised(runtime):
 async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(runtime):
     """A producer routinely starts before the tree it reads exists.
 
-    A signal is commissioned by a separate act — `colca dm deploy`, or the
-    Edit binding UI — so a producer that came up first used to keep the
+    A signal is commissioned by a separate act — `signal/autobind`, or an
+    editor — so a producer that came up first used to keep the
     empty dispatch table it was born with for the life of the process. It
     still ticked, so it looked like it worked: its outputs tracked its inputs
     at the TIMER's cadence instead of the data's, with one WARNING at startup
@@ -345,8 +345,8 @@ class LateResolvedProducer(Producer):
 def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(buffer, door, runtime):
     """Horizons used to be computed ONCE at startup, before `reresolve_loop`
     had resolved anything — a signal commissioned after the service started
-    (the documented normal order: `colca dm deploy`/the editor binds
-    signals after the service is already running) never appeared in the
+    (the normal order: signals are bound
+    after the service is already running) never appeared in the
     horizons dict, and `Buffer.trim` keeps every point for a signal absent
     from it — it grew without bound for the life of the volume. The fix
     recomputes horizons inside the trim job itself from the CURRENTLY
@@ -363,7 +363,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
     assert list(df["value"]) == ["old"], "an unresolved input must not be trimmed"
 
     # The signal is commissioned later: KV gains the _Signal entry (mirrors
-    # what `colca dm deploy` does while the service keeps running).
+    # a commissioning while the service keeps running).
     door.entries.append(signal_entry("sig-late", "late_signal"))
 
     trim_buffer(buffer, instances, retention_s=1.0)

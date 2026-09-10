@@ -6,7 +6,7 @@ Resolves colca identities by scanning the node's retained KV projection —
 records for annotation-type name -> ULID, and (the reverse direction,
 design §5) a service's own catalogue tag ULID -> the ``_Signal`` record
 bound to it, via :func:`resolve_output_binding`. This is the ONLY
-resolution path: no Django DB access, no historian involvement (the
+resolution path: no database access, no historian involvement (the
 optional :class:`~chaski.dataops.inputs.Historian` is a different concern
 entirely — historised metric *values*, not topology identities).
 

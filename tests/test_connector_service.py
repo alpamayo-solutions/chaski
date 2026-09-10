@@ -1,5 +1,4 @@
-"""Level-2 pin for ``chaski.ConnectorService`` (service families design §3.4,
-D10) — hermetic: a fake driver for the source, a fake node standing in for
+"""Level-2 pin for ``chaski.ConnectorService`` (service families design §3.4) — hermetic: a fake driver for the source, a fake node standing in for
 BOTH doors the service speaks to (the MQTT client it publishes through, the
 KV it reads its previous catalogue from), and the loop driven one iteration
 at a time.
@@ -393,8 +392,8 @@ def test_a_vanished_tag_keeps_its_id_stale_and_a_returning_one_is_revived(node, 
 
 
 def test_a_file_mapped_driver_advertises_its_catalogue_while_the_source_is_down(node, monkeypatch):
-    """S7/Modbus derive their catalogue from config, so `colca dm deploy`
-    can bind signals before the machine is physically connected."""
+    """S7/Modbus derive their catalogue from config, so signals can be bound
+    before the machine is physically connected."""
     driver = FakeDriver(requires_connection=False)
     driver.fail_connects = 10
     svc = started(node, driver, monkeypatch)

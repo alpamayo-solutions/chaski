@@ -8,7 +8,7 @@ directly, never a database:
   ``DataTags`` entry, exactly like a connector catalogues its source tags,
   and binds each one to its minted tag id via :func:`build_catalogue`. From
   there the output is commissioned through the SAME command flow as a
-  connector tag (``signal/autobind`` / the editor binding UI) — the node
+  connector tag (``signal/autobind``, or an editor) — the node
   authors the ``_Signal`` record and mints ITS OWN ULID, which the output
   discovers by scanning KV for a ``_Signal`` whose ``data_tag`` names the
   tag id it was bound to (:func:`chaski.dataops.resolve.resolve_output_binding`).
@@ -172,7 +172,7 @@ class SignalOutput(_PerInstance):
         applied to outputs too): a ``_Signal`` naming ``self.tag_id`` via
         ``data_tag`` and marked ``is_published``. When none exists yet —
         the catalogue was published but nobody has commissioned this tag
-        through ``signal/autobind`` / the editor binding UI — this is a
+        through ``signal/autobind`` or an editor — this is a
         no-op: no write, no exception, just a rate-limited idle log (design
         §5: "an unbound output idles its producer's writes with a clear,
         rate-limited log status. No fallback path.").
@@ -180,7 +180,7 @@ class SignalOutput(_PerInstance):
         door = self._runtime().door
         # A found binding is held; a MISS never is. An unbound output has to
         # keep looking — it becomes bound by a separate act (`signal/autobind`,
-        # the editor binding UI) that this service does not perform and
+        # or an editor) that this service does not perform and
         # cannot be notified of — while a bound one has nothing left to learn
         # until the next resolution pass calls `forget`.
         #

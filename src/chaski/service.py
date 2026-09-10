@@ -1,5 +1,4 @@
-"""``chaski.Service``: the shared connector-protocol publisher (SDK design
-§3, §3.2 "Service lifecycle", §7 gap 3).
+"""``chaski.Service``: the shared connector-protocol publisher .
 
 ONE constructor, not two classmethods: ``Service(name, mount="", *,
 node=None, ...)``. ``node`` says who this service is to Colca —
@@ -42,7 +41,7 @@ a driver discovers tags into the same catalogue and reads them on an
 interval; bindings, publishing, registration and the consume lane are all
 this class. It re-implements nothing here.
 
-**The consume lane** (service families design 2026-09-07 §3.3, D7). A
+**The consume lane** (service families design §3.3). A
 started Service also reads: ``kv(prefix, contract=)`` is a bounded snapshot
 of the node's retained state, and ``stream(name)`` a named, durable cursor
 over one of its streams — ``metrics``, ``annotations``, ``alarms``, ... —
@@ -51,7 +50,7 @@ follows (``chaski.door.Stream``). Both speak the same door ``publish()``
 registers at, with the same identity: ``X-Colca-Service`` on the local door,
 the pinned client certificate on the published one.
 
-**A bridge is a Service whose protocol is HTTP** (design §3.6, D8). There is
+**A bridge is a Service whose protocol is HTTP** (design §3.6). There is
 no ``BridgeService`` class, deliberately. A bridge to an ERP/MES has two
 lanes and neither is bridge-shaped: its *reference* lane polls the foreign
 system and ``publish()``-es what it learns — a connector whose protocol
@@ -61,8 +60,8 @@ is not a base class either: an external identity holds the ``write:``
 grants its enrollment gave it and no ``cmd:`` — position is authority
 (architecture principle 6). What a bridge genuinely owns — the foreign
 system's client and its idempotency keys — is shaped by that system, so
-start from the ``bridge`` starter (``chaski new bridge``) rather than a class
-that would wrap a dictionary.
+start from a plain ``Service`` rather than a class that would wrap a
+dictionary.
 """
 
 from __future__ import annotations
@@ -139,12 +138,12 @@ _DEFAULT_LOCAL_MQTT_PORT = 1883
 
 class NotEnrolled(RuntimeError):
     """Raised by :meth:`Service.start` when the node refuses this identity's
-    CONNECT — outside a deployment only. The message IS the enroll command
-    an operator runs once; also available bare via :meth:`Service.enroll_hint`."""
+    CONNECT — outside a deployment only. The message says how an operator
+    enrolls it; also available bare via :meth:`Service.enroll_hint`."""
 
     def __init__(self, name: str, node_url: str, command: str) -> None:
         super().__init__(
-            f"{name} is not enrolled at {node_url}. An operator runs:\n  {command}"
+            f"{name} is not enrolled at {node_url}. To enroll it:\n  {command}"
         )
         self.command = command
 
@@ -155,8 +154,8 @@ class LocalDoor:
     integrator never constructs this directly — pass a ``node=`` URL string
     outside a deployment, or leave ``node`` unset inside one (the compose
     defaults below). ``chaski.Node.service()`` builds one for an embedded
-    node, and the shipped connector image builds one from its
-    ``MQTT_IP``/``HTTP_PORT``/``MQTT_PORT`` environment."""
+    node, and a containerised connector can build one from its own
+    environment."""
 
     host: str = "colca"
     http_port: int = _DEFAULT_LOCAL_HTTP_PORT
@@ -317,9 +316,7 @@ def _connect_external_mqtt(
 
 def _revoke_external(node_url: str, ulid: str, token: str, *, api_port: Optional[int] = None,
                       timeout: float = 15.0) -> None:
-    """``DELETE /enroll/{ulid}`` on the node's admin door — the identical
-    call ``colca external revoke`` makes (node-manager ``commands/node.py``
-    ``revoke``)."""
+    """``DELETE /enroll/{ulid}`` on the node's admin door."""
     _, base = _node_admin_base(node_url, api_port)
     request = urllib.request.Request(
         f"{base}/enroll/{ulid}", method="DELETE", headers={"X-Colca-Token": token},
@@ -334,8 +331,7 @@ def _revoke_external(node_url: str, ulid: str, token: str, *, api_port: Optional
 
 class Service:
     """A publisher on either the local or the external door — one implementation,
-    one constructor. See the module docstring and the SDK design's lifecycle
-    table for what each method does."""
+    one constructor. See the module docstring for the lifecycle."""
 
     def __init__(
         self,
@@ -361,14 +357,12 @@ class Service:
         :class:`LocalDoor` (an embedded node's own local door — internal,
         ``chaski.Node.service()`` only).
 
-        ``mqtt_port``/``api_port`` are a deliberate extension beyond the
-        design's three-argument external shape, for a node whose published
+        ``mqtt_port``/``api_port`` are for a node whose published
         doors sit behind a non-standard port (a test harness, a port-mapped
-        deployment) — mirrors ``Service.external``'s equivalent keyword
-        arguments in the prior design.
+        deployment).
 
         ``metadata`` and ``architecture_metadata`` ride the retained
-        ``_ServiceDetails`` record as given: what the editor shows about
+        ``_ServiceDetails`` record as given: what an editor shows about
         this service beyond its health — protocol, icon, the driver behind
         it. ``architecture_metadata`` is merged under the live
         ``status``/``detail`` :meth:`status` writes.
@@ -720,10 +714,11 @@ class Service:
             raise RuntimeError(
                 "chaski.Service.enroll_hint() only applies outside a deployment (node=<url>)"
             )
-        mount_flag = f" --mount {self._mount}" if self._mount else ""
+        position = f" at {self._mount!r}" if self._mount else ""
         return (
-            f"colca external enroll {self._node_url} --ulid {self.ulid} "
-            f"--pubkey {self.pubkey}{mount_flag}"
+            f"enroll {self.name} at {self._node_url}: author an element{position} there, then "
+            f"POST /enroll with the admin token and "
+            f'{{"ulid": "{self.ulid}", "kind": "external", "element": "<that element id>", "pubkey": "{self.pubkey}"}}'
         )
 
     def wait_enrolled(self, timeout: float = 60.0, *, poll_interval: float = 2.0) -> "Service":
@@ -893,8 +888,7 @@ class Service:
 
     def status(self, ok: bool, detail: str = "") -> None:
         """Republish ``_ServiceDetails`` with ``architecture_metadata.status``
-        healthy/unhealthy (+``detail``) — what the editor's health panel
-        reads (``api/src/edge/models/service.py`` ``derived_health``)."""
+        healthy/unhealthy (+``detail``) — what a health view reads."""
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
         if self._client is None:
@@ -1057,16 +1051,16 @@ class Service:
     def retire(self, token: Optional[str] = None) -> None:
         """A deliberate end, not a restart: tombstone this service's own
         ``_ServiceDetails`` and ``_DataTags`` (empty retained payloads) so
-        the editor forgets it entirely. Outside a deployment, also
-        revokes the enrollment through the node's admin door — the same one
-        ``colca external revoke`` uses — which needs ``token`` (raises
+        the tree forgets it entirely. Outside a deployment, also
+        revokes the enrollment through the node's admin door
+        (``DELETE /enroll``), which needs ``token`` (raises
         without one). Not part of the context manager: this is an explicit
         decision, never implied by ``__exit__``.
         """
         if self._external and not token:
             raise RuntimeError(
                 "chaski.Service.retire() outside a deployment needs the node's admin token "
-                "(the same one `colca external revoke` uses)"
+                "(it revokes the enrollment with DELETE /enroll)"
             )
         if self._closed:
             raise RuntimeError("chaski.Service: cannot retire() a closed service")
