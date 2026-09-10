@@ -1,63 +1,50 @@
 [project]
 name = "chaski"
 version = "0.0.0"
-description = "Speak to a Colca node, or be one: Edit, Service and Node, plus the chaski CLI"
+description = "Publish to a Colca node, process its streams, or embed a node"
 readme = "README.md"
+license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
-  "keyring>=25,<27",
+  "colca-data-contracts",
   "franzmq==0.6.3",
   "paho-mqtt==2.1.0",
   "ulid-py>=1.1",
   "pyyaml>=6.0",
-  # chaski.Service's own external-identity minting (ed25519 key + self-signed
-  # cert, mirroring colca-keygen -cert — SDK design §3.2).
+  # A Service outside a deployment mints its own identity: an ed25519 key and
+  # a self-signed certificate, like colca-keygen.
   "cryptography>=42",
-  # The door's HTTP client (chaski.door: /fetch, /ack, /kv, /publish) — the
-  # consume lane behind Service.stream()/kv(), and what the shipped dataops
-  # service imports (service families design 2026-09-07 §3.3, D7).
+  # The door's HTTP client: /fetch, /ack, /kv and /publish.
   "httpx>=0.27",
 ]
 
-[project.scripts]
-chaski = "chaski.cli:main"
-
 [project.optional-dependencies]
-test = [
-  "pytest>=8.4,<10",
-  # Local sibling package (not on PyPI); the published wheel bundles its
-  # source instead (scripts/build_edit_client.py, matching how a
-  # generated deployment's Docker build copies it too). Tests resolve it via [tool.uv.sources] below.
-  "colca-data-contracts",
-  # The suite covers chaski.dataops too.
-  "chaski[dataops]",
-]
-# `chaski[dataops]` (service families design 2026-09-07 §3.5, D11): what
-# `chaski.dataops` — DataOpsService and the producer runtime — needs beyond
-# the base SDK. No database driver: the historian is a port the shipped
-# dataops image implements over TimescaleDB, not something the SDK opens.
+# What chaski.dataops (DataOpsService and the producer runtime) needs beyond the
+# base package. No database driver: the historian is an interface a deployment
+# implements, not something chaski opens.
 dataops = [
   "apscheduler>=3.10,<4",
   "pandas>=2.1",
   "python-decouple>=3.8",
 ]
-# `chaski[node]` (SDK design §6/§7 gap 5): the colcad binary, per platform,
-# so `chaski.Node` needs no separate download or system install. Locally
-# this resolves to colca/pywheel's bare SOURCE (see [tool.uv.sources] below)
-# — importable, but with no `bin/colcad` inside, since only
-# scripts/build_colcad_wheels.py's Go cross-compile actually populates that
-# (chaski.Node._resolve_colcad_binary() checks the file exists before
-# trusting it, and falls through to COLCAD_BINARY/PATH otherwise — local
-# development and tests use COLCAD_BINARY). The version pin here is a
-# placeholder matching colca/pywheel/pyproject.toml's own; the CI-built
-# release wheel gets the real one, matching this exact release, from
-# scripts/build_edit_client.py.
+# The colcad binary for this platform, so chaski.Node needs nothing else
+# installed. A local checkout resolves it to colca/pywheel's source, which
+# carries no binary; chaski.Node then falls back to COLCAD_BINARY or PATH.
 node = [
   "colcad==0.0.0",
 ]
+test = [
+  "pytest>=8.4,<10",
+  "chaski[dataops]",
+]
 
+[project.urls]
+Source = "https://github.com/alpamayo-solutions/chaski"
+Colca = "https://github.com/alpamayo-solutions/colca"
+
+# Development against a colca checkout next to this one.
 [tool.uv.sources]
-colca-data-contracts = { path = "../colca-data-contracts" }
+colca-data-contracts = { path = "../colca/contracts", editable = true }
 colcad = { path = "../colca/pywheel" }
 
 [build-system]
