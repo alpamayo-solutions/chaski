@@ -142,7 +142,8 @@ chaski uses the same topic root as every Colca process: `colca`, or whatever
 
 ## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). chaski is
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). chaski is
 licensed under the [Functional Source License, Version 1.1, ALv2 Future
 License](LICENSE.md): use it for anything except a product or service that
 competes with it; every release becomes Apache 2.0 two years after it is

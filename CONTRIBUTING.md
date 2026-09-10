@@ -1,7 +1,8 @@
 # Contributing
 
 Bug reports, questions and pull requests are welcome. This page says how to
-work on chaski and what a change needs before it can be merged.
+work on chaski and what a change needs before it can be merged. Everyone taking
+part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Set up
 
@@ -27,6 +28,14 @@ uv run --group lint bandit -q -c pyproject.toml -r src
 uv run --extra dataops --group lint mypy src
 ```
 
+The same checks, plus gitleaks and a check of the commit subject, run as
+[pre-commit](https://pre-commit.com) hooks once you install them:
+
+```bash
+uv tool install pre-commit
+pre-commit install
+```
+
 ## Pull requests
 
 - Keep a pull request to one change, and add or adjust a test that fails
@@ -49,8 +58,8 @@ the same check locally.
 
 Maintainers release by pushing a tag `vX.Y.Z`, or `vX.Y.Z-rc.N` for a release
 candidate, on `main`. Once lint and tests have passed, CI creates a GitHub
-release with the wheel, the sdist, checksums, and notes built from the commit
-subjects.
+release with the wheel, the sdist, an SBOM, checksums, and notes built from
+the commit subjects.
 
 ## Contributor License Agreement
 
