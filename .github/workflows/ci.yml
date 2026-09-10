@@ -3,12 +3,61 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: chaski
+          fetch-depth: 0
+      # chaski is developed against the data contracts of a colca checkout next to it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: alpamayo-solutions/colca
+          path: colca
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          version: "0.11.17"
+      - name: ruff
+        working-directory: chaski
+        run: |
+          uv run --group lint ruff check .
+          uv run --group lint ruff format --check .
+      - name: bandit
+        working-directory: chaski
+        run: uv run --group lint bandit -q -c pyproject.toml -r src
+      - name: mypy
+        working-directory: chaski
+        run: uv run --extra dataops --group lint mypy src
+      - name: shellcheck
+        working-directory: chaski
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck
+      - name: actionlint
+        working-directory: chaski
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - name: yamllint
+        working-directory: chaski
+        run: git ls-files -z '*.yml' '*.yaml' | xargs -0 uvx yamllint@1.38.0 --strict
+      - name: No working notes in the tree
+        working-directory: chaski
+        run: scripts/check-no-working-notes.sh
+      - name: No working notes in the commits of this pull request
+        if: github.event_name == 'pull_request'
+        working-directory: chaski
+        run: scripts/check-no-working-notes.sh "origin/${{ github.base_ref }}"
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -17,32 +66,103 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: chaski
-      # chaski is developed against the data contracts of a colca checkout
-      # next to it (see pyproject.toml, [tool.uv.sources]).
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
           path: colca
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           version: "0.11.17"
       - name: Tests
         working-directory: chaski
         run: uv run --python ${{ matrix.python-version }} --extra test pytest
-      - name: No working notes in the tree
-        working-directory: chaski
-        run: scripts/check-no-working-notes.sh
 
-  working-notes:
-    if: github.event_name == 'pull_request'
+  # Pushes to main and version tags build the package once lint and tests pass;
+  # a version tag also publishes a release.
+
+  package:
+    needs: [lint, test]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          version: "0.11.17"
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ ! "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-rc\.([0-9]+))?$ ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z or vX.Y.Z-rc.N"
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}${BASH_REMATCH[3]:+rc${BASH_REMATCH[3]}}"
+          else
+            version="0.0.0.dev${GITHUB_RUN_NUMBER}+g${GITHUB_SHA::7}"
+          fi
+          uv version --frozen "$version"
+      - name: Wheel and sdist
+        run: uv build --out-dir dist
+      - name: Check package metadata
+        run: uvx twine@7.0.0 check --strict dist/*
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: startsWith(github.ref, 'refs/tags/v') && github.event.repository.visibility == 'public'
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: python-package
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
-      - name: No working notes in any commit of this pull request
-        run: scripts/check-no-working-notes.sh "origin/${{ github.base_ref }}"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          version: "0.11.17"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: python-package
+          path: dist
+      - name: Release notes
+        run: |
+          {
+            echo "Install chaski together with \`colca-data-contracts\` from a" \
+              "[Colca release](https://github.com/alpamayo-solutions/colca/releases);" \
+              "\`chaski[node]\` also needs the \`colcad\` wheel for your platform from there."
+            echo
+            if git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" > /dev/null 2>&1; then
+              uvx git-cliff@2.13.1 --latest --strip header
+            else
+              echo "First public release."
+            fi
+          } > notes.md
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-rc.* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "chaski $GITHUB_REF_NAME" \
+            --notes-file notes.md "${prerelease[@]}"

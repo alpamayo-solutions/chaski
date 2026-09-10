@@ -19,7 +19,7 @@ fi
 
 if [ -n "$found" ]; then
   echo "Working notes do not belong in this repository:" >&2
-  printf '  %s\n' $found >&2
+  printf '%s\n' "$found" | sed 's/^/  /' >&2
   echo "Keep plans and agent instructions outside the repository (see CONTRIBUTING.md)." >&2
   exit 1
 fi
