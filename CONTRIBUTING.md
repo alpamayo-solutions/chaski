@@ -19,6 +19,14 @@ The tests need no running node. The ones about `Node` use a fake colcad
 process; set `COLCAD_BINARY` to a real binary (`make build` in the colca
 checkout) to try the real one by hand.
 
+CI also runs the linters, and so can you:
+
+```bash
+uv run --group lint ruff check . && uv run --group lint ruff format --check .
+uv run --group lint bandit -q -c pyproject.toml -r src
+uv run --extra dataops --group lint mypy src
+```
+
 ## Pull requests
 
 - Keep a pull request to one change, and add or adjust a test that fails
@@ -36,6 +44,13 @@ Plans, design drafts, task lists and instruction files for coding assistants
 (`CLAUDE.md`, `AGENTS.md`, `.cursor/`, `docs/plans/` and the like) do not
 belong in commits. CI rejects them; `scripts/check-no-working-notes.sh` runs
 the same check locally.
+
+## Releases
+
+Maintainers release by pushing a tag `vX.Y.Z`, or `vX.Y.Z-rc.N` for a release
+candidate, on `main`. Once lint and tests have passed, CI creates a GitHub
+release with the wheel, the sdist, checksums, and notes built from the commit
+subjects.
 
 ## Contributor License Agreement
 

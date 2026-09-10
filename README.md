@@ -1,5 +1,9 @@
 # chaski
 
+[![ci](https://github.com/alpamayo-solutions/chaski/actions/workflows/ci.yml/badge.svg)](https://github.com/alpamayo-solutions/chaski/actions/workflows/ci.yml)
+[![codeql](https://github.com/alpamayo-solutions/chaski/actions/workflows/codeql.yml/badge.svg)](https://github.com/alpamayo-solutions/chaski/actions/workflows/codeql.yml)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE.md)
+
 A Python SDK for [Colca](https://github.com/alpamayo-solutions/colca).
 
 - `Service` publishes data to a node: through its local door inside the
@@ -14,8 +18,16 @@ roads of the Inca empire.
 
 ## Install
 
-chaski needs Python 3.11 or newer. The data contracts it builds on live in the
-Colca repository:
+chaski needs Python 3.11 or newer. Its wheel is attached to each
+[chaski release](https://github.com/alpamayo-solutions/chaski/releases), and the
+`colca-data-contracts` it builds on to each
+[Colca release](https://github.com/alpamayo-solutions/colca/releases):
+
+```bash
+pip install colca_data_contracts-<version>-py3-none-any.whl chaski-<version>-py3-none-any.whl
+```
+
+Or straight from git:
 
 ```bash
 pip install "colca-data-contracts @ git+https://github.com/alpamayo-solutions/colca#subdirectory=contracts"
@@ -23,8 +35,8 @@ pip install "chaski @ git+https://github.com/alpamayo-solutions/chaski"
 ```
 
 Add the `dataops` extra for `DataOpsService`. `Node` needs the `colcad` binary:
-install the `chaski[node]` wheel for your platform, put `colcad` on `PATH`, or
-point `COLCAD_BINARY` at it.
+install the `colcad` wheel for your platform from the Colca release, put
+`colcad` on `PATH`, or point `COLCAD_BINARY` at it.
 
 ## Publish data
 

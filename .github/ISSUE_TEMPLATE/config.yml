@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/alpamayo-solutions/chaski/security/advisories/new
+    about: Please report vulnerabilities privately, not in a public issue.
+  - name: A problem in the node itself
+    url: https://github.com/alpamayo-solutions/colca/issues
+    about: Replication, doors, contracts and colcad belong to the Colca repository.
