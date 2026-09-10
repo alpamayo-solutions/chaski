@@ -28,7 +28,7 @@ CycloneDX format. The wheel, the sdist and the SBOM come with signed
 attestations:
 
 ```bash
-gh attestation verify chaski-<version>-py3-none-any.whl --owner alpamayo-solutions
+gh attestation verify chaski-<version>-py3-none-any.whl --repo alpamayo-solutions/chaski
 ```
 
 Every night, CI builds fresh SBOMs of the latest release and of `main` and scans
