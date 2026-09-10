@@ -1,5 +1,6 @@
 [project]
 name = "chaski"
+# Release builds take the version from the git tag.
 version = "0.0.0"
 description = "Publish to a Colca node, process its streams, or embed a node"
 readme = "README.md"
@@ -27,11 +28,11 @@ dataops = [
   "pandas>=2.1",
   "python-decouple>=3.8",
 ]
-# The colcad binary for this platform, so chaski.Node needs nothing else
-# installed. A local checkout resolves it to colca/pywheel's source, which
-# carries no binary; chaski.Node then falls back to COLCAD_BINARY or PATH.
+# The colcad binary for this platform, from the Colca release you run against.
+# A local checkout resolves it to colca/pywheel, which has no binary; Node then
+# looks at COLCAD_BINARY and PATH.
 node = [
-  "colcad==0.0.0",
+  "colcad",
 ]
 test = [
   "pytest>=8.4,<10",
