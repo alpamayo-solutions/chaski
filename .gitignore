@@ -1,0 +1,21 @@
+# build output
+/bin/
+/build/
+/bench/results/
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Working notes and coding-assistant files stay local (see CONTRIBUTING.md).
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.codex/
+.cursor/
+.aider*
+docs/plans/
+docs/specs/

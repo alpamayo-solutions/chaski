@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          path: chaski
+      # chaski is developed against the data contracts of a colca checkout
+      # next to it (see pyproject.toml, [tool.uv.sources]).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: alpamayo-solutions/colca
+          path: colca
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+        with:
+          version: "0.11.17"
+      - name: Tests
+        working-directory: chaski
+        run: uv run --python ${{ matrix.python-version }} --extra test pytest
+      - name: No working notes in the tree
+        working-directory: chaski
+        run: scripts/check-no-working-notes.sh
+
+  working-notes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      - name: No working notes in any commit of this pull request
+        run: scripts/check-no-working-notes.sh "origin/${{ github.base_ref }}"
