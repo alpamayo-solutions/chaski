@@ -1,26 +1,14 @@
 """Producer base class, auto-discovery, and the runtime a producer runs in.
 
-Any concrete subclass of :class:`Producer` is recorded on class definition
-(``__init_subclass__``) so :meth:`chaski.dataops.DataOpsService.discover`
-can find what a module defined; which producers a service actually RUNS is
-that service's own state (``DataOpsService.add`` / ``discover``), never this
-module-level record.
+Every concrete subclass of :class:`Producer` is recorded when it is defined, so
+:meth:`chaski.dataops.DataOpsService.discover` can find what a module defined.
+Which producers a service runs is the service's own state. Abstract classes
+are not recorded.
 
-Abstract intermediate classes (e.g. contract/interface ABCs that concrete
-producers subclass) are NOT recorded — they carry abstract methods, so
-``__abstractmethods__`` is non-empty and the class is skipped.
-
-**Where the wiring lives.** A producer never opens a door, a buffer or a
-database itself (evaluator design §3, §5). It is *attached* to a
-:class:`Runtime` — the :class:`~chaski.dataops.DataOpsService` that
-instantiated it, or a small stand-in in a test — and every declared input,
-output and its own watermark reach the door, the buffer and the optional
-historian through that one reference (``self.runtime``). This used to be
-three module globals in the shipped ``dataops`` service
-(``inputs.bind(door, buffer)`` / ``Producer.bind_buffer(buffer)``), correct
-for one container and wrong for an SDK where two services may share a
-process (service families design §3.5). The runtime is instance
-state now, and nothing here is process-global except the discovery record.
+A producer never opens a door, a buffer or a database itself. It is attached to
+a :class:`Runtime`, usually the :class:`~chaski.dataops.DataOpsService` that
+created it, and its inputs, outputs and watermark go through ``self.runtime``.
+Nothing here is process-global except the discovery record.
 """
 
 from __future__ import annotations
@@ -41,15 +29,12 @@ log = logging.getLogger("chaski.dataops")
 
 @runtime_checkable
 class Runtime(Protocol):
-    """What a producer's inputs, outputs and watermark need from whoever
-    runs it: the node's door, the one local :class:`~chaski.dataops.Buffer`,
-    and an optional read-only :class:`~chaski.dataops.Historian` (evaluator
-    design §7 — absent by default, and never written).
+    """What a producer's inputs, outputs and watermark need from whoever runs
+    it: the node's door, the local :class:`~chaski.dataops.Buffer`, and an
+    optional read-only :class:`~chaski.dataops.Historian`.
 
-    :class:`~chaski.dataops.DataOpsService` is the runtime a deployed
-    producer runs in; the shipped ``dataops`` backfill CLI builds a
-    door-only one; a level-2 test builds one from a fake door and a
-    tmp-file buffer.
+    :class:`~chaski.dataops.DataOpsService` is the usual runtime; a test can
+    build one from a fake door and a temporary buffer.
     """
 
     @property
@@ -74,29 +59,22 @@ class Producer(ABC):
       ``@on_metric`` (:mod:`chaski.dataops.triggers`)
     * may declare ``async def setup(self)`` for state initialisation
 
-    Discovery happens via ``__init_subclass__``. Only concrete classes
-    (``__abstractmethods__`` empty AND ``system_element_name`` set) end up in
-    the record :meth:`all` returns.
+    Discovery happens in ``__init_subclass__``. Only concrete classes (no
+    abstract methods, ``system_element_name`` set) are recorded; see :meth:`all`.
 
-    **Watermark persistence.** ``self.watermark`` / ``self.advance_watermark(t)``
-    are backed by the runtime's :class:`~chaski.dataops.Buffer` (design §3,
-    §10) — the framework owns cursor-resume state so a producer never
-    hand-rolls its own (e.g. no bespoke "last processed timestamp" row in a
-    private table). :meth:`attach` is called once by the service that
-    instantiates the producer, before any producer reads or advances its
-    watermark.
+    **Watermark.** ``self.watermark`` and ``self.advance_watermark(t)`` are
+    stored in the runtime's :class:`~chaski.dataops.Buffer`, so a producer
+    needs no progress table of its own. The service calls :meth:`attach`
+    before the producer touches its watermark.
     """
 
     # Set by the user on concrete subclasses
     name: ClassVar[str]
     system_element_name: ClassVar[str | None] = None
 
-    # Optional: the decouple-config env var names this producer's own
-    # calculation logic depends on (design §10 — a canonical dump of these
-    # values is folded into `chaski.dataops.codehash.compute_code_hash`, so a
-    # threshold change via env var triggers hash-triggered replay exactly
-    # like a source change does). Empty by default — most producers declare
-    # none.
+    # Environment variables the producer's calculation depends on. Their
+    # values are part of the code hash, so changing one triggers a replay like
+    # a code change does.
     config_keys: ClassVar[tuple[str, ...]] = ()
 
     # Populated by __init_subclass__
@@ -150,21 +128,10 @@ class Producer(ABC):
         Producer._registry[cls.name] = cls
 
     def __new__(cls, *args, **kwargs) -> Producer:
-        # A producer's `@on_metric` handlers run on the ingest worker
-        # thread; its `@every`/`@cron` ticks run in APScheduler's own
-        # executor thread pool (design §4: "handlers and ticks on one
-        # producer serialize on the producer's own lock"). This is the lock
-        # that promise depends on — taken by the dispatch/tick wrappers in
-        # `chaski.dataops.service` (`make_handler`, `off_loop`) around every
-        # call into producer code, never by producer code itself.
-        #
-        # It is attached in `__new__`, not `__init__`, so that it exists on
-        # EVERY instance regardless of what the subclass does: a producer that
-        # overrides `__init__` for its own state (the level-4 `OvenWatch`
-        # fixture does, and so will user code) and never calls
-        # `super().__init__()` would otherwise lose the lock and fail on its
-        # first dispatched metric. The runtime slot lives here for the same
-        # reason.
+        # Handlers run on the ingest thread and ticks in APScheduler's pool; the
+        # service's wrappers take this lock around every call, so a producer's
+        # handlers and ticks never overlap. Set in __new__, like the runtime
+        # slot, so a subclass that overrides __init__ without super() has both.
         self = super().__new__(cls)
         self._lock = threading.RLock()
         self._runtime = None
@@ -224,12 +191,8 @@ class Producer(ABC):
     def advance_watermark(self, position: float) -> None:
         """Persist this producer's progress at ``position``.
 
-        Preserves whatever code hash the buffer already has on file for
-        this producer (empty string if none has ever been recorded) —
-        advancing the watermark is not the act that decides whether the
-        producer's code changed; that is the hash-triggered replay check
-        (design §10), which calls ``Buffer.set_watermark`` directly with
-        the freshly computed hash.
+        Keeps the code hash already on file; only the replay check at startup
+        records a new one.
         """
         buffer = self.runtime.buffer
         existing_hash = buffer.code_hash(self.name) or ""

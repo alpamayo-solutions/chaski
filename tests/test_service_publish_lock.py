@@ -1,20 +1,10 @@
-"""Level-2 pin for the one threading rule Service has: never hold its lock
-across a waiting publish (`service.py` ``_publish_outside_the_lock``).
+"""Service never holds its lock across a waiting publish
+(``_publish_outside_the_lock`` in service.py).
 
-The bug this pins, seen first at level 4 (the embedded-node contract): a
-qos=1 publish waits for a PUBACK, and the PUBACK is read by the same MQTT
-network thread that runs ``_on_signal``. A Signal that lands while
-``close()`` (or ``publish()``, ``status()``, ``retire()``) is inside the lock
-therefore blocks that thread on the lock the publisher holds, and the
-publisher waits out its full ``publish_timeout`` for an acknowledgement that
-cannot arrive — surfacing as ``PublishTimeout`` on ``_ServiceDetails``, a
-topic with nothing to do with the Signal that caused it.
-
-The fake here reproduces exactly that coupling and nothing else: its
-``publish(wait=True)`` needs the network thread to be free before it can
-return, and a delivery armed by the test runs ON that thread. With the lock
-held across the publish, the two block each other and the publish raises;
-with the fix they proceed in either order.
+A QoS 1 publish waits for a PUBACK that the MQTT network thread reads, and that
+thread also runs ``_on_signal``, which takes the lock. The fake client here
+needs its network thread free before ``publish(wait=True)`` returns, and the
+test delivers a Signal on that thread while a publish is in flight.
 """
 
 from __future__ import annotations
@@ -39,13 +29,9 @@ class _FakeReasonCode:
 
 
 class _NetworkThreadClient:
-    """A fake franzmq.Client whose PUBACK comes from the SAME single thread
-    that dispatches subscription callbacks — the real client's shape, and the
-    only property this test needs.
-
-    ``arm_delivery`` queues a message to be dispatched on that thread at the
-    next publish, which is how the test puts a Signal into the exact window
-    where a publisher might be holding the lock.
+    """A fake franzmq.Client whose PUBACK comes from the thread that dispatches
+    subscription callbacks, as in the real client. ``arm_delivery`` queues a
+    message for that thread at the next publish.
     """
 
     def __init__(self) -> None:
@@ -154,8 +140,7 @@ def _signal_for(client: _NetworkThreadClient) -> tuple[Topic, Signal]:
 
 
 def test_close_completes_when_a_signal_lands_on_the_network_thread(service):
-    """The level-4 failure, hermetic: publish buffers (no binding yet), then
-    the node's autobound Signal arrives in the window where close() is
+    """A sample is buffered, then the node's Signal arrives while close() is
     publishing its final ServiceDetails."""
     svc, client = service
     svc.publish("orders", 42)
@@ -200,10 +185,7 @@ def test_retire_completes_when_a_signal_lands_on_the_network_thread(service):
 
 
 def test_the_lock_is_free_while_a_publish_waits(service):
-    """The rule itself, stated once rather than only through its symptoms: a
-    second thread must be able to take the lock while a waiting publish is in
-    flight. Without this, the three tests above could all pass on timing
-    alone if the fake's window ever narrowed."""
+    """Another thread can take the lock while a waiting publish is in flight."""
     svc, client = service
     taken = threading.Event()
 

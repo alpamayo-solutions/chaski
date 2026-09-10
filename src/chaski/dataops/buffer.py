@@ -1,19 +1,14 @@
-"""SQLite-backed input buffer — a DataOps service's only local state.
+"""SQLite-backed input buffer, a DataOps service's only local state.
 
-Kept in one file under the service's data directory
-(the dataops evaluator design §3): a
-``points`` table holding the retained window per declared input signal, a
-``watermarks`` table tracking per-producer replay progress, a ``meta``
-table holding the store's own identity (its ``generation``), and an
-``emitted_annotations`` table recording the ids each ``AnnotationOutput``
-has itself published (design §10) — the record that lets
-``clear_window`` delete only annotations a producer actually emitted.
+One file under the service's data directory with four tables: ``points`` (the
+retained window per input signal), ``watermarks`` (replay progress per
+producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
+(the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
+its own).
 
-Every :meth:`Buffer.append` is idempotent on ``(signal_id, ts)`` — a crash
-between an append and the corresponding cursor ack simply re-writes the
-same row when the ingest loop re-fetches the record. That is what makes
-cold start, disaster recovery, and replay the same code path (design §3,
-§6): re-processing a record is always safe.
+:meth:`Buffer.append` is idempotent on ``(signal_id, ts)``, so a record
+processed again after a crash rewrites the same row. Cold start, recovery and
+replay are therefore the same code path.
 """
 
 from __future__ import annotations
@@ -202,16 +197,12 @@ class Buffer:
     # ------------------------------------------------------------------ emitted annotations
 
     def record_emitted_annotation(self, source: str, annotation_id: str, time_start: float) -> None:
-        """Record that ``source`` (one ``AnnotationOutput``, identified the
-        same way a catalogue entry is — design §5, §10) itself published
+        """Record that ``source`` (one ``AnnotationOutput``) published
         ``annotation_id`` with this ``time_start``.
 
-        This is what makes :meth:`AnnotationOutput.clear_window` safe: it
-        only ever deletes ids read back from THIS table, so a producer
-        structurally cannot delete an annotation it never emitted — there is
-        no query that lets it name an arbitrary id. Idempotent on
-        ``(source, annotation_id)``: re-emitting the same logical interval
-        (same derived id) just re-writes the same row.
+        :meth:`AnnotationOutput.clear_window` only deletes ids read from this
+        table, so a producer cannot delete an annotation it did not emit.
+        Idempotent on ``(source, annotation_id)``.
         """
         with self._lock:
             self._conn.execute(

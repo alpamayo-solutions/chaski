@@ -1,16 +1,11 @@
 """Input descriptors for Producer classes.
 
-Declared inputs read exclusively from the runtime's own buffer
-(:class:`chaski.dataops.Buffer`) — never from a live MQTT cache
-(the dataops evaluator design §3): ticks and
-``@on_metric`` handlers alike see the same source-transparent view, live,
-on replay, and in deep backfill. Resolution (signal name + optional system
-element -> Signal ULID) reads colca's KV projection fresh on every
-resolution pass via :mod:`chaski.dataops.resolve` — see that module's
-docstring for why nothing here caches a resolved id across passes.
+Inputs read only from the runtime's buffer (:class:`chaski.dataops.Buffer`),
+never from a live MQTT cache, so ticks and ``@on_metric`` handlers see the same
+data live, on replay and in backfill. Names resolve to Signal ULIDs through
+:mod:`chaski.dataops.resolve` on every resolution pass.
 
-**Per-instance, through the producer's runtime.** An input is declared as
-a class attribute and read through the instance::
+An input is declared as a class attribute and used through the instance::
 
     class MyMachine(Producer):
         part_counter = SignalRangeInput("part_counter", window="1h")
@@ -24,24 +19,14 @@ a class attribute and read through the instance::
         def compute_status_at(self, t):
             return self.part_counter.latest_value_before(t)
 
-``self.part_counter`` is a per-instance copy of the declaration (a plain
-descriptor: the first access on an instance stores the copy in that
-instance's ``__dict__``), and it reaches the door, the buffer and the
-optional historian through ``self.runtime`` — the
-:class:`~chaski.dataops.base.Runtime` the producer is attached to. This
-replaces the module-level ``bind(door, buffer)`` the shipped ``dataops``
-service used: correct for one container, wrong for an SDK where two
-services may share a process (service families design §3.5).
-Read on the class (``MyMachine.part_counter``) the descriptor is the
-declaration itself — what :func:`validate_windows` and the dispatch
-builder walk.
+``self.part_counter`` is a per-instance copy of the declaration, created on
+first access, that reaches the door, buffer and historian through
+``self.runtime``. On the class (``MyMachine.part_counter``) it is the
+declaration itself.
 
-**The historian is a port, not a dependency.** :class:`Historian` names the
-two reads an optional, read-only historian must answer (design §7). The
-SDK never imports a database driver: the shipped ``dataops`` image
-implements this port over TimescaleDB (``dataops/historian.py``), and a
-runtime with ``historian=None`` — the default — serves every read from the
-buffer alone.
+:class:`Historian` is an optional, read-only port for points older than the
+buffer. The SDK ships no database driver; with ``historian=None`` every read
+comes from the buffer.
 """
 
 from __future__ import annotations
@@ -67,10 +52,9 @@ DEFAULT_WINDOW = "1h"
 
 @runtime_checkable
 class Historian(Protocol):
-    """An optional, READ-ONLY source of historised points older than the
-    buffer holds (evaluator design §7). Timestamps are unix seconds, the
-    same unit as every buffer read; a frame has columns ``ts`` and
-    ``value``, the same shape as :meth:`chaski.dataops.Buffer.window`.
+    """An optional, read-only source of points older than the buffer holds.
+    Timestamps are unix seconds; frames have columns ``ts`` and ``value``, like
+    :meth:`chaski.dataops.Buffer.window`.
     """
 
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
@@ -83,12 +67,9 @@ class Historian(Protocol):
 
 
 class _PerInstance:
-    """The descriptor half every declared input/output shares: read on the
-    class it is the declaration; read on an instance it is that instance's
-    own copy, created once and kept in the instance's ``__dict__`` under
-    the declared attribute name (a non-data descriptor, so the instance
-    entry wins on every later access — and a test may replace it with a
-    stand-in by plain assignment).
+    """Descriptor shared by inputs and outputs: on the class it is the
+    declaration, on an instance a copy kept in the instance's ``__dict__``.
+    A test can replace it by plain assignment.
     """
 
     _attr_name: str | None = None
@@ -127,19 +108,14 @@ def _find_attr_name(owner: type, descriptor: Any) -> str:
 
 
 class SignalRangeInput(_PerInstance):
-    """Read one signal's buffered values, resolved by name (+ optional element).
+    """Read one signal's buffered values, resolved by name and optional element.
 
-    Pass ``system_element_name`` to scope resolution to a specific
-    SystemElement — required on multi-machine hubs where the same signal
-    name lives on multiple SEs.
+    Pass ``system_element_name`` when the same signal name exists on several
+    elements.
 
-    ``window`` declares how far back this input needs to reach (a plain
-    number of seconds, or a string like ``"24h"``, ``"7d"``) — it sizes the
-    per-signal horizon the service trims the buffer to, and is checked at
-    startup by :func:`validate_windows`: a window longer than the broker's
-    own retention, with no historian configured to cover the gap, is a
-    startup error rather than a producer silently seeing an emptier and
-    emptier frame over time.
+    ``window`` is how far back the input reaches, in seconds or as ``"24h"``,
+    ``"7d"``. It sizes the buffer horizon, and :func:`validate_windows` refuses
+    at startup a window longer than broker retention without a historian.
     """
 
     def __init__(
@@ -156,11 +132,8 @@ class SignalRangeInput(_PerInstance):
     def forget(self) -> None:
         """Drop the resolved id so the next read resolves again.
 
-        Called by the service at the top of every resolution pass, which is
-        what keeps a rebind visible: the pass runs at startup and then on
-        `reresolve_loop`'s cadence, and that IS this service's re-resolution
-        rate — the dispatch table it builds is keyed by the ids it resolved,
-        so nothing downstream could act on a fresher answer anyway.
+        The service calls this at the start of every resolution pass, so a
+        rebind is picked up on the next pass.
         """
         self._resolved_id = None
 
@@ -168,17 +141,8 @@ class SignalRangeInput(_PerInstance):
     def signal_id(self) -> str:
         """This input's Signal ULID, resolved once per resolution pass.
 
-        It used to resolve on EVERY read, and this is read per metric: the
-        ingest loop asks for it for each record it applies, and each ask is a
-        full KV scan — twice over, since `resolve_signal` looks up the element
-        first. colca serves /kv at five a second because it is a SCAN, so a
-        node ingesting a few hundred metrics a second answered most of them
-        with HTTP 429, and every one surfaced as a handler that failed on a
-        signal it had already resolved successfully at startup.
-
-        The dispatch table is keyed by exactly this id, so re-deriving it per
-        record could not have changed any routing decision — it was work with
-        no possible effect but to fail.
+        It is read for every record, and resolving is a rate-limited KV scan,
+        so it is not resolved again until :meth:`forget`.
         """
         if self._resolved_id is not None:
             return self._resolved_id
@@ -193,19 +157,12 @@ class SignalRangeInput(_PerInstance):
     # ─── source-transparent reads: buffer, historian iff configured ────
 
     def fetch(self, start: float, end: float) -> pd.DataFrame:
-        """Points with ``start <= ts < end`` (half-open, matching
-        :meth:`Buffer.window`).
+        """Points with ``start <= ts < end``, like :meth:`Buffer.window`.
 
-        Served from the buffer. The portion of the range older than the
-        buffer's earliest retained point for this signal is served from
-        the historian when one is configured; when the buffer holds
-        nothing at all for this signal, the historian is consulted if
-        configured, otherwise the honest answer is an empty frame — buffer
-        state alone can't tell "nothing was ever produced" apart from
-        "not ingested yet". A range that demonstrably predates the
-        buffer's own retained window, with no historian configured to
-        cover it, is a clear error rather than a silently incomplete
-        frame (design §4.3, §7).
+        The part of the range older than the buffer's earliest point comes
+        from the historian if there is one. Without a historian, an empty
+        buffer gives an empty frame, and a range reaching before the buffer's
+        earliest point raises instead of returning an incomplete frame.
         """
         runtime = self._runtime()
         buffer = runtime.buffer
@@ -235,10 +192,8 @@ class SignalRangeInput(_PerInstance):
         return buffer.window(signal_id, start, end)
 
     def latest_value_before(self, before: float) -> Any:
-        """Value of the most recent point with ``ts <= before``, source-
-        transparent over buffer then historian. ``None`` if neither holds
-        one — never an error (unlike :meth:`fetch`, there is no declared
-        range to be provably incomplete against)."""
+        """Value of the most recent point with ``ts <= before``, from the buffer
+        or else the historian; ``None`` if neither has one."""
         row = self._latest_before(before)
         return row[1] if row is not None else None
 
@@ -262,12 +217,8 @@ class SignalRangeInput(_PerInstance):
     def earliest_timestamp(self) -> float | None:
         """The oldest point the buffer holds for this signal, or ``None``.
 
-        What a producer clamps a trailing window's start to on a node with
-        no historian: :meth:`fetch` refuses a range that reaches before this
-        point rather than silently serving less than was asked for, so a
-        window-based computation (an OEE over the last hour, on a service
-        that started ten minutes ago) asks first and computes over what
-        there is.
+        Without a historian, clamp a window's start to this, since
+        :meth:`fetch` refuses a range that reaches further back.
         """
         return self._runtime().buffer.earliest(self.signal_id)
 
@@ -292,17 +243,12 @@ class SignalRangeInput(_PerInstance):
         return (now - ts) <= freshness_s
 
 
-# ─── startup validation (design §4.1) ──────────────────────────────────────
+# ─── startup validation ─────────────────────────────────────────────────────
 
 
 class WindowExceedsRetentionError(RuntimeError):
-    """A declared input window exceeds broker retention with no historian
-    configured to cover the gap.
-
-    Raised at startup, never mid-run: the alternative is a producer whose
-    windowed reads silently grow emptier as the buffer's actual retained
-    window falls short of what it declared, with nothing telling the
-    operator why.
+    """A declared input window exceeds broker retention and no historian covers
+    the gap. Raised at startup.
     """
 
 
@@ -338,10 +284,8 @@ def validate_windows(
 
 
 def declared_inputs(instance: Any) -> Iterable[tuple[str, SignalRangeInput]]:
-    """``(attr_name, bound_input)`` for every ``SignalRangeInput`` declared
-    on ``instance``'s class — the one enumeration the dispatch builder, the
-    trim-horizon computation and the resolution pass share, so a ticking-
-    only input is counted everywhere a windowed one is."""
+    """``(attr_name, bound_input)`` for every ``SignalRangeInput`` declared on
+    ``instance``'s class."""
     cls = type(instance)
     for attr_name in dir(cls):
         class_attr = getattr(cls, attr_name, None)

@@ -1,15 +1,11 @@
-"""Tests for chaski.dataops.ingest.Ingest against a fake Door (no live broker).
+"""Tests for chaski.dataops.ingest.Ingest against a fake Door.
 
-Pins the crash-safety contract of the single-lane ingest loop (design §3):
-in-order processing, ack only after append + dispatch, gap honesty, doorbell
-wake-ups, generational cursor retirement, and safe reprocessing after a
-crash between processing and ack. The loop reads through a real
-:class:`chaski.door.Stream` — the SDK's consume lane — opened by the same
-factory shape ``DataOpsService`` hands it.
+Covered: processing in order, ack only after append and dispatch, gaps, the
+doorbell, retiring the previous cursor, and reprocessing after a crash before
+the ack. The loop reads through a real :class:`chaski.door.Stream`.
 
-No pytest-asyncio dependency: ``@run_async`` drives each coroutine test body
-through a plain ``asyncio.run()`` call under a normal (sync) pytest test, so
-fixtures inject exactly as they would on any other test.
+``@run_async`` runs each coroutine test with ``asyncio.run()``, so no
+pytest-asyncio is needed.
 """
 
 from __future__ import annotations
@@ -148,13 +144,8 @@ async def test_processing_appends_records_to_the_buffer(door, buffer):
 
 @run_async
 async def test_a_record_with_no_payload_timestamp_buffers_colca_ts_converted_to_seconds(door, buffer):
-    """colca's own record.ts is unix MILLISECONDS
-    (`colca/internal/store/store.go`'s UnixMilli cutoff comparison); every
-    other timestamp in dataops, including what lands in the buffer, is unix
-    SECONDS. A payload with no `timestamp` field of its own used to buffer
-    the raw millisecond ts as if it were seconds — landing the point
-    ~50,000 years in the future and wedging `latest_before`/`is_fresh`/
-    `trim` for that signal forever."""
+    """record.ts is in milliseconds; a payload without its own timestamp is
+    buffered at record.ts converted to seconds."""
     r = Record(
         offset=1,
         origin_offset=1,
@@ -384,11 +375,8 @@ class FlakyDoor(FakeDoor):
 
 @run_async
 async def test_run_forever_survives_one_transient_transport_error_and_resumes_fetching(buffer):
-    """`run_forever` once awaited `run_once` with no exception handling, so
-    any httpx error from /fetch or /ack (a colca restart, a read timeout, a
-    429, a 5xx) ended the ingest task FOR GOOD — health stayed 503 forever
-    and scheduled producers kept ticking on a frozen buffer. One transient
-    ConnectError must not kill the loop; it must retry and resume fetching."""
+    """A transient transport error does not end the loop; it retries and
+    fetches again."""
     door = FlakyDoor(fail_times=1)
     ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
 
@@ -407,9 +395,7 @@ async def test_run_forever_survives_one_transient_transport_error_and_resumes_fe
 
 @run_async
 async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
-    """Mutation check: the fix must catch httpx.HTTPError specifically, not
-    every exception — a genuine bug in run_once must still kill the task,
-    which is what turns the health door 503."""
+    """Only httpx.HTTPError is retried; any other exception still ends the task."""
 
     class BrokenDoor(FakeDoor):
         def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
@@ -422,8 +408,7 @@ async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
 
 
 def test_error_backoff_grows_with_consecutive_attempts_and_is_bounded(door, buffer):
-    """Bounded, jittered backoff (design: back off, don't spin against a
-    door that is still refusing)."""
+    """The backoff grows with each attempt, with jitter, up to a bound."""
     ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=1.0)
 
     first = ingest._error_backoff_s(1)
@@ -489,14 +474,8 @@ async def test_reprocessing_a_page_after_a_crash_does_not_duplicate_buffer_rows(
 
 @run_async
 async def test_a_drain_runs_off_the_loop_so_timers_keep_firing(buffer):
-    """The loop owns every timer in the process; a drain is blocking work
-    (door HTTP, sqlite, sync producer bodies) and must not run on it. This
-    was the measured failure: sync httpx inside `run_once` awaited on the
-    loop had a 15-second producer schedule firing every ~30 seconds. Pinned
-    by racing a drain whose fetch blocks for 0.3s against a 10ms ticker on
-    the same loop: off-loop, the ticker keeps counting; on-loop (revert
-    `run_once` to awaiting the body directly) it cannot run at all until
-    the drain ends, and the assertion goes red."""
+    """A drain whose fetch blocks for 0.3 s runs against a 10 ms ticker on the
+    same loop; the ticker keeps counting only if the drain is off the loop."""
     import time as time_mod
 
     class SlowDoor(FakeDoor):
@@ -525,10 +504,8 @@ async def test_a_drain_runs_off_the_loop_so_timers_keep_firing(buffer):
 
 
 def test_the_rollup_says_what_a_window_ingested_and_that_an_empty_one_ingested_nothing(door, buffer, caplog):
-    """One INFO line per 60s window — records, drains, cursor — mirroring the
-    connectors' [DATA] rollup. An empty window still logs: on a node whose
-    connectors publish every second, "0 records" is the stalled-lane signal
-    there was no line for."""
+    """One INFO line per 60 s window with records, drains and cursor, also when
+    the window was empty."""
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])
     # The window opens at construction on the real monotonic clock; anchor it
     # to the synthetic timeline the test drives.

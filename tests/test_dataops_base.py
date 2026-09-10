@@ -104,7 +104,7 @@ def test_cron_rejects_invalid_expression():
         cron("0 6 * * * *")  # 6 fields
 
 
-# ─── watermark (design §3, §10 — the framework, not the producer, owns it) ──
+# ─── watermark ──────────────────────────────────────────────────────────────
 
 
 def _make_producer(name: str) -> Producer:
@@ -164,8 +164,7 @@ def test_advance_watermark_preserves_the_existing_code_hash(tmp_path):
 
 
 def test_watermark_survives_a_restart(tmp_path):
-    """Not just the in-memory Buffer object — a FRESH Producer over a FRESH
-    Buffer instance opened on the same file must see the persisted value."""
+    """A new Producer over a new Buffer on the same file sees the persisted value."""
     db_path = tmp_path / "buffer.sqlite3"
 
     buffer1 = Buffer(db_path)
@@ -182,10 +181,8 @@ def test_watermark_survives_a_restart(tmp_path):
 
 
 def test_two_services_in_one_process_keep_their_producers_apart(tmp_path):
-    """The reason the runtime is instance state (service families design
-    §3.5): two producers of the SAME class, attached to two runtimes,
-    persist their watermarks in two buffers — nothing module-global routes
-    one service's writes into the other's state."""
+    """Two producers of the same class attached to two runtimes keep their
+    watermarks in two buffers."""
 
     class P(Producer):
         name = "shared_class"

@@ -40,17 +40,12 @@ class IntervalSpec:
 
 @dataclass(frozen=True)
 class OnMetricSpec:
-    """Event-driven trigger: fire whenever a new Metric for one of the
-    producer's declared inputs arrives over MQTT.
+    """Event-driven trigger: fire for every new Metric of one of the producer's
+    declared inputs.
 
     ``input_name`` is the attribute name of the ``SignalRangeInput`` on the
-    producer class (e.g. ``"part_counter"``). The service runtime resolves
-    this to a concrete MQTT topic at startup, subscribes via franzmq, and
-    invokes the decorated method (with the deserialised Metric as its
-    single positional arg) on every incoming message.
-
-    Multiple ``@on_metric`` decorators may stack on one method; the method
-    fires whenever any of the listed inputs receives a new value.
+    producer class (e.g. ``"part_counter"``). The decorated method receives the
+    decoded Metric. ``@on_metric`` decorators may stack on one method.
     """
 
     input_name: str
@@ -96,11 +91,8 @@ def parse_duration(duration: str | float | int) -> float:
     """Parse a duration into seconds.
 
     Accepts a numeric seconds value or a string like ``"30s"``, ``"15m"``,
-    ``"2h"``, ``"500ms"``, ``"7d"``. The one owner of duration-string
-    parsing in this package — :func:`every` and
-    ``chaski.dataops.SignalRangeInput``'s ``window`` argument both go
-    through this, so a syntax accepted in one reads identically in the
-    other.
+    ``"2h"``, ``"500ms"``, ``"7d"``. Used by :func:`every` and by
+    ``SignalRangeInput``'s ``window``.
     """
     if isinstance(duration, bool):
         raise TypeError(f"`duration` must be str or number, got {type(duration).__name__}")
@@ -136,7 +128,7 @@ def every(duration: str | float | int) -> Callable[[Callable], Callable]:
 
 
 def on_metric(input_name: str) -> Callable[[Callable], Callable]:
-    """Fire whenever the named declared input receives a new Metric over MQTT.
+    """Fire whenever the named declared input receives a new Metric.
 
     The argument is the attribute name of a ``SignalRangeInput`` on the
     producer class (not the underlying signal name). Stacks with other
@@ -153,11 +145,9 @@ def on_metric(input_name: str) -> Callable[[Callable], Callable]:
             async def recompute(self, metric):
                 ...
 
-    The handler receives the deserialised
-    :class:`colca_data_contracts.Metric` as its only positional argument.
-    The service runtime has already updated the input's in-memory cache by
-    the time the handler runs, so ``self.part_counter.latest_value`` is
-    current.
+    The handler receives the decoded :class:`colca_data_contracts.Metric` as
+    its only positional argument. The record is already in the buffer when the
+    handler runs.
     """
     if not input_name or not isinstance(input_name, str):
         raise ValueError(f"input_name must be a non-empty string, got {input_name!r}")

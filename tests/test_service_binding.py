@@ -1,17 +1,9 @@
-"""Level-2 pin for Service's signal-binding logic (hermetic — a fake MQTT
-client, no broker) — SDK design §9's "buffered sample flushes on bind".
+"""Tests for Service's signal binding with a fake MQTT client.
 
-The node's default placement binds a Signal at ``{connector's own
-mount}/{tag's sanitized NAME}`` (colca `exec_configure.go` `bindCatalogue`),
-which is NOT in general the same string as the ``path`` a caller passed to
-``publish()`` — a single-segment source like "temp" gets the connector's
-mount prepended. `_on_signal` must match by `signal.data_tag` against the
-catalogue, never by comparing the Signal's own topic path to the source.
-
-``connect_local_mqtt``/``resolve_local_identity`` are monkeypatched so the
-public ``Service(name, mount, ...)`` constructor (no ``node=`` — the local
-door) exercises the real ``start()``/``publish()``/``_on_signal`` code paths
-without a real broker or a real ``/self`` HTTP call.
+The node binds a Signal at ``{mount}/{tag name}``, which is usually not the
+``path`` given to ``publish()``, so `_on_signal` matches by `signal.data_tag`.
+``connect_local_mqtt`` and ``resolve_local_identity`` are patched, so the real
+``start()``, ``publish()`` and ``_on_signal`` run without a broker.
 """
 
 from __future__ import annotations
@@ -94,9 +86,8 @@ def _minted_tag_id(client: _FakeClient) -> str:
 
 
 def test_a_single_segment_path_binds_at_the_connectors_mount_not_at_the_source(tmp_path, monkeypatch):
-    """The bug this pins: "temp" (no meta.element) binds at "line1/temp" at
-    the node — a different string from the source "temp" the catalogue
-    carries. Matching must go through signal.data_tag, not the path."""
+    """The source "temp" binds at "line1/temp" at the node, so matching goes
+    through signal.data_tag."""
     svc, client = _service(tmp_path, monkeypatch)
 
     svc.publish("temp", 42.0)
@@ -112,11 +103,8 @@ def test_a_single_segment_path_binds_at_the_connectors_mount_not_at_the_source(t
 
 
 def test_a_multi_segment_path_binds_under_the_subscribed_mount_and_still_matches(tmp_path, monkeypatch):
-    """Denominator check (testing.md): a source naming its own child element
-    (meta.element, resolved server-side against an element already placed
-    under this service's own mount) must keep matching too — this is the
-    case where the Signal's bound path and the catalogue source happen to be
-    the identical string."""
+    """A source with its own child element matches too; here the bound path and
+    the source happen to be the same string."""
     svc, client = _service(tmp_path, monkeypatch)
 
     svc.publish("press3/temp", 7.0)

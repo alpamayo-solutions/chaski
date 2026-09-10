@@ -1,11 +1,8 @@
-"""Unit tests for chaski.dataops.inputs — buffer-backed, KV-resolved declared inputs.
+"""Tests for chaski.dataops.inputs.
 
-No live colca and no real Postgres: a fake ``Door`` (KV only) plus a real
-``Buffer`` over a tmp SQLite file stand in for the runtime, and a small
-stand-in implements the :class:`Historian` port where a test needs
-"historian configured". Inputs are read the way a producer reads them —
-through an instance attached to a runtime — because that is the only way
-they reach a door or a buffer now (no module globals).
+A fake ``Door`` (KV only), a real ``Buffer`` on a temporary SQLite file and,
+where needed, a :class:`Historian` stand-in make up the runtime. Inputs are
+read through a producer instance, as in production.
 """
 
 from __future__ import annotations
@@ -89,9 +86,7 @@ def test_an_input_read_on_the_class_is_the_declaration_not_a_reader():
 
 
 def test_each_instance_reads_through_its_own_runtime(door, buffer, tmp_path):
-    """Per-instance state: two instances of one producer class attached to
-    two runtimes resolve against two doors — the module-global binding this
-    replaced would have made them share one."""
+    """Two instances of one producer class on two runtimes resolve against two doors."""
     other_door = FakeDoor([kv_entry("colca/v1/_Signal/n-2/heartbeat", {"id": "sig-other", "name": "heartbeat"})])
     other_buffer = Buffer(tmp_path / "other.sqlite3")
     try:
@@ -199,7 +194,7 @@ def test_window_accepts_duration_strings():
     assert SignalRangeInput("x").window_s == 3600  # default "1h"
 
 
-# ─── validate_windows (design §4.1) ──────────────────────────────────────
+# ─── validate_windows ────────────────────────────────────────────────────
 
 
 def test_validate_windows_passes_when_historian_configured():
@@ -257,14 +252,7 @@ def test_validate_windows_accepts_instances_too():
 
 
 def test_the_ingest_hot_path_does_not_re_read_kv(door, runtime):
-    """`signal_id` is read per METRIC, and it used to scan KV on every read.
-
-    Twice over, since `resolve_signal` looks up the element first. colca
-    serves /kv at five a second because it is a SCAN class, so a node
-    ingesting a few hundred metrics a second answered most of those reads
-    with HTTP 429 — and each one surfaced as an `on_metric` handler failing
-    on a signal it had already resolved successfully at startup.
-    """
+    """`signal_id` is read for every metric, so it must not read KV again."""
     signal = _holder(runtime).heartbeat
 
     first = signal.signal_id
@@ -275,12 +263,7 @@ def test_the_ingest_hot_path_does_not_re_read_kv(door, runtime):
 
 
 def test_forget_makes_the_next_read_resolve_again(door, runtime):
-    """The denominator for the test above: the id is held, not frozen.
-
-    The service calls `forget()` at the top of every resolution pass, so a
-    rebound signal is picked up at that cadence — which is the same cadence
-    the dispatch table it builds is rebuilt on.
-    """
+    """The id is held, not frozen: after `forget()` the next read resolves again."""
     signal = _holder(runtime).heartbeat
     assert signal.signal_id == "sig-1"
 

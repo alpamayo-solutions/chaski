@@ -88,11 +88,8 @@ def test_value_round_trip_preserves_python_types(buffer):
     assert buffer.latest_before("sig-str", 2.0) == (1.0, "hello")
     assert buffer.latest_before("sig-json", 2.0) == (1.0, {"nested": [1, 2, 3]})
 
-    # the sharp edge this pins: a bool must not silently become an int (or
-    # vice versa) — SQLite has no bool type, so this only holds if storage
-    # round-trips through something (JSON) that does. `is True`/`is not
-    # True` uses Python's cached bool singletons for an exact check that
-    # `==` (True == 1) would not give us.
+    # SQLite has no bool type, so values go through JSON. `is True` checks
+    # exactly, where `==` would accept 1.
     bool_value = buffer.latest_before("sig-bool", 2.0)[1]
     assert bool_value is True
     int_value = buffer.latest_before("sig-int", 2.0)[1]

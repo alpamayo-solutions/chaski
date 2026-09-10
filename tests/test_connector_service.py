@@ -1,17 +1,13 @@
-"""Level-2 pin for ``chaski.ConnectorService`` (service families design §3.4) — hermetic: a fake driver for the source, a fake node standing in for
-BOTH doors the service speaks to (the MQTT client it publishes through, the
-KV it reads its previous catalogue from), and the loop driven one iteration
-at a time.
+"""Tests for ``chaski.ConnectorService`` with a fake driver, a fake node behind
+both doors (MQTT and KV), and the loop driven one iteration at a time.
 
-These are the claims ``connector/src/reader.py`` carried before the loop
-moved here, kept in outcome: a catalogue published once and not again until
-it changes (also across a restart, whose memory is the node), a tag's id
-outliving the discovery that minted it, bindings by ``data_tag`` membership
-with tombstones and someone-else's-tags, publish-on-change at the Signal's
-own topic with the Signal's precision, the heartbeat surviving a lost
-source, ``is_connected`` on change per bound Signal, a broker outage failed
-closed into a bounded buffer and retried in order, source reconnect with
-backoff that never crash-loops, and an outage logged as a state.
+Covered: the catalogue is published once and again only when it changes, also
+across restarts; tag ids outlive discovery; bindings follow ``data_tag``,
+including tombstones and other services' tags; values are published on change
+at the Signal's topic and precision; the heartbeat survives a lost source;
+``is_connected`` is published on change; a broker outage fills a bounded buffer
+that is retried in order; the source reconnects with backoff; and an outage is
+logged once, not per poll.
 """
 
 from __future__ import annotations
@@ -53,13 +49,9 @@ class _ReasonCode:
 
 
 class FakeNode:
-    """One colca node's local doors, in memory: retained state (the KV the
-    service reads its previous catalogue from, and what a retained publish
-    lands in), a publish log, subscriptions with callbacks, and a
-    connectivity switch. One object serves as the MQTT client
-    ``connect_local_mqtt`` returns AND as the ``Door`` the service opens —
-    two wires to the same node in production, collapsed because nothing
-    here cares which one a call used."""
+    """A colca node's local doors in memory: retained state, a publish log,
+    subscriptions with callbacks and a connectivity switch. One object plays
+    both the MQTT client and the ``Door``."""
 
     def __init__(self) -> None:
         self.retained: dict[str, dict] = {}
@@ -370,9 +362,8 @@ def test_a_rejected_catalogue_is_not_recorded_as_published(node, driver, monkeyp
 
 
 def test_a_restart_reuses_every_tag_id_and_republishes_nothing(node, driver, monkeypatch):
-    """The connector holds no state of its own: a restart is a fresh object
-    against the same node, and what survives can only have come from the
-    node's retained record — the ids AND the republish guard."""
+    """A restart is a fresh object against the same node; the ids and the
+    republish guard come back from the node's retained record."""
     first = started(node, driver, monkeypatch)
     poll(first)
     before = tag_ids(node.catalogues()[0])
@@ -420,9 +411,8 @@ def test_a_file_mapped_driver_advertises_its_catalogue_while_the_source_is_down(
 
 
 def test_a_browse_driver_that_started_with_its_source_down_discovers_on_the_retry(node, driver, monkeypatch):
-    """The startup promise, kept in the loop: the RETRY is a full connect +
-    discover, not a bare reconnect — until then only the synthetic tags are
-    advertised, and every id the node already knows is carried forward."""
+    """The retry is a full connect and discover. Until it succeeds only the
+    synthetic tags are advertised, and known ids are carried forward."""
     clock = Clock()
     # Startup fails, and so does the first poll's retry (it is immediate);
     # the next retry is due DISCOVERY_RETRY_SECONDS later.
@@ -654,10 +644,8 @@ def _batch(n: int) -> list[tuple[Topic, Metric]]:
 
 
 def test_a_disconnected_broker_is_detected_before_publishing_and_does_not_stall(node, driver, monkeypatch):
-    """paho queues a QoS>=1 publish while disconnected instead of raising;
-    franzmq notices only via PublishTimeout after the full publish_timeout,
-    one metric at a time. Checking is_connected() up front is what keeps a
-    broker outage from stalling for len(batch) * timeout seconds."""
+    """paho queues publishes while disconnected, so the loop checks
+    is_connected() first instead of waiting out one timeout per metric."""
     svc = started(node, driver, monkeypatch)
     node.connected = False
     batch = _batch(50)
@@ -826,9 +814,8 @@ def test_a_reconnect_re_resolves_placement_and_republishes_at_the_new_position(n
 
 
 def test_the_local_door_is_opened_with_the_log_publisher_attached(node, driver, monkeypatch):
-    """Every service publishes its log: the connector reaches
-    the tree's logs stream through the same connect_local_mqtt every local
-    service uses, publish_logs on."""
+    """The connector publishes its log through connect_local_mqtt, like every
+    local service."""
     calls: dict = {}
 
     def connect(name, **kwargs):

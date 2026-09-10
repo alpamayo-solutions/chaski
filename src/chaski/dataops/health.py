@@ -1,22 +1,12 @@
-"""A DataOps service's health door: an HTTP server ON the event loop, port 8888.
+"""A DataOps service's health door: an HTTP server on the event loop, port 8888.
 
-Every Colca Python service answers health on 8888. The shipped dataops
-service once had no server at all — its container healthcheck spawned a
-fresh interpreter that imported the whole app and exited: it tested nothing
-about the RUNNING service, and under load the import alone exceeded the
-probe's own timeout. A check that cannot see a real failure and can report
-a false one is worse than none.
+It runs on the service's own event loop on purpose. The loop schedules every
+producer tick and ingest drain, so a loop that answers in time is what the
+container wants to know, and a blocked loop fails the probe. Blocking work runs
+off the loop (see ``Ingest.run_once`` and ``service.off_loop``).
 
-This one is deliberately served from the service's own event loop, with no
-thread to hide behind: the loop is the thing that schedules every producer
-tick and every ingest drain, so "the loop answered within the probe's
-timeout" is the very fact the container wants to know. A wedged or blocked
-loop fails the probe honestly. (The blocking work itself — door HTTP,
-sqlite — runs OFF the loop; see ``Ingest.run_once`` and
-``service.off_loop``. This server is how that stays true.)
-
-Stdlib only, HTTP/1.1 with ``Connection: close`` — one tiny GET, no routes
-beyond ``/healthz``, no framework for a service that otherwise needs none.
+Standard library only: HTTP/1.1 with ``Connection: close`` and one route,
+``/healthz``.
 """
 
 from __future__ import annotations
@@ -34,14 +24,11 @@ PORT_DEFAULT = 8888
 
 @dataclass
 class HealthState:
-    """What the service knows about itself, written by ``run()``'s wiring.
+    """What the service knows about itself, set by ``run()``.
 
-    ``ingest_task`` is the one thing that can make the answer a 503 while
-    the loop still runs: the ingest loop is the service's single data lane,
-    so a task that DIED (done, with an exception) means the service is up
-    but doing nothing — the container should say so. An ingest that was
-    never started (nothing resolved yet) is healthy: that is a fresh node
-    waiting to be commissioned, not a failure.
+    An ingest task that died with an exception turns the answer into a 503,
+    because the service is up but doing nothing. An ingest that never started
+    (nothing resolved yet) is healthy: a fresh node waiting to be commissioned.
     """
 
     started_at: float = field(default_factory=time.time)

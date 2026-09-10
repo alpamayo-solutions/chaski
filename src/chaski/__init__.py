@@ -49,9 +49,8 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    # `chaski.DataOpsService` without importing pandas/APScheduler into every
-    # `import chaski`: a process that only wants a Service pays nothing, and one
-    # without the extra gets an ImportError that names it.
+    # Imported on first use, so `import chaski` does not pull in pandas, and a
+    # missing extra raises an ImportError that names it.
     if name == "DataOpsService":
         try:
             from .dataops import DataOpsService

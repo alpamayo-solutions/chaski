@@ -1,19 +1,11 @@
-"""Unit tests for chaski.dataops.service's dispatch, trim and tick machinery.
+"""Tests for chaski.dataops.service's dispatch, trim and tick machinery.
 
-The fetch filter (`signal_ids`) and the dispatch table (`dispatch`) answer
-two different questions:
+The fetch filter (`signal_ids`) says which points are buffered; the dispatch
+table (`dispatch`) says which methods fire for a buffered point. A producer
+driven only by ticks is not in `dispatch`, but its inputs must be in
+`signal_ids`, or its window reads stay empty.
 
-  * `signal_ids` — which points does the ingest loop buffer at all?
-  * `dispatch`   — which producer methods fire when a buffered point
-                    arrives?
-
-A producer driven purely by `@every`/`@cron` never appears in `dispatch`
-(nothing should call it per-record), but its declared `SignalRangeInput`
-must still show up in `signal_ids` — otherwise its points never enter the
-buffer and its window reads come back silently empty (design §3, §4.1).
-
-No live colca: a fake `Door` (KV only) stands in for KV resolution, same
-pattern as `test_dataops_inputs.py`.
+A fake `Door` (KV only) stands in for resolution.
 """
 
 from __future__ import annotations
@@ -94,8 +86,7 @@ class TickOnlyProducer(Producer):
 
 
 class EventDrivenProducer(Producer):
-    """Declares an input wired to @on_metric — the pre-existing case that
-    already worked."""
+    """Declares an input wired to @on_metric."""
 
     name = "event_driven"
     system_element_name = "SE-Event"
@@ -123,14 +114,13 @@ def test_tick_only_producer_contributes_its_signal_to_the_filter(runtime):
 
 
 def test_filter_is_the_union_of_tick_only_and_on_metric_inputs(runtime):
-    """Denominator check (testing.md): a fix that swapped one omission for
-    another (e.g. only tick-driven inputs) would still fail this."""
+    """Both kinds of inputs are in the filter."""
     instances = _instantiate(runtime, TickOnlyProducer, EventDrivenProducer)
     _dispatch, signal_ids, _unresolved = build_dispatch(runtime, instances)
     assert set(signal_ids) == {"sig-tick", "sig-event"}
 
 
-# ─── dispatch: unchanged shape — @on_metric only ─────────────────────────
+# ─── dispatch: @on_metric only ───────────────────────────────────────────
 
 
 def test_dispatch_table_has_no_entry_for_a_tick_only_producer(runtime):
@@ -177,14 +167,8 @@ def test_unresolvable_input_is_skipped_not_raised(runtime):
 
 @run_async
 async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(runtime):
-    """A producer routinely starts before the tree it reads exists.
-
-    A signal is commissioned by a separate act — `signal/autobind`, or an
-    editor — so a producer that came up first used to keep the
-    empty dispatch table it was born with for the life of the process. It
-    still ticked, so it looked like it worked: its outputs tracked its inputs
-    at the TIMER's cadence instead of the data's, with one WARNING at startup
-    to say why.
+    """A signal commissioned after the producer started reaches dispatch
+    without a restart.
     """
     import chaski.dataops.service as service_module
 
@@ -224,8 +208,7 @@ async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(run
 
 @run_async
 async def test_the_retry_stops_once_everything_resolves(runtime):
-    """A startup race, not a steady-state poll — a resolved input never
-    becomes unresolved, so this must not keep reading KV forever."""
+    """The retry loop stops reading KV once everything resolved."""
     import chaski.dataops.service as service_module
 
     class _Ingest:
@@ -254,12 +237,10 @@ async def test_the_retry_stops_once_everything_resolves(runtime):
     assert calls["n"] == 1
 
 
-# ─── trim horizons + periodic wiring ─────────────────────────────────────
+# ─── trim horizons and the periodic trim ─────────────────────────────────
 #
-# design §3: "horizon per signal = max(the largest `window` declared on it,
-# the broker's metrics retention)". These pin compute_trim_horizons (the
-# horizon computation) and trim_buffer (the wired call) — the two halves
-# DataOpsService.serve() wires onto a periodic scheduler job.
+# The horizon per signal is the larger of its widest declared window and the
+# broker's metrics retention.
 
 
 class ShortWindowProducer(Producer):
@@ -298,8 +279,8 @@ def test_horizon_is_the_largest_declared_window_across_producers_sharing_a_signa
 
 
 def test_horizon_falls_back_to_broker_retention_when_it_exceeds_every_declared_window(runtime):
-    """A short declared window must never trim tighter than the broker's
-    own metrics retention — replay (§10) needs the full retained window."""
+    """A short window never trims tighter than the broker's retention, which
+    replay needs."""
     instances = _instantiate(runtime, ShortWindowProducer)
     horizons = compute_trim_horizons(instances, retention_s=999_999.0)
     assert horizons == {"sig-event": 999_999.0}
@@ -318,12 +299,8 @@ def test_horizon_skips_an_unresolved_input_rather_than_raising(runtime):
 
 
 def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runtime):
-    """Wiring-level test (both directions in one test, matching
-    test_dataops_buffer.py's Buffer.trim pin, but exercised through the
-    actual path the service wires): a real producer's declared window flows
-    through compute_trim_horizons into a trim_buffer call — a point older
-    than the horizon is deleted, a point inside it survives. Plain function,
-    like the job itself: sqlite work stays off the event loop."""
+    """A producer's declared window flows through trim_buffer: a point older
+    than the horizon is deleted, one inside it survives."""
     now = time.time()
     buffer.append("sig-event", now - 20.0, "old")  # older than the 10s window
     buffer.append("sig-event", now - 1.0, "recent")  # inside the 10s window
@@ -339,10 +316,8 @@ def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runti
 
 
 class LateResolvedProducer(Producer):
-    """Declares an input for a signal that is NOT in KV yet at startup —
-    resolves only after commissioning, like `UnresolvableProducer`, but
-    reused here under a distinct signal name so the buffer content this
-    test seeds is not shared with other tests in this module."""
+    """Declares an input for a signal that appears in KV only later; its own
+    signal name keeps the seeded buffer apart from other tests."""
 
     name = "late_resolved"
     system_element_name = "SE-Late"
@@ -355,15 +330,8 @@ class LateResolvedProducer(Producer):
 
 
 def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(buffer, door, runtime):
-    """Horizons used to be computed ONCE at startup, before `reresolve_loop`
-    had resolved anything — a signal commissioned after the service started
-    (the normal order: signals are bound
-    after the service is already running) never appeared in the
-    horizons dict, and `Buffer.trim` keeps every point for a signal absent
-    from it — it grew without bound for the life of the volume. The fix
-    recomputes horizons inside the trim job itself from the CURRENTLY
-    resolved inputs, so a late resolve is picked up on the very next
-    scheduled trim, no restart required."""
+    """The trim job recomputes horizons on every run, so a signal that resolves
+    late is trimmed too."""
     instances = _instantiate(runtime, LateResolvedProducer)
     now = time.time()
     buffer.append("sig-late", now - 20.0, "old")  # older than the 10s window, once it resolves
@@ -384,11 +352,8 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
 
 
 def test_the_doorbell_rings_for_a_metric_franzmq_cannot_decode():
-    """franzmq decodes every inbound message before dispatch, on paho's
-    network thread; a `_Metric` without `timestamp` raised inside that
-    decode and killed the thread — the service went deaf with no error.
-    The doorbell never reads the payload, so an undecodable message must
-    still ring it, and a well-formed one must still take the typed path."""
+    """An undecodable message still rings the doorbell; a well-formed one takes
+    the typed path."""
     import json
 
     import franzmq
@@ -412,14 +377,10 @@ def test_the_doorbell_rings_for_a_metric_franzmq_cannot_decode():
 
 
 def test_a_periodic_tick_is_scheduled_as_a_plain_function_not_a_coroutine():
-    """What keeps producer ticks OFF the event loop: AsyncIOScheduler runs a
-    coroutine job on the loop and a plain function in its thread-pool
-    executor. `off_loop` turns a producer's (decoratively async) tick into
-    the latter — and still runs the coroutine body, exceptions included.
-
-    `off_loop` always wraps a bound Producer method in production (taking
-    the producer's own lock around it — see the lock tests below), so this
-    exercises it the same way rather than a bare function."""
+    """`off_loop` turns an async tick into a plain function, which
+    AsyncIOScheduler runs in its thread pool, and still runs the coroutine
+    body, exceptions included. It wraps a bound Producer method, as in
+    production."""
     import inspect
 
     class _TickProducer(Producer):
@@ -474,12 +435,8 @@ def _metric_record(payload: dict, ts: float) -> Record:
 
 
 def test_decode_metric_falls_back_to_colca_record_ts_converted_to_seconds():
-    """colca's record.ts is unix MILLISECONDS
-    (`colca/internal/store/store.go`'s UnixMilli cutoff comparison); every
-    timestamp handed to a producer's @on_metric handler is unix SECONDS. A
-    payload with no `timestamp` field of its own used to decode into a
-    Metric carrying the raw millisecond ts as if it were seconds — landing
-    ~50,000 years in the future."""
+    """A payload without a timestamp gets record.ts converted from milliseconds
+    to seconds."""
     record = _metric_record({"signal_id": "sig-1", "value": 1.0}, ts=1_700_000_000_000.0)
 
     metric = decode_metric(record)
@@ -488,9 +445,7 @@ def test_decode_metric_falls_back_to_colca_record_ts_converted_to_seconds():
 
 
 def test_decode_metric_prefers_the_payloads_own_timestamp():
-    """Denominator: the fallback must only kick in when the payload truly
-    carries none of its own — an explicit payload timestamp must survive
-    unconverted, proving the conversion isn't applied unconditionally."""
+    """A payload's own timestamp is kept unconverted."""
     record = _metric_record({"signal_id": "sig-1", "value": 1.0, "timestamp": 42.0}, ts=1_700_000_000_000.0)
 
     metric = decode_metric(record)
@@ -516,20 +471,14 @@ class FlakyKvDoor(FakeDoor):
 
 
 def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
-    """`forget_resolved` once ran unconditionally BEFORE the pass's own KV
-    read, so a 429 on the pinned read (`resolve.one_pass`) meant every
-    already-resolved input tried to re-resolve on its own — against a door
-    still refusing requests — the fetch filter narrowed below what was
-    actually bound, and `ingest.rebind` dropped already-flowing signals from
-    the buffer while the cursor kept acking, silently. Only forget a
-    resolved id once the pass's own KV read actually succeeded."""
+    """When the pass's KV read fails, inputs keep the ids they resolved before
+    and the fetch filter does not narrow."""
     door = FlakyKvDoor([signal_entry("sig-event", "on_metric_signal")])
     runtime = FakeRuntime(door, buffer)
 
     instances = _instantiate(runtime, EventDrivenProducer)
 
-    # First pass resolves normally — denominator: proves resolution works
-    # before the failure is introduced.
+    # The first pass resolves normally.
     _, signal_ids1, unresolved1 = build_dispatch(runtime, instances)
     assert signal_ids1 == ["sig-event"]
     assert unresolved1 == 0
@@ -542,24 +491,13 @@ def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
     assert list(dispatch2.keys()) == ["sig-event"]
 
 
-# ─── producer state shared across the ingest thread and the scheduler's
-# thread pool must serialize on the producer's own lock ──────────────────
+# ─── handlers and ticks serialize on the producer's lock ─────────────────
 
 
 def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock():
-    """`@on_metric` handlers run on the ingest worker thread; `@every`/
-    `@cron` ticks run in APScheduler's own thread pool — two real OS
-    threads that can race on shared producer state with no lock (design §4:
-    "handlers and ticks on one producer serialize on the producer's own
-    lock"). Drives both through the exact wrappers the service hands to the
-    ingest dispatch table (`make_handler`) and the scheduler (`off_loop`),
-    on the SAME producer instance, and proves they cannot overlap.
-
-    The producer overrides `__init__` for its own state and does NOT call
-    `super().__init__()` — exactly what the level-4 `OvenWatch` fixture and
-    user-written producers do. The lock must exist anyway (it is attached in
-    `Producer.__new__`), or every dispatched metric on such a producer dies
-    with `AttributeError: ... has no attribute '_lock'`."""
+    """A handler (through `make_handler`) and a tick (through `off_loop`) on the
+    same producer never overlap. The producer overrides `__init__` without
+    calling super(); the lock exists anyway."""
 
     class _LockedProducer(Producer):
         name = "locked_producer_test"

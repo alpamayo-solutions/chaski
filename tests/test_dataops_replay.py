@@ -1,10 +1,7 @@
-"""Unit tests for chaski.dataops.service.replay_changed_producers —
-hash-triggered broker-window replay (design §10, requirement #5).
+"""Tests for chaski.dataops.service.replay_changed_producers.
 
-No live colca: a fake Door (KV only) resolves declared inputs, same
-pattern as test_dataops_service.py. A real Buffer over a tmp SQLite file
-provides watermark/code_hash persistence and the buffered points replay
-reads from.
+A fake Door (KV only) resolves inputs; a real Buffer on a temporary SQLite file
+holds watermarks, code hashes and the points replay reads.
 """
 
 from __future__ import annotations
@@ -73,9 +70,8 @@ class RecordingProducer(Producer):
 
 
 class TickOnlyProducer(Producer):
-    """Declares an input but has no @on_metric handler at all — replay has
-    nothing to dispatch for it, but its hash/watermark bookkeeping must
-    still work uniformly (design: no special-casing by trigger shape)."""
+    """Declares an input but no @on_metric handler: nothing to replay, but its
+    hash and watermark are still kept."""
 
     name = "tick_only"
     system_element_name = "SE-2"
@@ -143,9 +139,8 @@ async def test_unchanged_hash_does_not_reset_or_replay_again(buffer, runtime):
 
 @run_async
 async def test_a_second_real_code_change_replays_again(buffer, runtime, monkeypatch):
-    """Denominator for 'exactly once': it means once PER CHANGE, not a
-    permanent lockout. Simulates a second genuine code change by monkey-
-    patching compute_code_hash to return a fresh value on the second call."""
+    """Replay happens once per change: a second code change, simulated by
+    patching compute_code_hash, replays again."""
     from chaski.dataops import service
 
     buffer.append("sig-event", 100.0, "a")
@@ -188,19 +183,11 @@ async def test_tick_only_producer_is_untouched_on_the_second_call(buffer, runtim
     assert buffer.watermark("tick_only") == watermark_after_first
 
 
-# ─── a producer error must be as survivable on replay as it is live ─────────
-#
-# Ingest._process_record wraps every @on_metric handler call in its own
-# try/except so one broken handler never takes the ingest loop down. Before
-# this guard existed here, the SAME error was fatal on replay, and — because
-# it happened before set_watermark — the hash was never persisted, so the
-# next restart replayed the identical window and crashed again. Unbounded
-# crash-loop.
+# ─── a producer error is survived on replay, as it is live ─────────────────
 
 
 class FailingProducer(Producer):
-    """An @on_metric handler that always raises — the shape that crash-
-    looped the service on replay."""
+    """An @on_metric handler that always raises."""
 
     name = "failing"
 
@@ -230,11 +217,8 @@ async def test_a_handler_that_raises_on_replay_does_not_crash_the_service(buffer
 
 @run_async
 async def test_a_failing_producer_still_gets_its_watermark_and_hash_persisted(buffer, runtime):
-    """The rule for the watermark/hash: persisted exactly once per replay
-    pass regardless of handler failures — same as a live page always being
-    acked regardless of a handler failure. Otherwise a producer that fails
-    on EVERY record would replay (and crash-loop) forever, since the hash
-    triggering replay would never get stored."""
+    """Watermark and hash are stored after a replay pass even when handlers
+    failed, so the replay does not repeat on every start."""
     from chaski.dataops import codehash
 
     buffer.append("sig-event", 100.0, "a")
@@ -245,9 +229,8 @@ async def test_a_failing_producer_still_gets_its_watermark_and_hash_persisted(bu
     assert buffer.code_hash("failing") == codehash.compute_code_hash(FailingProducer)
     assert buffer.watermark("failing") == 100.0
 
-    # Denominator half of "not forever": with the hash now stored, a second
-    # startup with the SAME (still-failing) code must not replay again —
-    # exactly the same one-time-per-change contract a healthy producer gets.
+    # With the hash stored, a second start with the same failing code does not
+    # replay again.
     instance.calls = 0
     await replay_changed_producers(runtime, [instance])
     assert instance.calls == 0, "an unchanged hash must not replay a failing producer again either"
@@ -255,10 +238,8 @@ async def test_a_failing_producer_still_gets_its_watermark_and_hash_persisted(bu
 
 @run_async
 async def test_a_failing_producer_does_not_block_a_later_producer_in_the_same_pass(buffer, runtime):
-    """An unhandled exception from one producer's handler must not abort
-    bookkeeping for every producer after it in the same startup pass —
-    denominator: a healthy producer later in the list still replays and
-    advances."""
+    """A failing producer does not stop a later producer in the same pass from
+    replaying and advancing."""
     buffer.append("sig-event", 100.0, "a")
     failing = FailingProducer().attach(runtime)
     healthy = RecordingProducer().attach(runtime)

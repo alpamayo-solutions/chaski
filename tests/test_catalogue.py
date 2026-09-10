@@ -1,9 +1,7 @@
-"""Level-2 pin for the one catalogue every Service publishes (SDK design §9;
-service families design §3.4/§4): a source keeps its id for as long as it
-is known — across restarts, because the memory is the node's retained
-record, not the process — the set grows monotonically, a vanished source
-is carried forward stale, and the republish guard is armed from what is
-already on record."""
+"""The catalogue every Service publishes: a source keeps its id for as long as
+it is known, also across restarts through the node's retained record; a
+vanished source stays marked stale; and an unchanged catalogue is not
+republished."""
 
 from __future__ import annotations
 
@@ -44,10 +42,8 @@ def test_element_for_is_the_paths_parent_or_empty_for_a_top_level_path():
 
 
 def test_element_for_joins_the_mount_to_make_the_parent_node_local():
-    # The node resolves meta.element as a NODE-LOCAL path (exec_configure.go
-    # elementAt/authorElementAt), so a mounted service's parent must be
-    # joined onto its mount before it is sent, or the node looks for a
-    # root-level element that was never meant (SDK design §3 gap 1).
+    # The node resolves meta.element as a node-local path, so the parent is
+    # joined onto the mount.
     assert element_for("press3/temp", mount="line1") == "line1/press3"
     # A top-level path has no parent at all — no meta.element, not "the
     # mount itself" — so nothing is joined.
@@ -68,9 +64,8 @@ def test_ensure_emits_the_mount_joined_element_and_the_unit_for_a_published_path
 
 
 def test_ensure_emits_no_element_for_a_top_level_path_on_a_mounted_catalogue():
-    # No parent means the tag stays placed at the service's own mount, which
-    # the node already does by default when meta.element is absent —
-    # sending "line1" here would wrongly narrow it to the mount itself.
+    # Without a parent there is no meta.element; the node places the tag at
+    # the service's mount by default.
     cat = Catalogue(connector="svc1", mount="line1")
     cat.ensure("temp", 21.5)
     assert "element" not in cat.data_tags()[0].meta
@@ -97,8 +92,7 @@ def test_seal_marks_a_path_not_seen_this_run_stale_and_a_seen_one_survives():
     assert cat.seal(seen={"kept"}) is True
 
     tags = {tag.source: tag for tag in cat.data_tags()}
-    # Presence check first (testing.md: an absence assertion needs a
-    # denominator) — "kept" must NOT be stale before trusting "vanished" is.
+    # "kept" must not be stale, or the check on "vanished" proves nothing.
     assert tags["kept"].is_stale is False
     assert tags["vanished"].is_stale is True
     assert cat.seal(seen={"kept"}) is False, "sealing again with nothing new to stale changes nothing"
@@ -168,9 +162,8 @@ def test_declare_ignores_the_id_a_driver_puts_on_a_tag():
 
 
 def test_a_restart_reuses_every_id_from_the_retained_record_and_the_guard_is_armed():
-    """A fresh process seeded from what the node holds must (a) hand every
-    source its previous id and (b) hash to the revision on record, so an
-    unchanged catalogue is NOT republished after a restart (one fat record, re-appended and re-replicated)."""
+    """A fresh process seeded from the node keeps every id and matches the
+    revision on record, so an unchanged catalogue is not republished."""
     first = Catalogue(connector="svc1")
     first.declare({"a": _tag("a", meta_key=1), "b": _tag("b", data_type="int")})
     first.declare({"a": _tag("a", meta_key=1)})  # b vanishes -> stale, carried forward

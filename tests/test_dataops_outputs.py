@@ -1,10 +1,7 @@
-"""Unit tests for chaski.dataops.outputs — catalogue-provisioned SignalOutput
-and broker-native AnnotationOutput (design §5, §8).
+"""Tests for chaski.dataops.outputs: SignalOutput and AnnotationOutput.
 
-No live colca: a fake ``Door`` stands in for the local door, same pattern
-as ``test_dataops_resolve.py``. ``Door.publish`` calls are recorded rather
-than sent anywhere. Outputs are used the way a producer uses them — declared
-on a class, read through an instance attached to a runtime.
+A fake ``Door`` records publishes. Outputs are declared on a class and used
+through an instance attached to a runtime, as a producer uses them.
 """
 
 from __future__ import annotations
@@ -39,12 +36,8 @@ def buffer(tmp_path):
 
 
 def _producer(name: str, runtime, **outs) -> Producer:
-    """A minimal producer with REAL class attributes (not instance
-    attributes) for each output — build_catalogue/bind_annotation_outputs
-    both discover outputs via ``dir(cls)`` + ``getattr(cls, attr_name)``,
-    exactly like ``validate_windows`` does for inputs, so a class attribute
-    is required for the discovery walk to see it at all. Not registered
-    (no system_element_name): these tests are about outputs, not discovery."""
+    """A minimal, unregistered producer with each output as a class attribute,
+    which is where build_catalogue and bind_annotation_outputs look."""
     cls = type(f"_TestProducer_{name}", (Producer,), {"name": name, **outs})
     return cls().attach(runtime)
 
@@ -135,14 +128,8 @@ def test_bound_output_publishes_metric_at_the_bound_position():
 
 
 def test_rebind_is_picked_up_on_the_next_resolution_pass():
-    """A held binding is refreshed by `forget`, on the service's own cadence.
-
-    Resolving on every publish is what this replaced: each call is a full KV
-    scan, colca serves /kv at five a second, and a node publishing ten
-    computed signals per machine asked for a scan per value — most of them
-    refused with 429. The thing that must never happen is an output writing to
-    a RETIRED signal indefinitely, and `forget` on each resolution pass is
-    what prevents that.
+    """A held binding is refreshed by `forget`, so an output does not keep
+    writing to a retired signal.
     """
     door = FakeDoor(
         [
@@ -168,13 +155,7 @@ def test_rebind_is_picked_up_on_the_next_resolution_pass():
 
 
 def test_an_unbound_output_keeps_looking():
-    """A MISS is never held: nothing tells this service it has been bound.
-
-    An output is commissioned by a separate act — `signal/autobind`, or an
-    editor — that dataops neither performs nor is notified of.
-    Holding "not bound yet" would idle the output until the next resolution
-    pass for no reason, and at startup that is every output at once.
-    """
+    """A miss is not held, because nothing tells the service when it is bound."""
     door = FakeDoor()  # no _Signal entries at all
     out = _bound_output(door)
 
@@ -219,20 +200,16 @@ def test_build_catalogue_mints_ids_and_publishes_when_none_retained():
 
 
 def test_build_catalogue_reuses_ids_and_skips_republish_across_a_simulated_restart():
-    """Content hash stable across restarts. Two INDEPENDENT builds (fresh
-    Door, fresh Producer/SignalOutput instances — simulating a process
-    restart with the SAME declared outputs) must mint the SAME tag id and
-    therefore the SAME catalogue content, so the second build's
-    Door.publish is never called."""
+    """Two independent builds with the same outputs, as after a restart, mint the
+    same tag id, so the second build publishes nothing."""
     door1 = FakeDoor()
     producer1 = _producer("press", FakeRuntime(door1, None), computed=SignalOutput("computed", "float"))
     result1 = _build(door1, producer1)
     assert len(door1.published) == 1
     published_topic, published_json = door1.published[0]
 
-    # Simulate a restart: a FRESH Door whose KV already carries what run 1
-    # published (the only durable memory a real colca deployment offers),
-    # and FRESH Producer/SignalOutput instances.
+    # A restart: a new Door whose KV holds what run 1 published, and new
+    # producer instances.
     door2 = FakeDoor([kv_entry(published_topic, json.loads(published_json))])
     producer2 = _producer("press", FakeRuntime(door2, None), computed=SignalOutput("computed", "float"))
     result2 = _build(door2, producer2)
@@ -323,11 +300,8 @@ def test_same_interval_republished_updates_in_place_not_duplicates(buffer):
 
 
 def test_id_and_topic_are_identical_across_a_simulated_restart(tmp_path):
-    """Not just two calls in a row: two INDEPENDENT AnnotationOutput
-    instances, independently bound (fresh Door, buffer re-opened from the
-    same file — the closest local analogue of a process restart), given
-    the same (type, source, time_start) must derive the identical id and
-    publish to the identical topic."""
+    """Two independently bound AnnotationOutputs, as after a restart, derive the
+    same id and topic for the same type, source and start."""
     db_path = tmp_path / "buffer.sqlite3"
 
     door1 = FakeDoor([_annotation_type_entry("downtime", "at-1")])
@@ -355,9 +329,7 @@ def test_id_and_topic_are_identical_across_a_simulated_restart(tmp_path):
 
 
 def test_clear_window_only_deletes_ids_this_output_itself_emitted(buffer):
-    """A producer cannot delete an annotation it never emitted: clear_window
-    reads exclusively from the buffer's own emitted-id record, keyed by
-    THIS output's source."""
+    """clear_window only deletes ids this output recorded emitting."""
     door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
     runtime = FakeRuntime(door, buffer)
 
@@ -408,12 +380,7 @@ def test_clear_window_outside_the_range_deletes_nothing(buffer):
 
 
 def test_a_refused_scan_idles_the_publish_instead_of_killing_the_tick():
-    """The door limits /kv scans and answers 429 — the node working, not
-    failing. An unbound output resolving through that limit must idle the
-    one value (same as unbound) rather than raise: the exception used to
-    abort the producer's whole tick mid-method, so one refused scan took
-    every later output down with it. A refusal that is NOT the limiter
-    still raises — a 500 is a broken door, not a busy one."""
+    """A 429 on the KV scan idles the value instead of raising; a 500 still raises."""
     import httpx
 
     class RefusingDoor(FakeDoor):

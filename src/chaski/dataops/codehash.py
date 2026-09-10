@@ -1,39 +1,20 @@
-"""Per-producer code hash for hash-triggered broker-window replay (design §10).
+"""Per-producer code hash for hash-triggered replay.
 
-The service computes one SHA-256 digest per registered producer, covering:
+The service computes one SHA-256 digest per producer, covering:
 
-1. the producer's own defining module source (the whole file, not just the
-   class body);
-2. the source of every module it transitively imports that is
-   PROJECT-LOCAL — a customer-mounted module, a shared calculation helper
-   under the same flat customer-modules namespace, or a shipped producer
-   base such as the ``dataops`` image's ``dataops.producers.machine_state``
-   — with every installed dependency (anything resolving under a
-   ``site-packages``/``dist-packages`` directory, or the standard library)
-   EXCLUDED. This SDK is an installed dependency in a deployment, so the
-   ``chaski.dataops`` framework itself is outside the hash: upgrading the
-   SDK does not replay every producer on every node, and a producer's
-   hash says "MY calculation changed", not "something underneath me did";
-3. a canonical (sorted-key JSON) dump of the current values of whatever
-   env vars the producer declares via ``Producer.config_keys``.
+1. the source of the producer's module;
+2. the source of every project-local module it imports, directly or not.
+   Installed packages and the standard library are excluded, chaski
+   included, so upgrading the SDK does not replay every producer;
+3. the current values of the environment variables in
+   ``Producer.config_keys``, as sorted-key JSON.
 
-Two failure modes this is written to avoid (both explicitly called out in
-the design):
+Missing a local module would hide a real calculation change; including an
+installed package, or hashing in unstable order, would replay on every restart.
 
-* Silently excluding an imported local module (e.g. a shared pure-calc
-  helper a customer producer imports) would mean a real calculation change
-  never triggers replay.
-* Accidentally including a site-packages dependency, or hashing a
-  dict/set in non-canonical order, would mean an UNCHANGED producer
-  computes a DIFFERENT hash on every restart — replaying the whole window
-  forever instead of exactly once per real change.
-
-The traversal is static and side-effect-free: it walks ``import``
-statements via :mod:`ast` and resolves each target against ``sys.modules``
-ONLY — it never triggers a new import. By the time this runs (service
-startup, after producer discovery), every module a registered producer can
-legitimately reference is already imported, so this is not a limitation in
-practice.
+The traversal walks ``import`` statements with :mod:`ast` and resolves them
+against ``sys.modules`` only, so it never imports anything. By the time it
+runs, every module a producer uses is already imported.
 """
 
 from __future__ import annotations
@@ -74,18 +55,11 @@ _STDLIB_ROOTS = _stdlib_roots()
 
 
 def _is_project_local(module: Any) -> bool:
-    """True iff ``module`` is code this deployment owns — never an
-    installed dependency (site-packages/dist-packages) and never the
-    standard library.
+    """True if ``module`` is code this deployment owns: not under
+    site-packages or dist-packages, and not the standard library.
 
-    This is deliberately NOT scoped to a fixed root like "the customer-
-    modules dir" — a shipped image's own producer modules
-    (``dataops.producers.*``, an editable install of that project) are
-    equally project-local, and live outside site-packages the same way a
-    customer-mounted ``.py`` file does (verified: an editable/local install
-    of a package resolves its ``__file__`` OUTSIDE site-packages, while
-    every PyPI/wheel dependency — including ``colca-data-contracts`` and
-    this SDK, once installed into a deployment — resolves INSIDE it).
+    Editable installs count as local because their files live outside
+    site-packages, like a mounted ``.py`` file does.
     """
     name = getattr(module, "__name__", None)
     if not name:
@@ -96,7 +70,7 @@ def _is_project_local(module: Any) -> bool:
 
     file = getattr(module, "__file__", None)
     if not file:
-        return False  # namespace/built-in/frozen module — nothing to hash
+        return False  # namespace, built-in or frozen module: nothing to hash
 
     path = Path(file).resolve()
     if "site-packages" in path.parts or "dist-packages" in path.parts:
@@ -111,10 +85,8 @@ def _is_project_local(module: Any) -> bool:
 
 
 def _read_source(module: Any) -> str | None:
-    """The module's CURRENT on-disk source, read fresh every call (never
-    via :mod:`linecache`, which caches by mtime/size and can serve stale
-    content) — the whole point of this module is to detect a source change
-    the moment it happens, including within a single test process."""
+    """The module's current source, read from disk on every call; linecache
+    could serve a stale copy."""
     file = getattr(module, "__file__", None)
     if not file:
         return None
@@ -146,11 +118,9 @@ def _resolve_from_base(module: Any, node: ast.ImportFrom) -> str:
 
 
 def _imported_module_names(tree: ast.AST, module: Any) -> set[str]:
-    """Every dotted name an ``import``/``from ... import ...`` statement in
-    ``tree`` could plausibly refer to. Over-approximates on purpose (e.g. a
-    ``from pkg import func`` also yields ``pkg.func`` as a candidate, which
-    is a name rather than a module) — harmless, since resolution below only
-    keeps candidates that are ACTUALLY present in ``sys.modules``."""
+    """Every dotted name an import statement in ``tree`` could refer to. It
+    over-approximates (``from pkg import func`` also yields ``pkg.func``);
+    only names present in ``sys.modules`` are kept later."""
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -166,10 +136,8 @@ def _imported_module_names(tree: ast.AST, module: Any) -> set[str]:
 
 
 def _transitive_project_local_modules(root_module: Any) -> dict[str, Any]:
-    """BFS from ``root_module`` over import statements, staying entirely
-    inside ``sys.modules`` (never imports anything new), collecting every
-    project-local module reached — ``root_module`` itself included when it
-    qualifies (it always does for a real producer module)."""
+    """Every project-local module reachable from ``root_module`` through
+    imports, ``root_module`` included, without importing anything new."""
     seen: dict[str, Any] = {}
     stack = [root_module]
     while stack:
@@ -205,9 +173,8 @@ def _transitive_project_local_modules(root_module: Any) -> dict[str, Any]:
 
 
 def _config_fingerprint(producer_cls: type) -> str:
-    """Canonical (sorted-key JSON) dump of the current values of every env
-    var ``producer_cls.config_keys`` names. Read as plain strings (no cast)
-    — the hash only needs to detect "this changed", not interpret it."""
+    """Sorted-key JSON of the current values of ``producer_cls.config_keys``,
+    read as plain strings."""
     keys = sorted(set(getattr(producer_cls, "config_keys", ()) or ()))
     values = {key: decouple_config(key, default="") for key in keys}
     return json.dumps(values, sort_keys=True)
@@ -226,11 +193,10 @@ def _update(hasher, text: str) -> None:
 
 
 def compute_code_hash(producer_cls: type) -> str:
-    """SHA-256 hex digest for one producer class (design §10).
+    """SHA-256 hex digest for one producer class.
 
-    Deterministic across processes given unchanged inputs: module names and
-    config keys are both sorted before hashing, so dict/set iteration order
-    can never perturb the result.
+    Module names and config keys are sorted first, so the digest is the same
+    in every process for unchanged inputs.
     """
     module = sys.modules.get(producer_cls.__module__)
     if module is None:

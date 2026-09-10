@@ -1,11 +1,10 @@
-"""Shared stand-ins for the ``chaski.dataops`` level-2 suites.
+"""Shared stand-ins for the ``chaski.dataops`` tests.
 
-No live colca anywhere in these suites: a :class:`FakeDoor` answers ``kv()``
-from a canned snapshot, records ``publish()`` calls, serves ``fetch``/``ack``
-from queued pages, and a :class:`FakeRuntime` is the
-:class:`chaski.dataops.Runtime` a producer under test is attached to — a
-real :class:`~chaski.dataops.Buffer` over a tmp SQLite file, the fake door,
-and an optional historian stand-in.
+A :class:`FakeDoor` answers ``kv()`` from a canned snapshot, records
+``publish()`` calls and serves ``fetch``/``ack`` from queued pages. A
+:class:`FakeRuntime` gives a producer the fake door, a real
+:class:`~chaski.dataops.Buffer` on a temporary SQLite file, and an optional
+historian stand-in.
 """
 
 from __future__ import annotations

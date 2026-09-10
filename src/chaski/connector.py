@@ -1,15 +1,11 @@
-"""``chaski.ConnectorService``: a :class:`chaski.Service` that polls a source
-(service families design §3.4).
+"""``chaski.ConnectorService``: a :class:`chaski.Service` that polls a source.
 
-A connector is a Service whose tags come from DISCOVERY rather than from
-``publish()`` calls, read on an interval from a source a protocol driver
-speaks to. Everything a connector does that is not protocol — advertising a
-catalogue, learning which of its tags the node bound to Signals, polling on
-a fixed cadence, rounding to the Signal's precision, publishing on change,
-keeping a liveness heartbeat and a source-connectivity flag, buffering
-through a broker outage, reconnecting to the source with backoff — is the
-same for OPC UA, Modbus, S7, Jetter and an HTTP status endpoint. That is
-this class, and this is where a connector for a new protocol starts.
+A connector's tags come from discovery rather than ``publish()`` calls.
+Everything that is not protocol-specific lives here: the catalogue, learning
+which tags are bound to Signals, polling on a fixed cadence, rounding to the
+Signal's precision, publishing on change, a heartbeat and a connectivity flag,
+buffering through a broker outage and reconnecting with backoff. A connector
+for a new protocol only writes a driver.
 
 The driver protocol is four ``async`` methods (:class:`Driver`):
 
@@ -33,12 +29,10 @@ one starts immediately. A poll cycle that could not publish (broker down)
 keeps its metrics — bounded at ``max_pending``, oldest dropped — and
 prepends them to the next cycle's batch.
 
-**What is NOT here.** Prometheus exposition: the loop reports its events to
-a :class:`Telemetry` (a no-op by default), where a process can plug in
-Prometheus gauges. Durability across a restart: the pending
-buffer is memory, by design — the answer for durability is ``chaski.Node``
-(design §3.4). Configuration from the environment: this is a library; the
-process that builds one reads its own environment.
+**Not included.** Metrics exposition: the loop reports to a
+:class:`Telemetry`, a no-op by default. Durability across restarts: the pending
+buffer is in memory; use ``chaski.Node`` for durability. Configuration from the
+environment: the process that builds a connector reads its own.
 """
 
 from __future__ import annotations
@@ -63,9 +57,8 @@ from franzmq.errors import PublishRejected, PublishTimeout
 
 from .service import Service
 
-# Synthetic tags have stable SOURCE keys like every protocol tag. Their ids
-# are ordinary catalogue-minted ULIDs, reused from the previous catalogue; a
-# source string is never smuggled into the identity field as a special case.
+# Synthetic tags have stable source keys; the catalogue mints and reuses their
+# ids like any other tag's.
 HEARTBEAT_TAG_SOURCE = "__heartbeat__"
 HEARTBEAT_TAG_NAME = "heartbeat"
 #: Every connector exposes a boolean reflecting its source's reachability:
@@ -81,13 +74,10 @@ DISCOVERY_RETRY_SECONDS = 15.0
 
 
 class SourceDisconnectedError(Exception):
-    """Raise from a driver's ``read`` (or ``connect``/``discover`` helpers)
-    when the source connection is lost. The loop flips the source-health
-    flag, publishes ``is_connected=False``, reconnects with backoff and, if
-    every retry fails, stays alive and tries again next poll — a source
-    that is genuinely offline is not a reason to crash-loop the container.
-    A driver that swallows connection errors locally leaves the flag stuck
-    at True and spams one log line per tag instead."""
+    """Raise from a driver's ``read`` (or ``connect``/``discover``) when the
+    source connection is lost. The loop publishes ``is_connected=False``,
+    reconnects with backoff, and keeps trying on later polls. Don't swallow
+    connection errors in the driver, or the flag stays True."""
 
 
 class MqttDisconnectedError(Exception):
@@ -132,12 +122,10 @@ class Driver:
     protocol: str = "unknown"
     #: Merged into the service's ``_ServiceDetails.metadata``.
     metadata: Mapping[str, Any] = MappingProxyType({})
-    #: Whether the catalogue can only be built while connected to the
-    #: source. True for browse-based protocols (OPC UA discovers nodes from
-    #: the server). False for file-mapped ones (S7, Modbus) whose tag list
-    #: comes from the driver's own config — those announce their catalogue
-    #: even while the source is unreachable, so the data model can be bound
-    #: before the machine is physically connected.
+    #: Whether the catalogue needs a connection to the source: True for
+    #: browse-based protocols such as OPC UA. Drivers with a configured tag list
+    #: (S7, Modbus) set False, so their tags can be bound before the machine is
+    #: connected.
     catalogue_requires_connection: bool = True
 
     def __init__(self, *, logger: logging.Logger | None = None) -> None:
@@ -166,10 +154,8 @@ class Driver:
 
 
 class Telemetry:
-    """Where the loop reports what it does. No-op by default; the shipped
-    connector image subclasses it with Prometheus instruments. Every method
-    is called from the poll loop or the MQTT network thread and must not
-    block."""
+    """Where the loop reports what it does; a no-op by default. Methods are
+    called from the poll loop or the MQTT network thread and must not block."""
 
     def broker_healthy(self, healthy: bool) -> None: ...
 
@@ -208,10 +194,8 @@ def round_to_precision(value: float, precision: int) -> float:
 
 
 def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandler]:
-    """``/is_healthy``: 200 while the broker is reachable, 503 while it is
-    not — so a connector silently buffering through an outage is visible
-    to ``docker compose ps`` and to whatever polls the endpoint, without a
-    second liveness signal beside the one paho already tracks."""
+    """``/is_healthy``: 200 while the broker is reachable, 503 while it is not,
+    so a connector buffering through an outage shows up as unhealthy."""
 
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -242,14 +226,10 @@ def start_health_server(port: int, is_healthy: Callable[[], bool]) -> HTTPServer
 
 
 def run(build: Callable[[], ConnectorService], *, health_port: int | None = 8888) -> None:
-    """Build a connector INSIDE a running event loop and serve it until
-    stopped, with the ``/is_healthy`` endpoint on ``health_port`` (None: no
-    endpoint). A factory rather than an instance because some protocol
-    clients need the loop at construction — pymodbus's
-    ``AsyncModbusTcpClient`` binds ``asyncio.get_running_loop()`` in its
-    ``__init__`` — so a driver built before ``asyncio.run`` would never
-    connect. ``ConnectorService.run()`` is this, for a service built where a
-    loop already exists or whose driver does not care."""
+    """Build a connector inside a running event loop and serve it until
+    stopped, with ``/is_healthy`` on ``health_port`` (None: no endpoint).
+    It takes a factory because some protocol clients, such as pymodbus's
+    ``AsyncModbusTcpClient``, need the running loop at construction."""
 
     async def main() -> None:
         svc = build()
@@ -374,10 +354,9 @@ class ConnectorService(Service):
             await self._teardown()
 
     async def _startup_discovery(self) -> None:
-        """Connect the source and discover once. Neither failure aborts
-        startup: the loop keeps retrying, and meanwhile the connector is
-        registered and its synthetic tags are advertised — so a customer
-        can tell "connector down" from "source down"."""
+        """Connect the source and discover once. A failure does not abort
+        startup: the connector registers and advertises its synthetic tags, so
+        "connector down" and "source down" look different, and the loop retries."""
         source_connected = False
         try:
             await self.driver.connect()
@@ -400,9 +379,8 @@ class ConnectorService(Service):
         self._declare_discovery(discovery)
 
     async def _retry_discovery(self) -> None:
-        """The startup promise kept: the RETRY is a full connect + discover.
-        Reconnecting alone would leave every bound tag without a handle
-        forever, silently polling nothing but the synthetic tags."""
+        """Retry a failed startup with a full connect and discover; a reconnect
+        alone would leave bound tags without read handles."""
         self._next_discovery_retry = self._now() + DISCOVERY_RETRY_SECONDS
         try:
             try:
@@ -533,10 +511,8 @@ class ConnectorService(Service):
                 for target in heartbeat_targets:
                     raw_batch.append((target.topic, heartbeat, target.signal))
 
-            # is_connected is published on change from _set_source_healthy;
-            # this covers the initial publish once a Signal is bound and
-            # self-heals a publish deferred by a broker outage. No-op when
-            # unchanged.
+            # Covers the first publish once a Signal is bound and one deferred by
+            # a broker outage; a no-op when nothing changed.
             self._publish_is_connected()
 
             batch: list[tuple[Topic, Metric]] = []
@@ -592,11 +568,9 @@ class ConnectorService(Service):
             await self._sleep(0.001)
 
     async def _reconnect_source(self) -> None:
-        """Reconnect the source, ``reconnect_retries`` times with a jittered
-        backoff. Exhausting them leaves source_healthy=0 and returns: the
-        next poll raises SourceDisconnectedError again and re-enters here,
-        so reconnecting continues indefinitely instead of crash-looping the
-        container while the source is genuinely offline."""
+        """Reconnect the source up to ``reconnect_retries`` times with jittered
+        backoff. If all fail it returns unhealthy, and the next poll comes back
+        here, so reconnecting never stops."""
         for retry in range(self.reconnect_retries):
             try:
                 self._log.info("Reconnecting to source (attempt %d/%d)", retry + 1, self.reconnect_retries)
@@ -676,10 +650,8 @@ class ConnectorService(Service):
         return (int(elapsed // self.heartbeat_interval) % 2) == 0
 
     def _set_source_healthy(self, state: bool) -> None:
-        """The one writer of the source-health flag: telemetry and the
-        in-process mirror never drift, and a change is surfaced at once
-        through :meth:`_publish_is_connected` — the per-cycle dedup cannot
-        be relied on for a transition while the broker session stays up."""
+        """The only writer of the source-health flag. A change is published at
+        once through :meth:`_publish_is_connected`."""
         self.telemetry.source_healthy(state)
         self._source_healthy = state
         self._publish_is_connected()
@@ -727,12 +699,10 @@ class ConnectorService(Service):
         self._pending = pending
 
     def _publish_batch(self, batch: list[tuple[Topic, Metric]]) -> None:
-        """Publish one cycle's metrics, the previous cycle's pending ones
-        first. Checks ``is_connected()`` before anything: paho queues a
-        QoS>=1 publish while disconnected instead of raising, and franzmq
-        would only notice via PublishTimeout after the full timeout, one
-        metric at a time — so a broker outage is failed closed here,
-        immediately, into the loop's reconnect path."""
+        """Publish one cycle's metrics, pending ones from earlier cycles first.
+        Checks ``is_connected()`` first: paho queues a QoS 1 publish while
+        disconnected instead of raising, and waiting out each timeout would
+        stall the loop."""
         if self._pending:
             batch = self._pending + batch
             self._pending = []
@@ -751,15 +721,13 @@ class ConnectorService(Service):
                 self._summary_published += 1
                 self.telemetry.published(metric, node_id=self._node_id or "")
             except PublishRejected as exc:
-                # The broker judged the record and said no. Retrying would
-                # fail identically, so it is dropped — never silently: the
-                # reason names what to fix (contract, schema, grant).
+                # Refused by the broker: retrying would fail the same way, so the
+                # record is dropped and the reason reported.
                 self.telemetry.publish_rejected(exc.reason_code)
                 self._log.error("[PUBLISH] %s", exc)
             except (ConnectionError, MqttDisconnectedError, PublishTimeout) as exc:
-                # PublishTimeout means paho queued it without delivering: the
-                # broker is gone, not slow — a disconnect, not a per-metric
-                # failure.
+                # A timeout means paho queued the publish undelivered: the broker
+                # is gone, so treat it as a disconnect.
                 self._buffer_pending(batch[index:])
                 raise MqttDisconnectedError(str(exc)) from exc
             except Exception as exc:
@@ -768,12 +736,8 @@ class ConnectorService(Service):
     # -- outage reporting -------------------------------------------------
 
     def _report_mqtt_outage(self, error: Exception) -> None:
-        """Say the broker is unreachable once, then rarely, not once per
-        poll. An outage is a STATE: it begins, it ends, and while it lasts
-        the only news is that it still lasts — the shape colca's
-        ``linkstate.go`` uses for a replication lane. Logging it per poll
-        wrote 698 identical ERROR records into the tree during one
-        deployment's startup window."""
+        """Log a broker outage when it starts and then only every
+        ``outage_reminder`` seconds, not on every poll."""
         now = self._now()
         if self._mqtt_down_since is None:
             self._mqtt_down_since = now

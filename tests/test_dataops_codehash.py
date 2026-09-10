@@ -1,12 +1,9 @@
-"""Unit tests for dataops.codehash — per-producer code hash (design §10).
+"""Tests for chaski.dataops.codehash.
 
-Real ``.py`` files under ``tmp_path`` stand in for a producer module and an
-imported local calculation helper, imported for real via ``importlib`` so
-the static import-walk sees genuine ``sys.modules`` entries — the same
-shape a customer-mounted producer + a shared calc module take in
-production. Mutations rewrite the file on disk and recompute: codehash
-reads source fresh off disk every call (never via ``linecache``), so no
-reload gymnastics are needed to observe a change.
+Real ``.py`` files under ``tmp_path`` play a producer module and a local helper
+it imports, imported with ``importlib`` so they are genuine ``sys.modules``
+entries. Tests rewrite the files and hash again; codehash reads the source from
+disk on every call.
 """
 
 from __future__ import annotations
@@ -63,7 +60,7 @@ def test_hash_is_stable_across_repeated_calls_with_unchanged_source(tmp_path):
     assert codehash.compute_code_hash(cls) == codehash.compute_code_hash(cls)
 
 
-# ─── changes that MUST change the hash ──────────────────────────────────────
+# ─── changes that must change the hash ──────────────────────────────────────
 
 
 def test_hash_changes_when_the_producers_own_module_source_changes(tmp_path):
@@ -126,13 +123,9 @@ def test_hash_unaffected_by_config_value_when_producer_declares_no_config_keys(t
 
 
 def test_a_site_packages_dependency_is_excluded_from_the_project_local_set(tmp_path):
-    """The second named trap, one direction: hashing an installed
-    dependency's source would make every restart replay everything, since a
-    dependency's own version can change independently of the producer. This
-    asserts the traversal set directly — comparing two producer FILES that
-    differ by one import line would also change each file's OWN source text
-    and therefore prove nothing about whether the imported module's source
-    was (also, wrongly) folded in."""
+    """An installed dependency is not part of the hash. The traversal set is
+    checked directly, because changing an import line would change the
+    producer's own source too."""
     _write(tmp_path, "prod_dep_yes", "import decouple\n")
     module = _import(tmp_path, "prod_dep_yes")
 
@@ -154,11 +147,7 @@ def test_a_stdlib_module_is_excluded_from_the_project_local_set(tmp_path):
 
 
 def test_hash_is_independent_of_module_traversal_order(tmp_path, monkeypatch):
-    """The third named trap: a dict/set-ordering artifact would make an
-    unchanged producer hash differently across restarts. Mutation-checked:
-    if `compute_code_hash` ever stopped sorting module names before
-    hashing, feeding it the SAME module set in reverse order would produce
-    a DIFFERENT digest than feeding it forward order."""
+    """The same modules in a different order give the same digest."""
     _write(tmp_path, "prod_order_helper", "H = 1\n")
     _write(tmp_path, "prod_order", "import prod_order_helper\n")
     module = _import(tmp_path, "prod_order")

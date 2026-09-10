@@ -1,10 +1,8 @@
-"""Unit tests for dataops.resolve — KV-based identity resolution.
+"""Tests for chaski.dataops.resolve.
 
-No live colca: a fake ``Door`` returns a canned KV snapshot. Pins the
-resolution rules the design (§4.2, §8) actually depends on: name(+element)
-matching, tombstones never matching, and — the one this whole rewrite
-exists to fix — a signal that moves or rebinds resolving to its NEW ULID
-on the very next call.
+A fake ``Door`` returns a canned KV snapshot. Covered: matching by name and
+element, tombstones never matching, and a moved or rebound signal resolving to
+its new ULID on the next call.
 """
 
 from __future__ import annotations
@@ -124,8 +122,7 @@ def test_a_rebind_is_reflected_on_the_very_next_call():
         ]
     )
 
-    # Denominator: prove resolution actually finds the OLD id first —
-    # a staleness claim is only meaningful next to this.
+    # First confirm the old id resolves.
     assert resolve.resolve_signal(door, "heartbeat") == "sig-old"
 
     door.entries = [
@@ -138,13 +135,7 @@ def test_a_rebind_is_reflected_on_the_very_next_call():
 
 
 def test_one_pass_over_many_inputs_costs_one_scan():
-    """The defect this replaced, stated as a number.
-
-    Thirty declared inputs meant sixty `/kv` scans per resolution pass —
-    `resolve_signal` asks once for the element and once for the signal —
-    against a door that allows five a second. colca refused them, and every
-    refusal surfaced as a producer input excluded from dispatch.
-    """
+    """Resolving many inputs inside one pass reads KV once."""
     entries = [_entry("colca/v1/_SystemElement/n-1/line1", {"id": "el-1", "name": "line1"})]
     for index in range(30):
         entries.append(
@@ -163,13 +154,8 @@ def test_one_pass_over_many_inputs_costs_one_scan():
 
 
 def test_a_pass_that_cannot_read_is_not_fatal():
-    """Sparing the door must not become a new way to lose the service.
-
-    The read moved from inside the per-input `try` to the moment the pass
-    opens, so one refused scan stopped being a logged, skipped input and
-    started being an exception out of `_replay_changed_producers` — which
-    crash-looped dataops on the demo. The pass now declines to pin and every
-    resolver reads on its own, failing exactly where it failed before.
+    """A failed read does not raise: the pass does not pin, and each resolver
+    reads on its own.
     """
 
     class RefusingDoor(FakeDoor):
@@ -185,9 +171,8 @@ def test_a_pass_that_cannot_read_is_not_fatal():
 
 
 def test_a_nested_pass_reuses_the_outer_read():
-    # `_replay_changed_producers` opens a pass over every producer, and
-    # `_build_dispatch` opens one per producer inside it. Without reuse that
-    # is one scan per producer, which is the burst this exists to avoid.
+    # Replay opens a pass over all producers and dispatch one per producer
+    # inside it; the inner passes must reuse the outer read.
     door = FakeDoor([_entry("colca/v1/_Signal/n-1/l/s", {"id": "sig-1", "name": "s"})])
 
     with resolve.one_pass(door):
@@ -199,12 +184,7 @@ def test_a_nested_pass_reuses_the_outer_read():
 
 
 def test_the_pin_does_not_outlive_its_pass():
-    """A snapshot that survives its pass is a different thing, and it broke.
-
-    The level-4 dataops contract failed on exactly that while every unit test
-    passed: the resolvers were correct, the LIFETIME was not. So a lookup made
-    after the block must read KV again and see what changed during it.
-    """
+    """After the block, a lookup reads KV again and sees what changed."""
     door = FakeDoor([_entry("colca/v1/_Signal/n-1/l/s", {"id": "sig-old", "name": "s"})])
 
     with resolve.one_pass(door):

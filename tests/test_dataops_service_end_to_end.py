@@ -1,14 +1,10 @@
-"""Level-2 pin for ``chaski.DataOpsService`` as a whole (service families
-design §3.5): a minimal user-defined service with one
-``@on_metric`` producer, fed by a fake door, publishes one computed value —
-and it is a :class:`chaski.Service` to the node, not a kind of its own (§3.1).
+"""``chaski.DataOpsService`` end to end: a service with one ``@on_metric``
+producer, fed by a fake door, publishes one computed value and registers at
+the node like any :class:`chaski.Service`.
 
-Hermetic: the MQTT side is the same fake client and monkeypatched connection
-functions ``test_service_lifecycle.py`` uses (plus the two paho attributes
-the doorbell touches); the HTTP side is a fake door installed in place of
-``chaski.service.Door`` that also plays the node's part in the commissioning
-act — when the service publishes its ``_DataTags`` catalogue, the fake
-authors the bound ``_Signal`` the way ``signal/autobind`` would.
+The MQTT side is the fake client from ``test_service_lifecycle.py``. The HTTP
+side is a fake door that also plays the node: when the service publishes its
+``_DataTags`` catalogue, it writes the bound ``_Signal`` as autobind would.
 """
 
 from __future__ import annotations
@@ -261,11 +257,8 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
 
 
 def test_a_dataops_service_registers_byte_identical_to_a_bare_service(tmp_path: Path, monkeypatch):
-    """The mechanical half of §3.1: a family is SDK ergonomics, never a
-    node-side kind. For the same inputs a DataOpsService and a bare Service
-    publish the same `_ServiceDetails`, byte for byte — including when the
-    deployment declares container health metrics, which is an input, not a
-    family trait."""
+    """For the same inputs a DataOpsService and a plain Service publish the same
+    `_ServiceDetails`, byte for byte, container health metrics included."""
     metrics = container_resource_health_metrics()
 
     bare_client = _FakeClient()

@@ -1,67 +1,41 @@
-"""``chaski.Service``: the shared connector-protocol publisher .
+"""``chaski.Service``: publish data to a Colca node.
 
-ONE constructor, not two classmethods: ``Service(name, mount="", *,
-node=None, ...)``. ``node`` says who this service is to Colca —
-architecture principle 1's one-clause test, applied to the client side:
+One constructor, ``Service(name, mount="", *, node=None, ...)``, where
+``node`` says who the service is to Colca:
 
-* ``node=None`` (the default) — inside a deployment: the local door
-  (``colca:80``/``colca:1883``, compose DNS), no credential, self-registered
-  by name+mount.
-* ``node="https://..."`` — outside a deployment: the published door
-  (8883/443), a registry-pinned ed25519 identity this Service loads or
-  mints under its own state directory.
-* ``node=LocalDoor(...)`` — an embedded node's own local door. An integrator
-  never constructs this; it is what ``chaski.Node.service()`` passes.
+* ``node=None`` (the default): inside a deployment, on the local door
+  (``colca:80``/``colca:1883``), without a credential, registered by name and
+  mount.
+* ``node="https://..."``: outside a deployment, on the published door, with an
+  ed25519 identity the service loads or mints under its state directory.
+* ``node=LocalDoor(...)``: an embedded node's local door, passed by
+  ``chaski.Node.service()``.
 
-Whichever door, ``publish(path, value, unit=, timestamp=)`` is the same
-implementation: every distinct path becomes a ``DataTag`` (see
-``catalogue.py``), the catalogue is republished when it changes
-(content-hash guarded), and each publish resolves the Signal the node
-minted for that tag — learned from the service's own ``_Signal``
-subscription — before writing ``_Metric`` with ``signal_id``. A path with no
-Signal yet is buffered (bounded) and flushed the moment one binds.
+``publish(path, value, unit=, timestamp=)`` works the same on every door.
+Each path becomes a ``DataTag`` (see ``catalogue.py``), the catalogue is
+republished when it changes, and each sample is written as a ``_Metric`` for
+the Signal the node bound to its tag. Samples for a path without a Signal are
+buffered, up to a limit, and flushed when one binds.
 
-Construction never connects — it stores configuration and, outside a
-deployment, loads-or-mints the identity. ``start()`` (or the context
-manager) is what opens the door; see the design's lifecycle table for what
-happens at each stage. ``start()`` also reads the catalogue this service
-published LAST time back from the node's KV before it subscribes to its
-``_Signal`` records: those records name the ids of the previous run, so the
-catalogue has to know them before the first one arrives, and the republish
-guard is armed from the revision already on record.
+Construction does not connect; ``start()`` or the context manager does.
+``start()`` reads the previously published catalogue from the node before
+subscribing to the service's ``_Signal`` records, because those records name
+the previous run's tag ids.
 
-**Placement follows the registry, live.** A re-placement (an operator moves
-the service's entry) kicks the MQTT session; on the reconnect the service
-re-resolves its identity, re-subscribes at its current mount, and
-republishes its ``_ServiceDetails`` and catalogue there — a rename or a
-reparent needs no redeploy (local-service-trust design §3.2, §6.1).
+**Placement follows the registry.** Moving the service's entry reconnects its
+MQTT session; the service then re-resolves its position, re-subscribes, and
+republishes ``_ServiceDetails`` and its catalogue there, without a redeploy.
 
-``ConnectorService`` (``chaski.connector``) is this class plus a poll loop:
-a driver discovers tags into the same catalogue and reads them on an
-interval; bindings, publishing, registration and the consume lane are all
-this class. It re-implements nothing here.
+``ConnectorService`` (``chaski.connector``) adds a poll loop to this class.
 
-**The consume lane** (service families design §3.3). A
-started Service also reads: ``kv(prefix, contract=)`` is a bounded snapshot
-of the node's retained state, and ``stream(name)`` a named, durable cursor
-over one of its streams — ``metrics``, ``annotations``, ``alarms``, ... —
-with the same fetch → process → ack contract the shipped dataops service
-follows (``chaski.door.Stream``). Both speak the same door ``publish()``
-registers at, with the same identity: ``X-Colca-Service`` on the local door,
-the pinned client certificate on the published one.
+**Reading.** A started service can also read: ``kv(prefix, contract=)``
+returns a snapshot of the node's retained state, and ``stream(name)`` a
+durable cursor over one of its streams (``chaski.door.Stream``), both with the
+service's own identity.
 
-**A bridge is a Service whose protocol is HTTP** (design §3.6). There is
-no ``BridgeService`` class, deliberately. A bridge to an ERP/MES has two
-lanes and neither is bridge-shaped: its *reference* lane polls the foreign
-system and ``publish()``-es what it learns — a connector whose protocol
-happens to be HTTP — and its *writeback* lane follows a stream with
-``stream()`` and makes idempotent foreign writes. "Never commands machines"
-is not a base class either: an external identity holds the ``write:``
-grants its enrollment gave it and no ``cmd:`` — position is authority
-(architecture principle 6). What a bridge genuinely owns — the foreign
-system's client and its idempotency keys — is shaped by that system, so
-start from a plain ``Service`` rather than a class that would wrap a
-dictionary.
+**Bridges.** A bridge to an ERP or MES is a plain ``Service``: it polls the
+foreign system and ``publish()``-es what it learns, and follows a stream with
+``stream()`` to write back. What it may do comes from its enrollment grants.
 """
 
 from __future__ import annotations
@@ -122,14 +96,9 @@ class Binding(NamedTuple):
     signal: SignalRecord
 
 
-# How long a not-yet-bound path may keep buffering before its "still
-# unbound" line repeats — mirrors colca's own 5-minute reminder shape
-# (unbound.go on the node side of this same gap).
+# How often the "still unbound" line repeats for a buffering path.
 _UNBOUND_LOG_INTERVAL = 300.0
-# A not-yet-bound path buffers at most this many samples; the newest ones
-# survive (a bounded deque with maxlen drops the oldest on overflow) — the
-# same "bounded memory over unbounded backlog" rule every publisher in this
-# codebase follows ("Every service publishes its log").
+# A path without a Signal buffers at most this many samples, dropping the oldest.
 _MAX_BUFFERED_PER_PATH = 100
 _DEFAULT_EXTERNAL_MQTT_PORT = 8883
 _DEFAULT_EXTERNAL_API_PORT = 443
@@ -149,12 +118,9 @@ class NotEnrolled(RuntimeError):
 
 @dataclass(frozen=True)
 class LocalDoor:
-    """A node's local door (SDK design §3.1): host, HTTP port, MQTT port. An
-    integrator never constructs this directly — pass a ``node=`` URL string
-    outside a deployment, or leave ``node`` unset inside one (the compose
-    defaults below). ``chaski.Node.service()`` builds one for an embedded
-    node, and a containerised connector can build one from its own
-    environment."""
+    """A node's local door: host, HTTP port, MQTT port. ``chaski.Node.service()``
+    builds one for an embedded node, and a containerised connector can build one
+    from its environment; otherwise pass a URL or leave ``node`` unset."""
 
     host: str = "colca"
     http_port: int = _DEFAULT_LOCAL_HTTP_PORT
@@ -162,11 +128,8 @@ class LocalDoor:
 
 
 def _epoch(ts: Any) -> float:
-    """Accept a datetime, a float/int epoch, or None (-> now). The wire
-    contract's timestamp is a number — a datetime would encode as an ISO
-    string, which the door refuses. ``chaski.dataops.outputs`` applies the
-    same rule to a producer's output (it cannot import this one without
-    pulling the MQTT publisher into a module that never uses it)."""
+    """Accept a datetime, an epoch number, or None (now) and return epoch
+    seconds; the wire contract wants a number, not an ISO string."""
     if ts is None:
         return time.time()
     if hasattr(ts, "timestamp") and not isinstance(ts, (int, float)):
@@ -181,10 +144,8 @@ def _default_state_dir(name: str) -> Path:
 
 
 def _insecure_ssl_context() -> ssl.SSLContext:
-    """No CA anywhere in this door (identity/authz §"Node doors"): trust is
-    the registry-pinned key presented as a client certificate, never a chain
-    — the same InsecureSkipVerify shape colca-machine (the Go reference
-    client) uses when it dials this exact door."""
+    """TLS for the published door. There is no CA: trust is the pinned key
+    presented as a client certificate, so the chain is not checked."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -192,20 +153,13 @@ def _insecure_ssl_context() -> ssl.SSLContext:
 
 
 def _pending_reason(path: str, mount: str, connector_id: str, *, connected: bool) -> str:
-    """The reason a buffered path has no bound Signal yet — pure and testable
-    without a broker (level 2). Three cases, each independently observable
-    from state the SDK already holds:
+    """Why a buffered path has no bound Signal yet:
 
-    * "not enrolled" — outside a deployment, this identity has never
-      completed a CONNECT, so nothing at the node can have happened yet.
-    * "element not yet authored" — the path names a parent (``element_for``
-      is non-empty), so binding first needs the node to author that element
-      (``bindCatalogue``/``authorElementAt``) — a step a mount-level path
-      (already sitting on an element the enrollment/registration authored)
-      does not need.
-    * "awaiting binding" — the tag is on an element the node already has;
-      it is only waiting for `signal/autobind` (or the node's own
-      autobind-on-catalogue-growth trigger) to mint the Signal.
+    * "not enrolled": outside a deployment, this identity has never connected.
+    * "element not yet authored": the path names a parent element the node
+      has to create first.
+    * "awaiting binding": the element exists and the tag waits for
+      `signal/autobind` or the node's autobind.
     """
     if not connected:
         return "not enrolled"
@@ -220,13 +174,9 @@ def _pending_reason(path: str, mount: str, connector_id: str, *, connected: bool
 
 
 def _mint_identity(identity_dir: Path) -> tuple[str, str, Path, Path]:
-    """Load this Service's own external identity from ``identity_dir``,
-    minting one on first use (idempotent — a second call against the same
-    directory returns the identical ulid/pubkey). Mirrors
-    ``colca-keygen -cert``: an ed25519 key (PEM PKCS8) plus a self-signed
-    certificate wrapping it (cert = key container, trust = registry pinning
-    — no CA anywhere at this door). Both files, and the minted ulid, are
-    written 0600 — private material, host-local only."""
+    """Load this service's external identity from ``identity_dir``, minting it
+    on first use. Like ``colca-keygen -cert``: an ed25519 key (PEM PKCS8) and a
+    self-signed certificate around it. The files and the ulid are written 0600."""
     identity_dir.mkdir(parents=True, exist_ok=True)
     ulid_path = identity_dir / "ulid"
     key_path = identity_dir / "identity.key"
@@ -378,16 +328,12 @@ class Service:
         it. ``architecture_metadata`` is merged under the live
         ``status``/``detail`` :meth:`status` writes.
 
-        ``health_metrics`` declares which Prometheus-scraped metrics describe
-        this service's health in the Edit (``_ServiceDetails.
-        health_metrics``) — a fact about where the service RUNS, not about
-        what kind of service it is: a containerised deployment passes
-        ``colca_data_contracts.container_resource_health_metrics()``, a
-        host process nothing.
+        ``health_metrics`` names the Prometheus metrics that describe this
+        service's health (``_ServiceDetails.health_metrics``); a container
+        passes ``colca_data_contracts.container_resource_health_metrics()``.
 
-        Construction never touches the network except to load or mint an
-        external identity's own key material on disk — it does not dial the
-        node. See :meth:`start`.
+        Construction does not dial the node; it only loads or mints an external
+        identity on disk. See :meth:`start`.
         """
         self.name = name
         self._max_queued_messages = max_queued_messages
@@ -403,39 +349,23 @@ class Service:
         self._mqtt_port_override = mqtt_port
         self._api_port_override = api_port
 
-        # _publish_outside_the_lock — the one threading rule this class has.
-        #
-        # This lock guards the catalogue, the bindings and the buffer, and it
-        # is taken by TWO threads: the caller's, and the MQTT network thread
-        # that runs `_on_signal`. A qos=1 publish waits for its PUBACK, and the
-        # PUBACK is read by that same network thread — so holding this lock
-        # across a waiting publish deadlocks the pair: the caller waits for a
-        # PUBACK the network thread cannot deliver because it is blocked on
-        # the lock the caller holds. It costs the full publish_timeout and
-        # then surfaces as `PublishTimeout` on an unrelated topic, which is
-        # what made it look like a broker fault rather than our own.
-        #
-        # So: decide under the lock, publish outside it. Every waiting publish
-        # in this class (catalogue, ServiceDetails, metric, tombstones) is
-        # reached with the lock released, and the helpers that do the
-        # publishing say so in their own docstrings.
+        # _publish_outside_the_lock: this lock guards the catalogue, bindings
+        # and buffer, and the MQTT network thread takes it too. A QoS 1 publish
+        # waits for a PUBACK only that thread can read, so decide under the
+        # lock and publish after releasing it.
         self._lock = threading.RLock()
         self._client: Client | None = None
-        # The door's HTTP client — the consume lane (kv/stream). Opened by
-        # start() beside the MQTT client, on the same door with the same
-        # identity, so a read is never made under a name the node has not
-        # yet registered at its mount.
+        # HTTP client for kv() and stream(), opened by start() on the same door
+        # and identity as the MQTT client.
         self._http: Door | None = None
         self._connected = False
         self._closed = False
         self._node_id: str | None = None
         self._service_id: str | None = None
         self._system_element_id: str | None = None
-        # Where the node currently has this service: the resolved mount and
-        # the hierarchy (mount + name) its own records live under. Local
-        # services learn it from /self and re-learn it on every reconnect;
-        # an external one is placed by its enrollment and keeps the mount
-        # it was constructed with.
+        # Where the node has this service: the mount, and the hierarchy (mount
+        # and name) its records live under. Local services read it from /self
+        # on every connect; external ones keep the constructor's mount.
         self._resolved_mount: str = mount
         self._hierarchy: tuple[str, ...] = ()
         self._catalogue: Catalogue | None = None
@@ -540,9 +470,7 @@ class Service:
         self._service_id = ulid
         self._apply_placement(self._mount, service_context(self._mount, ulid), None)
         self._catalogue = Catalogue(connector=ulid, mount=self._mount)
-        # The published API door authenticates the same pinned key the MQTT
-        # door does, presented as a client certificate ("Node
-        # doors": API 443, credential "cert").
+        # The API door checks the same pinned key, as a client certificate.
         self._http = Door(base, service=ulid, cert=(self._cert_path, self._key_path))
 
         will_payload = self._build_service_details(is_active=False, status="unhealthy")
@@ -566,11 +494,9 @@ class Service:
         self._after_connect()
 
     def _apply_placement(self, mount: str, hierarchy: tuple[str, ...], element_id: str | None) -> None:
-        """Take the node's current answer for where this service sits: the
-        topics its own records live at, and the ``_Signal`` filter narrowed
-        to its own read scope (at or below its bound element — a fully
-        wildcarded filter is not authorized under local-service-trust, auth
-        §5.3)."""
+        """Apply where the node says this service sits: the topics of its own
+        records, and a ``_Signal`` filter at or below its element (a full
+        wildcard would not be authorized)."""
         self._resolved_mount = mount
         self._hierarchy = tuple(hierarchy)
         self._system_element_id = element_id
@@ -600,13 +526,10 @@ class Service:
         self._connected = True
 
     def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any = None) -> None:
-        """paho's CONNACK callback, on its network thread. The first one
-        releases :meth:`start`, which finishes the setup on the caller's
-        thread (:meth:`_after_connect`). Every later one is a RECONNECT —
-        and a re-placement kicks the live session, so a reconnect is exactly
-        when placement may have moved: re-resolve it and re-announce
-        (:meth:`_reannounce`). Nothing here may wait for a PUBACK: this is
-        the thread that would read it."""
+        """paho's CONNACK callback, on its network thread. The first one lets
+        :meth:`start` finish on the caller's thread (:meth:`_after_connect`);
+        later ones are reconnects, possibly after a re-placement, and
+        re-announce (:meth:`_reannounce`). Nothing here may wait for a PUBACK."""
         if not self._connected_event.is_set():
             self._connect_outcome = reason_code
             self._connected_event.set()
@@ -627,11 +550,9 @@ class Service:
         """Hook: the broker link came up (True) or went down (False)."""
 
     def _reannounce(self, client: Any) -> None:
-        """On a reconnect (network thread): follow the registry's CURRENT
-        placement — re-subscribe at it, republish ``_ServiceDetails`` there,
-        and, if the position moved, forget the catalogue's last published
-        revision so it republishes at the new topic. Publishes here go out
-        without waiting (franzmq detects the network thread itself)."""
+        """On a reconnect, on the network thread: re-subscribe at the current
+        placement, republish ``_ServiceDetails``, and if the position moved,
+        republish the catalogue at the new topic. Publishes here do not wait."""
         old_filter = self._signal_filter
         old_topic = str(self._catalogue_topic)
         if not self._external:
@@ -661,12 +582,10 @@ class Service:
         """Hook: a reconnect re-announced this service (catalogue may be due)."""
 
     def _previous_catalogue(self) -> dict[str, Any] | None:
-        """The retained ``_DataTags`` record this service published last time,
-        read back from the node's KV under its own path — the memory that
-        lets tag ids survive a restart with no local state (design §6).
-        ``None`` when this service has never published one at this topic.
-        A transport failure is raised, never read as "no previous
-        catalogue": that would mint fresh ids and orphan every binding."""
+        """The ``_DataTags`` record this service published last time, from the
+        node's KV, or ``None`` if there is none. A transport failure raises
+        rather than returning ``None``, which would mint new ids and orphan
+        every binding."""
         prefix = "/".join(self._hierarchy)
         wanted = str(self._catalogue_topic)
         for entry in self._require_http("kv").kv(prefix, contract="_DataTags"):
@@ -720,10 +639,9 @@ class Service:
         return self._node_url, self.ulid
 
     def _after_connect(self) -> None:
-        # The previous catalogue BEFORE the subscription: the retained
-        # _Signal records that arrive on SUBSCRIBE name the ids of the last
-        # run, and a binding for an id the catalogue does not know is
-        # dropped as someone else's (see _on_signal).
+        # Load the previous catalogue before subscribing: retained _Signal
+        # records name the last run's ids, and bindings for unknown ids are
+        # dropped (see _on_signal).
         with self._lock:
             self._started_catalogue.load_previous(self._previous_catalogue())
         self._started_client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
@@ -865,12 +783,9 @@ class Service:
 
     @property
     def cursor_prefix(self) -> str:
-        """The cursor namespace this identity owns at the door — what
-        :meth:`stream` prepends to a cursor name. ``c/{name}/`` for a local
-        service, ``{ulid}/`` for an external one: the node's own rule
-        (``plugins/uns`` ``Entry.CursorPrefix``), restated here only so a
-        caller never has to know it — a cursor outside this prefix is
-        refused by the door."""
+        """The cursor namespace this identity owns, which :meth:`stream`
+        prepends: ``c/{name}/`` for a local service, ``{ulid}/`` for an external
+        one. The door refuses cursors outside it."""
         if self._external:
             return f"{self.ulid}/"
         return f"c/{self.name}/"
@@ -901,15 +816,12 @@ class Service:
         (``metrics``, ``annotations``, ``alarms``, ...) — see
         :class:`chaski.door.Stream` for the fetch → process → ack contract.
 
-        ``cursor`` names the cursor within this service's own namespace
-        (:attr:`cursor_prefix`) and defaults to the stream's name, so one
-        consumer per stream needs no naming at all; a service following
-        the same stream twice, or rebuilding its local state and wanting a
-        fresh start (dataops' generational cursor), passes its own —
-        ``svc.stream("metrics", cursor="ingest-02")`` — and retires the
-        old one with ``Stream.retire()``. ``max`` bounds one page.
-        ``signal_ids`` filters the ``metrics`` stream server-side (the door
-        refuses it on any other stream). Requires :meth:`start`.
+        ``cursor`` names the cursor within :attr:`cursor_prefix` and defaults
+        to the stream's name. Pass another name to follow a stream twice or to
+        start fresh (``svc.stream("metrics", cursor="ingest-02")``), and retire
+        the old one with ``Stream.retire()``. ``max`` bounds one page.
+        ``signal_ids`` filters the ``metrics`` stream at the door. Requires
+        :meth:`start`.
         """
         door = self._require_http("stream")
         return Stream(
@@ -948,14 +860,8 @@ class Service:
     # -- signal binding ------------------------------------------------
 
     def _on_signal(self, message: Any) -> None:
-        """A Signal binds at ``{under}/{leaf}`` — ``under`` is the connector's
-        own mount by default, ``leaf`` the tag's sanitized NAME — which is
-        NOT in general the same string as the ``path`` a caller gave
-        ``publish()`` (a single-segment source like "temp" gets the
-        connector's mount prepended; a multi-segment one only matches by
-        coincidence). So the match key is ``signal.data_tag`` against this
-        service's own catalogue, never the topic's path (``exec_configure.go``
-        ``bindCatalogue``).
+        """Match a ``_Signal`` to this service's tags by ``data_tag``. Its topic
+        path is not the ``path`` given to ``publish()``, so it cannot be the key.
         """
         topic_str = str(message.topic)
         parts = topic_str.split("/")
@@ -978,8 +884,7 @@ class Service:
                 if self._bindings.pop(topic_str, None) is not None:
                     self._bindings_changed()
                 return
-            # The metric belongs at the SIGNAL's own position: same node,
-            # same path — no service-local address, no translation (design §6).
+            # The metric goes to the Signal's own position: same node and path.
             metric_topic = Topic(payload_type=Metric, node_id=parts[3], context=tuple(parts[4:]))
             self._bindings[topic_str] = Binding(tag_id, metric_topic, signal)
             self._bindings_changed()
@@ -990,13 +895,9 @@ class Service:
             if not signal.is_published:
                 queued = None
         if queued:
-            # Always the MQTT network/callback thread here: franzmq.Client's
-            # own qos>=1 wait-for-PUBACK is a deadlock on this thread by
-            # construction (it is the thread that would have to read the
-            # PUBACK), so ask it to fire-and-forget instead of trusting its
-            # same-thread detection, which does not appear to catch this
-            # dispatch path (observed: a PublishTimeout after the full
-            # publish_timeout, not a same-thread skip).
+            # This runs on the MQTT network thread, which cannot wait for its own
+            # PUBACK, so publish without waiting; franzmq's own detection does not
+            # cover this callback path.
             for value, timestamp in queued:
                 self._publish_metric(metric_topic, signal.id, value, timestamp, wait=False)
 
@@ -1094,13 +995,10 @@ class Service:
         self._started_catalogue.seal(self._seen)
 
     def retire(self, token: str | None = None) -> None:
-        """A deliberate end, not a restart: tombstone this service's own
-        ``_ServiceDetails`` and ``_DataTags`` (empty retained payloads) so
-        the tree forgets it entirely. Outside a deployment, also
-        revokes the enrollment through the node's admin door
-        (``DELETE /enroll``), which needs ``token`` (raises
-        without one). Not part of the context manager: this is an explicit
-        decision, never implied by ``__exit__``.
+        """Remove this service for good: publish empty retained
+        ``_ServiceDetails`` and ``_DataTags`` so the tree forgets it. Outside a
+        deployment it also revokes the enrollment (``DELETE /enroll``), which
+        needs ``token``. The context manager never calls this.
         """
         if self._external and not token:
             raise RuntimeError(

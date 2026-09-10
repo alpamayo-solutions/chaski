@@ -1,12 +1,8 @@
-"""Level-2 pin for Service's lifecycle (SDK design §3.2) — hermetic: a fake
-MQTT client for the wire side, monkeypatched connection/identity resolution
-functions so no broker or real network is needed, plus genuine on-disk
-identity minting (the one piece that IS real file/crypto work).
+"""Tests for Service's lifecycle with a fake MQTT client and real identity files.
 
-Covers: the ServiceDetails shape and is_active/status transitions,
-NotEnrolled's mapping from a refused CONNACK, enroll_hint()'s exact text,
-pending()'s three reasons, retire()'s outside-needs-a-token refusal, and
-identity minting being idempotent with 0600 files.
+Covered: ServiceDetails and its is_active and status changes, NotEnrolled for a
+refused CONNACK, the enroll hint, pending()'s three reasons, retire() needing a
+token outside a deployment, and idempotent identity minting with 0600 files.
 """
 
 from __future__ import annotations
@@ -27,10 +23,8 @@ class _FakeReasonCode:
 
 
 class _FakeClient:
-    """A minimal stand-in for franzmq.Client — see test_service_binding.py
-    for the same shape; this copy additionally supports a configurable
-    CONNACK outcome and records tombstones, needed for the lifecycle tests
-    here."""
+    """A minimal franzmq.Client stand-in with a configurable CONNACK outcome
+    that records tombstones."""
 
     def __init__(self, *, reason_code: _FakeReasonCode | None = None) -> None:
         self.published: list[tuple[str, object]] = []

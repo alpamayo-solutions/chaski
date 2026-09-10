@@ -1,31 +1,19 @@
-"""The one DataTag catalogue every :class:`chaski.Service` publishes (SDK
-design §3, §7 gap 3; service families design §3.4 and §4).
+"""The DataTag catalogue every :class:`chaski.Service` publishes.
 
-A catalogue is the set of sources a service offers, each with an id that
-never changes for as long as the source is known. Two things grow it and
-they are the only two:
+A catalogue is the set of sources a service offers, each with an id that stays
+the same for as long as the source is known. It grows in two ways:
 
-* ``ensure(path, value, unit)`` — the ``publish()`` path: a never-seen path
-  mints a tag, a stale one is revived.
-* ``declare(tags)`` — the discovery path (``ConnectorService``): the whole
-  discovered set at once. Ids are reused by ``source``, new sources mint,
-  and a source that vanished is carried forward marked ``is_stale`` rather
-  than dropped, so a Signal bound to it stays bound instead of silently
-  rebinding (local-service-trust design §6).
+* ``ensure(path, value, unit)``, the ``publish()`` path: a new path mints a
+  tag, a stale one is revived.
+* ``declare(tags)``, the discovery path (``ConnectorService``): ids are reused
+  by ``source``, new sources mint, and a vanished source stays in the catalogue
+  marked ``is_stale`` so a Signal bound to it stays bound.
 
-**The memory is the node, not a local file.** A service holds no catalogue
-state of its own: the retained ``_DataTags`` record it published last time
-is already in the node's KV, readable through the same door it publishes at,
-and ``load_previous`` seeds the catalogue from it before the service
-subscribes to its ``_Signal`` records — the bindings that arrive on that
-subscription name the ids of the PREVIOUS run, so the catalogue must know
-them first. That seed is also what arms the republish guard: an unchanged
-catalogue after a restart hashes to the revision already on record and is
-not re-appended and re-replicated.
-
-This used to exist twice — here as a JSON file next to the service's state
-directory, and in ``connector/src/reader.py`` reading the node — with the
-content-hash guard implemented in both. There is one now.
+The service keeps no catalogue file. ``load_previous`` seeds the catalogue from
+the retained ``_DataTags`` record in the node's KV before the service
+subscribes to its ``_Signal`` records, whose bindings name the previous run's
+ids. The seed also means an unchanged catalogue is not republished after a
+restart.
 """
 
 from __future__ import annotations
@@ -51,15 +39,9 @@ def infer_data_type(value: Any) -> str:
 
 
 def element_for(path: str, mount: str = "") -> str:
-    """The path's parent, joined onto ``mount`` to make it node-local (SDK
-    design §3 rule 2): the node resolves ``meta.element`` as a node-local
-    path (``exec_configure.go`` ``elementAt``/``authorElementAt``), so a
-    mount-relative parent sent as-is would miss for every service that is
-    not bound at the node's root. "" for a top-level path — no parent means
-    no ``meta.element`` at all, which leaves the tag placed at the service's
-    own mount, whatever that is (architecture principle 6); joining an empty
-    parent with a mount would wrongly turn "no parent" into "the mount
-    itself"."""
+    """The path's parent joined onto ``mount``, because the node resolves
+    ``meta.element`` as a node-local path. "" for a top-level path, which
+    leaves the tag at the service's own mount."""
     if "/" not in path:
         return ""
     parent = path.rsplit("/", 1)[0]
@@ -84,10 +66,9 @@ def _tag_from_record(raw: Mapping[str, Any]) -> DataTag:
 class Catalogue:
     """The source -> DataTag mapping for one service.
 
-    ``connector`` is the identity the published ``DataTags.connector`` field
-    carries — the node-minted registry ULID of a local service, the pinned
-    ULID of an external one. ``mount`` is where the service sits, used only
-    to make a ``publish()``-path parent node-local (:func:`element_for`).
+    ``connector`` is the service's registry ULID, published as
+    ``DataTags.connector``. ``mount`` is where the service sits, used to make a
+    ``publish()`` path's parent node-local (:func:`element_for`).
     """
 
     def __init__(self, *, connector: str, mount: str = "") -> None:
@@ -164,11 +145,10 @@ class Catalogue:
         return tag.id, changed
 
     def declare(self, tags: Mapping[str, DataTag]) -> None:
-        """The discovery path: the complete set of sources a discovery
-        found, keyed by ``source``. Each keeps the id it already had (or
-        mints one); every known source NOT in ``tags`` is carried forward
-        marked stale. The ``id`` on the given tags is ignored — the
-        catalogue is the one place ids are minted."""
+        """The discovery path: every source a discovery found, keyed by
+        ``source``. Known sources keep their id, new ones mint, and known
+        sources missing from ``tags`` are marked stale. The ``id`` on the
+        given tags is ignored."""
         merged: dict[str, DataTag] = {}
         for source, raw in tags.items():
             old = self._tags.get(source)
@@ -189,9 +169,7 @@ class Catalogue:
         self.dirty = True
 
     def seal(self, seen: set[str]) -> bool:
-        """Mark every known path NOT in ``seen`` stale — the ``publish()``
-        path's end-of-run rule (a path not published this run is gone).
-        True if anything changed."""
+        """Mark every known path not in ``seen`` stale. True if anything changed."""
         changed = False
         for source, tag in list(self._tags.items()):
             if source not in seen and not tag.is_stale:

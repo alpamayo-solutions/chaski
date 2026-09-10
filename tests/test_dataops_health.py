@@ -1,12 +1,7 @@
-"""The health door answers for the RUNNING service, from its event loop.
+"""The health door answers for the running service, from its event loop.
 
-The old container healthcheck (`python -c "import dataops.service"`) spawned
-a fresh interpreter: it could not see a dead ingest loop, and under load its
-own import cost exceeded the probe timeout. These tests pin the replacement:
-a loop-hosted server whose 200/503 is derived from the one task that makes
-this service a service — and which, being ON the loop, cannot answer at all
-when the loop is blocked (that silence is the probe's honest failure mode;
-timing it is not a job for a unit test).
+Its 200 or 503 follows the ingest task. Being on the loop, it cannot answer at
+all while the loop is blocked; that is not timed here.
 """
 
 from __future__ import annotations
@@ -65,9 +60,8 @@ async def test_a_running_ingest_answers_200_with_the_service_facts():
 
 @run_async
 async def test_a_dead_ingest_loop_turns_the_probe_503():
-    """The one condition that makes an answering service unhealthy: its
-    single data lane died. An ingest that was never started is NOT that —
-    a fresh node waiting to be commissioned is healthy."""
+    """A dead ingest task makes the service unhealthy; one that never started
+    does not."""
 
     async def _dies():
         raise RuntimeError("boom")

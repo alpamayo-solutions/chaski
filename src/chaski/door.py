@@ -1,35 +1,21 @@
-"""The colca door's HTTP client — the SDK's consume lane (service families
-design §3.3).
+"""The colca door's HTTP client, the SDK's consume lane.
 
 One implementation of ``GET /fetch`` (named cursors), ``POST /ack``,
 ``GET /kv`` (paged, contract-filtered), ``GET /self`` and ``POST /publish``,
-used by ``chaski.Service.stream()`` / ``chaski.Service.kv()`` and directly by
-the shipped ``dataops`` service. It used to live in ``dataops/door.py`` and
-was vendored by hand into every bridge that needed to follow a stream — the
-duplication architecture principle 1 forbids, deleted by moving it here.
+used by ``chaski.Service.stream()`` and ``chaski.Service.kv()``.
 
-Two doors, one client. On the LOCAL door (plain HTTP, port 80 inside the
-deployment's own compose network) there is no credential — reachability IS
-the credential — and the caller names itself with ``X-Colca-Service`` so the
-door can self-register and bind it on first sight ("Node doors",
-the local service trust design). On the
-published API door (HTTPS, 443) the caller presents its registry-pinned
-identity as a TLS client certificate instead (``cert=``), and the name
-header is ignored. Which door a :class:`Door` speaks to is decided entirely
-by its ``base_url`` and whether ``cert`` is given.
+On the local door (plain HTTP inside the deployment's network) there is no
+credential: the caller names itself with ``X-Colca-Service`` and the door
+registers it on first sight. On the published API door (HTTPS) the caller
+presents its pinned identity as a TLS client certificate (``cert=``) and the
+name header is ignored. ``base_url`` and ``cert`` decide which door a
+:class:`Door` talks to.
 
-This client stays contract-agnostic: it decodes the HTTP/JSON envelope
-(records, cursors, gaps, KV entries) but hands each record's ``payload``
-back as whatever native Python value ``json`` produced (typically a
-``dict``). Turning that into a ``colca_data_contracts`` type (``Metric``,
-``Annotation``, ...) is the caller's job.
-
-Errors surface as exceptions from the underlying ``httpx`` client: a
-non-2xx response raises ``httpx.HTTPStatusError`` (via
-``response.raise_for_status()``); a connection failure, timeout, or other
-transport problem raises the corresponding ``httpx`` exception directly.
-Nothing here wraps or swallows either kind — a consumer's retry loop
-catches ``httpx.HTTPError``, the class both kinds share.
+The client decodes the HTTP/JSON envelope but returns each record's
+``payload`` as plain JSON values; decoding it into a contract type is the
+caller's job. Errors are ``httpx`` exceptions, raised unchanged:
+``httpx.HTTPStatusError`` for a non-2xx response, a transport exception
+otherwise. Both are ``httpx.HTTPError``.
 """
 
 from __future__ import annotations
@@ -52,14 +38,9 @@ log = logging.getLogger("chaski.door")
 class Record:
     """One record returned by ``GET /fetch`` (or held inside a :class:`Page`).
 
-    ``ts`` is passed through verbatim from the wire — colca's own record
-    timestamp, unix MILLISECONDS (``colca/internal/store/store.go``:
-    ``cutoff := now.UnixMilli() - maxAge.Milliseconds()`` is compared
-    against it). Every other timestamp a consumer handles (buffered points,
-    a payload's own ``timestamp`` field, watermarks) is unix SECONDS. Use
-    :attr:`fallback_timestamp_s`, never ``ts`` directly, wherever a
-    record's own timestamp stands in for a payload that carries none of
-    its own.
+    ``ts`` is colca's record timestamp in unix milliseconds, while every other
+    timestamp is in seconds. Use :attr:`fallback_timestamp_s` when the record
+    timestamp stands in for a payload without one.
     """
 
     offset: int
@@ -74,15 +55,7 @@ class Record:
 
     @property
     def fallback_timestamp_s(self) -> float:
-        """``ts`` converted from colca's wire unit (milliseconds) to the
-        unix-seconds convention every other timestamp uses.
-
-        The ONE place a consumer gets the conversion from, so it can be
-        wrong in at most one place. A payload without a ``timestamp`` field
-        once buffered this record's raw millisecond ``ts`` as if it were
-        seconds, landing the point ~50,000 years in the future and wedging
-        every freshness check for that signal forever.
-        """
+        """``ts`` converted from milliseconds to unix seconds."""
         return self.ts / 1000.0
 
 
@@ -119,13 +92,11 @@ class Page:
 
     @property
     def ack_offset(self) -> int | None:
-        """The offset to ack once EVERY record of this page is processed.
+        """The offset to ack once every record of this page is processed.
 
-        The last record's offset when the page carries records; the gap's
-        own bound when nothing survived at/after the low-water mark
-        (otherwise the next fetch reports the identical gap forever); and
-        ``None`` for an empty page, which acks nothing. This is the rule
-        the dataops ingest loop and :class:`Stream` share — one owner.
+        The last record's offset; the gap's bound when no record survived the
+        low-water mark, so the same gap is not reported again; ``None`` for an
+        empty page.
         """
         if self.records:
             return self.records[-1].offset
@@ -147,10 +118,8 @@ class KvEntry:
 
 
 def _external_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
-    """No CA anywhere at the published API door ("Node doors"):
-    trust is the registry-pinned key presented as a client certificate,
-    never a chain — the same InsecureSkipVerify shape colca-machine (the Go
-    reference client) and ``chaski.Service``'s MQTT side use."""
+    """TLS context for the published API door. There is no CA: trust is the
+    pinned key presented as a client certificate, so the chain is not checked."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -265,13 +234,9 @@ class Door:
         ``prefix``, every page followed until the door returns an empty
         ``next``.
 
-        ``contract`` narrows the scan to a set of uns contracts — one name
-        or several, sent as the repeatable ``contract`` query parameter
-        (``?contract=_Group&contract=_MetadataType``). The filter is applied
-        inside colcad's scan, before any entry's payload is decoded, so a
-        narrowed read stays bounded regardless of how much other state the
-        node holds ("Element-Scoped Authorization"). An unknown
-        contract name is a 400 from the door, never a silent empty result.
+        ``contract`` narrows the scan to one or more contracts
+        (``?contract=_Group&contract=_MetadataType``); the node filters before
+        decoding payloads. An unknown contract name is a 400.
         """
         contracts = [contract] if isinstance(contract, str) else list(contract or [])
         entries: list[KvEntry] = []
@@ -321,59 +286,40 @@ class Door:
         return bool(resp.json()["moved"])
 
     def delete_cursor(self, stream: str, cursor: str) -> None:
-        """``POST /ack`` with ``delete: true`` — retire a cursor.
+        """``POST /ack`` with ``delete: true``: retire a cursor.
 
-        The door answers ``{"deleted": true}`` unconditionally on success,
-        including when the cursor was already absent (idempotent), so there
-        is no meaningful boolean to hand back — this raises only on a
-        transport or HTTP error and otherwise returns ``None``.
+        Succeeds also when the cursor does not exist; raises only on a
+        transport or HTTP error.
         """
         resp = self._client.post("/ack", json={"cursor": cursor, "stream": stream, "delete": True})
         resp.raise_for_status()
 
     def publish(self, topic: str, payload: str) -> None:
-        """``POST /publish`` — publish one record under this service's identity.
+        """``POST /publish``: publish one record under this service's identity.
 
-        ``payload`` is a pre-serialized JSON string (typically
-        ``json.dumps(...)`` of a contract payload dict). It is decoded and
-        re-embedded as a native JSON value in the request body — never
-        double-encoded as a JSON string containing JSON text — so the
-        record colca stores matches what any other publisher (e.g. a
-        connector's ``_Metric``) would produce.
+        ``payload`` is a JSON string. It is embedded as a JSON value, not as a
+        string, so the stored record matches what an MQTT publisher sends.
         """
         resp = self._client.post("/publish", json={"topic": topic, "payload": json.loads(payload)})
         resp.raise_for_status()
 
 
 class Stream:
-    """A named cursor over one colca stream — what ``Service.stream()`` returns.
+    """A named cursor over one colca stream, as ``Service.stream()`` returns it.
 
-    The cursor is durable and server-side: ``/fetch`` reads from wherever
-    the door last stored it, and only ``/ack`` moves it. A process that
-    restarts under the same cursor name resumes exactly where it acked;
-    one that opens a NEW cursor name starts from the stream's first
-    retained record — that is how the dataops ingest loop treats a rebuilt
-    buffer (a fresh "generation" gets a fresh cursor and :meth:`retire`
-    deletes the previous one), and the same contract holds here.
+    The cursor lives at the door: ``/fetch`` reads from its stored position
+    and only ``/ack`` moves it. Reopening the same name resumes where it was
+    acked; a new name starts at the stream's first retained record.
 
-    **Iterating is one drain, page-acked.** ``for record in stream:``
-    fetches page after page from the cursor's position, yields every
-    record in stream order, and acks a page — its last offset, or a gap's
-    bound when nothing survived at/after the low-water mark — only once the
-    consumer has come back for more after the page's last record, i.e.
-    after processing it. It stops at the first empty page. This is the
-    ingest loop's crash-safety contract verbatim (``dataops/ingest.py``):
-    a consumer that raises, breaks, or dies mid-page never acks that page,
-    so the next drain re-delivers it — at-least-once, page-granular.
-    Handlers must therefore be idempotent for the same record.
+    **Iterating drains the stream, acking page by page.** ``for record in
+    stream:`` yields records in stream order and acks a page only when the
+    consumer asks for the record after its last one. A consumer that raises or
+    stops mid-page gets that page again next time, so handlers must be
+    idempotent. Iteration stops at the first empty page.
 
-    :meth:`ack` is still public for a consumer that wants to commit earlier
-    than the page boundary (the page's own ack afterwards is a harmless
-    ``moved=False``). :meth:`follow` is the same drain repeated forever,
-    sleeping ``poll_interval`` after each empty page.
-
-    A pruned range (``Page.gap``) is logged at WARNING — operator-visible,
-    not an error — and the drain continues from what survived.
+    :meth:`ack` commits before the page boundary if needed. :meth:`follow`
+    repeats the drain, sleeping ``poll_interval`` after an empty page. A pruned
+    range (``Page.gap``) is logged as a warning.
     """
 
     def __init__(
@@ -437,9 +383,8 @@ class Stream:
         """:meth:`drain` forever — after an empty page, sleep ``poll_interval``
         (waking early when ``stop`` is set) and drain again. Ends when
         ``stop`` is set."""
-        # A plain sleep between drains. A consumer that wants an MQTT
-        # doorbell instead (dataops' shape) wires its own wake-up and
-        # calls drain() itself.
+        # A plain sleep between drains; a consumer with its own wake-up calls
+        # drain() itself.
         stop = stop or threading.Event()
         while not stop.is_set():
             yield from self.drain()

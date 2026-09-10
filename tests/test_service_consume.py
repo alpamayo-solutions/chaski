@@ -1,11 +1,7 @@
-"""Level-2 pin for the consume lane on ``chaski.Service`` (service families
-design §3.3): ``stream()`` and ``kv()`` against a fake door
-that models what colcad actually does with a named cursor — stores its
-position server-side, serves ``/fetch`` from it, moves it only on ``/ack``.
-
-Hermetic: the MQTT side is the same fake client and monkeypatched
-connection functions ``test_service_lifecycle.py`` uses; the HTTP side is
-``_FakeDoor`` installed in place of ``chaski.service.Door``.
+"""Tests for ``Service.stream()`` and ``Service.kv()`` against a fake door that
+keeps cursor positions like colcad: ``/fetch`` reads from the position and only
+``/ack`` moves it. The MQTT side is the fake client from
+``test_service_lifecycle.py``.
 """
 
 from __future__ import annotations
@@ -278,8 +274,7 @@ def test_explicit_ack_commits_earlier_than_the_page_boundary(tmp_path, monkeypat
 
 
 def test_a_gap_is_acked_at_its_bound_when_nothing_survived(tmp_path, monkeypatch, fake_door, caplog):
-    """Retention pruned everything this cursor had yet to read: the drain
-    acks the gap's bound (or the next fetch reports the same gap forever),
+    """When retention pruned everything unread, the drain acks the gap's bound,
     warns, and yields nothing."""
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
@@ -296,9 +291,8 @@ def test_a_gap_is_acked_at_its_bound_when_nothing_survived(tmp_path, monkeypatch
 
 
 def test_a_new_cursor_name_starts_over_and_retire_deletes_the_old_one(tmp_path, monkeypatch, fake_door):
-    """dataops' generational cursor, on the SDK: a rebuilt local state opens
-    a fresh cursor (which walks the whole retained window again) and
-    retires the previous generation's."""
+    """A new cursor name reads the retained window from the start, and retire()
+    deletes the old cursor."""
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
     door.streams["metrics"] = [_record(1, "metrics"), _record(2, "metrics")]

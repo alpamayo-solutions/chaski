@@ -1,9 +1,7 @@
-"""Level-2 pins for SDK design §3.1/§7 gaps 2/4: the embedded-node config
-generator, TOFU parent pinning, binary resolution order, status() derivation
-from a stubbed /healthz, crash detection, and enroll_hint() text. Hermetic —
-no real colcad anywhere in this file; a fake parent uses monkeypatched
-``chaski.node._fetch_json`` and a fake colcad uses a subprocess this test
-controls end to end."""
+"""Tests for the embedded node: config generation, trust-on-first-use parent
+pinning, binary resolution, status() from a stubbed /healthz, crash detection
+and the enroll hint. There is no real colcad: the parent is a patched
+``chaski.node._fetch_json`` and colcad a subprocess the test controls."""
 
 from __future__ import annotations
 
@@ -37,8 +35,7 @@ def test_a_fresh_node_writes_loopback_config_with_autobind_and_no_tls(tmp_path):
     for door in ("api", "mqtt", "mqtt_local", "repl"):
         addr = doc[door]["addr"] if door != "api" else doc[door]["local_addr"]
         assert addr.startswith("127.0.0.1:")
-    # No TLS doors except the uplink (spec §3.1): no human MQTT/WS, no tls
-    # block, no auth block.
+    # No TLS doors except the uplink: no human MQTT or WebSocket, no tls or auth block.
     assert "mqtt_human" not in doc
     assert "tls" not in doc
     assert "auth" not in doc
@@ -60,11 +57,8 @@ def test_an_explicit_parent_tuple_is_carried_into_the_uplink_block(tmp_path):
     node._write_config()
 
     doc = _load(node)
-    # An explicit pin names the parent's REPLICATION door as reachable from
-    # here (a remapped host port, a tunnel) and is carried VERBATIM into the
-    # config — no ":9443" convention applied; only a bare-URL TOFU parent
-    # derives the fixed door. node.parent_url is that host's API/enrollment
-    # door (enroll_hint()/retire_hint() print that one, not the repl one).
+    # An explicit pin names the parent's replication door and goes into the
+    # config unchanged; parent_url is the same host's API door the hints print.
     assert doc["parent"] == {"url": "https://hub.example:19743", "pubkey": "abc123"}
     assert node.parent_url == "https://hub.example"
     assert node.parent_pubkey == "abc123"
@@ -218,10 +212,8 @@ def test_binary_resolution_order_env_then_wheel_then_path(monkeypatch):
 
 
 def test_binary_resolution_falls_through_a_wheel_with_no_binary_populated(monkeypatch, tmp_path):
-    # A locally path-sourced colcad (dev/[tool.uv.sources], never
-    # scripts/build_colcad_wheels.py) imports fine but ships no bin/colcad —
-    # this must fall through to PATH, not hand Popen a path that can never
-    # exist.
+    # A colcad installed from a checkout has no bin/colcad; resolution falls
+    # through to PATH.
     monkeypatch.delenv(node_mod._COLCAD_ENV, raising=False)
     fake_module = types.ModuleType("colcad")
     fake_module.BINARY_PATH = tmp_path / "bin" / "colcad"  # deliberately absent
@@ -559,10 +551,8 @@ def test_a_crashing_binary_is_reported_as_crashed(tmp_path):
 
 
 def test_the_config_points_colcad_at_the_contracts_bundle(tmp_path, monkeypatch):
-    """A colcad without a bundle runs on the builtin floor and rejects every
-    Colca contract (the embedded node enrolled fine and then refused its own
-    service's _DataTags, level 4): the config names the bundle, from the env
-    override here, from the colcad package otherwise."""
+    """The config names the contracts bundle, from the env override here and
+    from the colcad package otherwise."""
     monkeypatch.setenv("COLCAD_CONTRACTS_BUNDLE", "/from/env/contracts-bundle.json")
     node = Node("erp-bridge", data_dir=tmp_path / "n")
     node._write_config()

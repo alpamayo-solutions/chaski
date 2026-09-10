@@ -1,9 +1,6 @@
-"""Level-2 pin for ``chaski.door.Door`` against a stub local-door HTTP server
-— the wire envelope of ``/fetch``, ``/ack``, ``/kv`` (paging + contract
-filter), ``/self`` and ``/publish``, exactly as colcad's httpapi answers
-them. Moved here from ``dataops/tests/test_door.py`` with the client itself
-(service families design D7); the dataops suite exercises the
-same class through its ingest/resolve/output tests."""
+"""Tests for ``chaski.door.Door`` against a stub HTTP server answering
+``/fetch``, ``/ack``, ``/kv`` (paging and contract filter), ``/self`` and
+``/publish`` the way colcad does."""
 
 from __future__ import annotations
 
@@ -206,13 +203,8 @@ def test_fetch_raises_on_http_error(stub_server, door):
 
 
 def test_record_fallback_timestamp_converts_colca_millis_to_seconds(stub_server, door):
-    """colca's own record ``ts`` is unix MILLISECONDS
-    (``colca/internal/store/store.go``'s ``UnixMilli`` cutoff comparison);
-    every other timestamp in dataops is unix SECONDS. A record's raw ``ts``
-    must stay untouched (it is passed through verbatim from the wire, and
-    other tests pin that), but ``fallback_timestamp_s`` — the one place both
-    ``Ingest._timestamp_of`` and ``service._decode_metric`` get their
-    no-payload-timestamp fallback from — must convert it."""
+    """``ts`` stays in milliseconds as on the wire; ``fallback_timestamp_s``
+    converts it to seconds."""
     _, handler_cls = stub_server
     handler_cls.responses["/fetch"] = (
         200,
@@ -414,10 +406,8 @@ def _rec(offset: int) -> dict:
 
 
 def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server, door):
-    """The one rule the dataops ingest loop and ``Stream`` share: after a
-    page is fully processed, ack its last record; when nothing survived
-    at/after the low-water mark, ack the gap's bound (or the next fetch
-    reports the identical gap forever); an empty page acks nothing."""
+    """Ack the last record; with no record past the low-water mark, the gap's
+    bound; for an empty page, nothing."""
     _, handler_cls = stub_server
     gap = {"stream": "metrics", "from_offset": 1, "to_offset": 40, "first_ts": None, "last_ts": None}
     handler_cls.responses["/fetch"] = [
