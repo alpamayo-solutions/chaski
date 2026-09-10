@@ -20,9 +20,9 @@ from pathlib import Path
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
-from franzmq import Topic
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import DataTags, Metric, Signal
+from franzmq import Topic
 
 from chaski.service import Service
 
@@ -52,13 +52,13 @@ class _FakeClient:
     def disconnect(self) -> None:
         pass
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         self.tombstoned.append(str(topic))
 
     def deliver(self, topic: Topic, payload: object) -> None:

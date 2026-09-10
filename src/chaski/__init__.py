@@ -26,25 +26,25 @@ from .node import Node
 from .service import LocalDoor, NotEnrolled, Service
 
 __all__ = [
-    "Service",
     "ConnectorService",
-    "Driver",
+    "DataOpsService",
     "DataTag",
     "Discovery",
-    "Target",
-    "Reading",
-    "Telemetry",
-    "SourceDisconnectedError",
-    "Node",
     "Door",
-    "Stream",
-    "Record",
-    "Page",
+    "Driver",
     "Gap",
     "KvEntry",
     "LocalDoor",
+    "Node",
     "NotEnrolled",
-    "DataOpsService",
+    "Page",
+    "Reading",
+    "Record",
+    "Service",
+    "SourceDisconnectedError",
+    "Stream",
+    "Target",
+    "Telemetry",
 ]
 
 

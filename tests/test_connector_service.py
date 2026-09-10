@@ -26,10 +26,10 @@ from typing import Any
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
-from franzmq import Topic
-from franzmq.errors import PublishRejected, PublishTimeout
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import DataTag, DataTags, Metric, ServiceDetails, Signal
+from franzmq import Topic
+from franzmq.errors import PublishRejected, PublishTimeout
 
 from chaski.connector import (
     HEARTBEAT_TAG_SOURCE,
@@ -75,7 +75,7 @@ class FakeNode:
         self.queue_limit: int | None = None
 
     # -- the Door half --
-    def door(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None):  # noqa: ARG002
+    def door(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None):
         return self
 
     def close(self) -> None:
@@ -114,14 +114,14 @@ class FakeNode:
     def max_queued_messages_set(self, limit: int) -> None:
         self.queue_limit = limit
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
     def unsubscribe(self, topic) -> None:
         self.unsubscribed.append(str(topic))
         self.subscriptions.pop(str(topic), None)
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         if self.reject is not None:
             raise self.reject
         if not self.connected:
@@ -130,7 +130,7 @@ class FakeNode:
         if retain:
             self.retained[str(topic)] = payload.__dict__
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         pass
 
     # -- what a test drives --
@@ -176,10 +176,10 @@ class FakeDriver(Driver):
     ``fail_connects`` counts down connect failures."""
 
     protocol = "fake"
-    metadata = {"protocol": "FAKE"}
 
     def __init__(self, *, requires_connection: bool = True) -> None:
         super().__init__(logger=logging.getLogger("fake-driver"))
+        self.metadata = {"protocol": "FAKE"}
         self.catalogue_requires_connection = requires_connection
         self.tags: dict[str, dict] = {"Axis1/Temperature": {"name": "Temperature", "data_type": "float"}}
         self.values: dict[str, Any] = {"Axis1/Temperature": 42.0}

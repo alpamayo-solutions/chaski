@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC
-from typing import TYPE_CHECKING, ClassVar, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from chaski.door import Door
@@ -53,13 +53,13 @@ class Runtime(Protocol):
     """
 
     @property
-    def door(self) -> "Door": ...
+    def door(self) -> Door: ...
 
     @property
-    def buffer(self) -> "Buffer": ...
+    def buffer(self) -> Buffer: ...
 
     @property
-    def historian(self) -> "Optional[Historian]": ...
+    def historian(self) -> Historian | None: ...
 
 
 class Producer(ABC):
@@ -105,7 +105,11 @@ class Producer(ABC):
     # Record of concrete producers defined so far, keyed by ``name`` — the
     # discovery convenience `DataOpsService.discover` diffs. Not a
     # service's run list.
-    _registry: ClassVar[dict[str, type["Producer"]]] = {}
+    _registry: ClassVar[dict[str, type[Producer]]] = {}
+
+    # Set on every instance in __new__.
+    _lock: threading.RLock
+    _runtime: Runtime | None
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
@@ -122,7 +126,7 @@ class Producer(ABC):
         # Skip intermediate / abstract classes — they're contracts, not runnables.
         # `__abstractmethods__` may not be populated yet during __init_subclass__
         # (ABCMeta sets it later); default to empty if absent.
-        abstract = getattr(cls, "__abstractmethods__", frozenset())
+        abstract: frozenset[str] = getattr(cls, "__abstractmethods__", frozenset())
         if abstract:
             log.debug("Skipping abstract producer %s (abstract methods: %s)", cls.__name__, sorted(abstract))
             return
@@ -145,7 +149,7 @@ class Producer(ABC):
             log.warning("Duplicate producer name %r — overwriting registration", cls.name)
         Producer._registry[cls.name] = cls
 
-    def __new__(cls, *args, **kwargs) -> "Producer":
+    def __new__(cls, *args, **kwargs) -> Producer:
         # A producer's `@on_metric` handlers run on the ingest worker
         # thread; its `@every`/`@cron` ticks run in APScheduler's own
         # executor thread pool (design §4: "handlers and ticks on one
@@ -163,27 +167,27 @@ class Producer(ABC):
         # reason.
         self = super().__new__(cls)
         self._lock = threading.RLock()
-        self._runtime: Runtime | None = None
+        self._runtime = None
         return self
 
     # ------------------------------------------------------------------ lifecycle
 
-    async def setup(self) -> None:
+    async def setup(self) -> None:  # noqa: B027 - optional hook
         """Override to load initial state (e.g. cursor from DB). Default no-op."""
 
-    async def teardown(self) -> None:
+    async def teardown(self) -> None:  # noqa: B027 - optional hook
         """Override for shutdown cleanup. Default no-op."""
 
     # ------------------------------------------------------------------ classmethods
 
     @classmethod
-    def all(cls) -> list[type["Producer"]]:
+    def all(cls) -> list[type[Producer]]:
         """Every concrete producer defined so far, sorted by name."""
         return [Producer._registry[n] for n in sorted(Producer._registry)]
 
     # ------------------------------------------------------------------ runtime
 
-    def attach(self, runtime: Runtime) -> "Producer":
+    def attach(self, runtime: Runtime) -> Producer:
         """Bind this instance to the runtime its inputs, outputs and
         watermark go through. Called once by the service that instantiated
         it (``DataOpsService``), before ``setup()``; a test attaches a

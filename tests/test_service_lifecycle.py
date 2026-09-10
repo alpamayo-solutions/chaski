@@ -51,13 +51,13 @@ class _FakeClient:
     def disconnect(self) -> None:
         self.disconnected = True
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         self.tombstoned.append(str(topic))
 
 
@@ -88,7 +88,7 @@ def _external_service(
     fails: bool = False,
 ) -> tuple[Service, _FakeClient]:
     client = _FakeClient(reason_code=_FakeReasonCode(is_failure=fails))
-    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")  # noqa: ARG005
+    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")
     monkeypatch.setattr("chaski.service._connect_external_mqtt", lambda *a, **k: client)
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
     svc = Service("erp-bridge", mount, node="https://edge1.example", state_dir=tmp_path)
@@ -103,7 +103,7 @@ def _details(client: _FakeClient) -> list[ServiceDetails]:
 
 
 def test_start_publishes_one_active_healthy_service_details(tmp_path, monkeypatch):
-    svc, client = _local_service(
+    _, client = _local_service(
         tmp_path,
         monkeypatch,
         display_name="ERP Bridge",
@@ -184,7 +184,7 @@ def test_local_start_sets_a_last_will_before_connect(tmp_path, monkeypatch):
 
 
 def test_external_connect_refused_raises_not_enrolled_with_the_exact_command(tmp_path, monkeypatch):
-    svc, client = _external_service(tmp_path, monkeypatch, fails=True)
+    svc, _ = _external_service(tmp_path, monkeypatch, fails=True)
 
     with pytest.raises(NotEnrolled) as excinfo:
         svc.start()
@@ -214,7 +214,7 @@ def test_wait_enrolled_retries_start_until_accepted(tmp_path, monkeypatch):
         attempts["n"] += 1
         return failing if attempts["n"] == 1 else accepted
 
-    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")  # noqa: ARG005
+    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")
     monkeypatch.setattr("chaski.service._connect_external_mqtt", fake_connect)
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
 

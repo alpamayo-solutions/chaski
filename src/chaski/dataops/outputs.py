@@ -49,11 +49,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import ulid
-from franzmq import Topic
 from colca_data_contracts import (
     AnnotationPayload,
     DataTag,
@@ -61,6 +61,7 @@ from colca_data_contracts import (
     Metric,
     derive_annotation_id,
 )
+from franzmq import Topic
 
 from . import resolve
 from .inputs import _PerInstance
@@ -86,7 +87,7 @@ def _epoch(ts: Any) -> float:
     return float(ts)
 
 
-def _catalogue_meta(output: "SignalOutput") -> dict[str, Any]:
+def _catalogue_meta(output: SignalOutput) -> dict[str, Any]:
     """What a catalogue entry says about an output beyond its name and type.
 
     ``element`` is the node-local path of the element the output belongs
@@ -364,7 +365,7 @@ class AnnotationOutput(_PerInstance):
 # ─── catalogue: SignalOutput provisioning (design §5) ──────────────────────
 
 
-def _iter_signal_outputs(instances: Iterable[Any]) -> Iterable[tuple[str, "SignalOutput", Any]]:
+def _iter_signal_outputs(instances: Iterable[Any]) -> Iterable[tuple[str, SignalOutput, Any]]:
     """Yield ``(source, bound_output, instance)`` for every ``SignalOutput``
     class attribute declared on any of ``instances``' classes.
 
@@ -395,7 +396,7 @@ def declared_outputs(instance: Any) -> Iterable[tuple[str, SignalOutput]]:
             yield attr_name, getattr(instance, attr_name)
 
 
-def _read_previous_catalogue(door: "Door", catalogue_topic: str) -> dict:
+def _read_previous_catalogue(door: Door, catalogue_topic: str) -> dict:
     """This service's own previously-published ``DataTags`` payload dict,
     read back from KV, or ``{}`` if it has never published one — the memory
     that lets tag-id minting AND the republish guard both survive a
@@ -410,7 +411,7 @@ def _read_previous_catalogue(door: "Door", catalogue_topic: str) -> dict:
 
 def build_catalogue(
     instances: Iterable[Any],
-    door: "Door",
+    door: Door,
     *,
     node_id: str,
     mount: str,

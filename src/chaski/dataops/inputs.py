@@ -49,7 +49,8 @@ from __future__ import annotations
 import copy
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Iterable, Protocol, runtime_checkable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -91,7 +92,7 @@ class _PerInstance:
     """
 
     _attr_name: str | None = None
-    _owner: "Producer | None" = None
+    _owner: Producer | None = None
 
     def __set_name__(self, owner: type, name: str) -> None:
         self._attr_name = name
@@ -105,7 +106,7 @@ class _PerInstance:
         instance.__dict__[name] = bound
         return bound
 
-    def _runtime(self) -> "Runtime":
+    def _runtime(self) -> Runtime:
         owner = self._owner
         if owner is None:
             raise RuntimeError(

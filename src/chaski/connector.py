@@ -49,15 +49,17 @@ import logging
 import secrets
 import threading
 import time
+from collections.abc import Callable, Iterable, Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from math import isclose, isfinite, isnan
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Optional
+from types import MappingProxyType
+from typing import Any, NamedTuple
 
-from franzmq import Topic
-from franzmq.errors import PublishRejected, PublishTimeout
 from colca_data_contracts.payload import DataTag, Metric
 from colca_data_contracts.payload import Signal as SignalRecord
+from franzmq import Topic
+from franzmq.errors import PublishRejected, PublishTimeout
 
 from .service import Service
 
@@ -129,7 +131,7 @@ class Driver:
     #: Short label for logs and telemetry (``opcua``, ``modbus``, ``http``).
     protocol: str = "unknown"
     #: Merged into the service's ``_ServiceDetails.metadata``.
-    metadata: dict[str, Any] = {}
+    metadata: Mapping[str, Any] = MappingProxyType({})
     #: Whether the catalogue can only be built while connected to the
     #: source. True for browse-based protocols (OPC UA discovers nodes from
     #: the server). False for file-mapped ones (S7, Modbus) whose tag list
@@ -138,7 +140,7 @@ class Driver:
     #: before the machine is physically connected.
     catalogue_requires_connection: bool = True
 
-    def __init__(self, *, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(self, *, logger: logging.Logger | None = None) -> None:
         self.logger = logger or logging.getLogger(f"{__name__}.{type(self).__name__}")
 
     async def connect(self) -> None:
@@ -180,7 +182,7 @@ class Telemetry:
     def poll_completed(self, duration_s: float, *, overrun: bool) -> None: ...
 
 
-def is_equal(a: Any, b: Any, precision: Optional[int]) -> bool:
+def is_equal(a: Any, b: Any, precision: int | None) -> bool:
     """Value equality for change detection: two floats are equal within the
     Signal's precision (absolute tolerance ``10**-precision``); NaN equals
     NaN; everything else is ``==``."""
@@ -201,7 +203,7 @@ def round_to_precision(value: float, precision: int) -> float:
             return value
         quantum = Decimal(10) ** -precision
         return float(Decimal(value).quantize(quantum, rounding=ROUND_HALF_UP))
-    except Exception:  # noqa: BLE001 - a value Decimal cannot represent is published as-is
+    except Exception:
         return value
 
 
@@ -212,7 +214,7 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
     second liveness signal beside the one paho already tracks."""
 
     class HealthCheckHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - http.server's name
+        def do_GET(self) -> None:
             if self.path == "/is_healthy":
                 if is_healthy():
                     self.send_response(200)
@@ -226,7 +228,7 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
                 self.send_response(404)
                 self.end_headers()
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server's name
+        def log_message(self, format: str, *args: Any) -> None:
             pass
 
     return HealthCheckHandler
@@ -234,12 +236,12 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
 
 def start_health_server(port: int, is_healthy: Callable[[], bool]) -> HTTPServer:
     """Serve ``GET /is_healthy`` on ``port`` from a daemon thread."""
-    server = HTTPServer(("0.0.0.0", port), _health_handler(is_healthy))  # noqa: S104 - a container's own port
+    server = HTTPServer(("0.0.0.0", port), _health_handler(is_healthy))  # noqa: S104 - a container's own port  # nosec B104
     threading.Thread(target=server.serve_forever, daemon=True, name="colca-health").start()
     return server
 
 
-def run(build: Callable[[], "ConnectorService"], *, health_port: Optional[int] = 8888) -> None:
+def run(build: Callable[[], ConnectorService], *, health_port: int | None = 8888) -> None:
     """Build a connector INSIDE a running event loop and serve it until
     stopped, with the ``/is_healthy`` endpoint on ``health_port`` (None: no
     endpoint). A factory rather than an instance because some protocol
@@ -285,7 +287,7 @@ class ConnectorService(Service):
         reconnect_retries: int = 5,
         outage_reminder: float = 300.0,
         summary_interval: float = 60.0,
-        telemetry: Optional[Telemetry] = None,
+        telemetry: Telemetry | None = None,
         **service_kwargs: Any,
     ) -> None:
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
@@ -327,7 +329,7 @@ class ConnectorService(Service):
 
         self._source_reconnects_total = 0
         self._mqtt_reconnects_total = 0
-        self._mqtt_down_since: Optional[float] = None
+        self._mqtt_down_since: float | None = None
         self._mqtt_down_attempts = 0
         self._mqtt_down_last_report = 0.0
         self._summary_published = 0
@@ -349,7 +351,7 @@ class ConnectorService(Service):
 
     # -- lifecycle --------------------------------------------------------
 
-    def run(self, *, health_port: Optional[int] = 8888) -> None:
+    def run(self, *, health_port: int | None = 8888) -> None:
         """Serve until stopped: :func:`run` with this service."""
         run(lambda: self, health_port=health_port)
 
@@ -380,17 +382,17 @@ class ConnectorService(Service):
         try:
             await self.driver.connect()
             source_connected = True
-        except Exception as exc:  # noqa: BLE001 - the loop retries; the reason is logged
+        except Exception as exc:
             self._set_source_healthy(False)
             self._log.warning("Source connect failed during startup: %s — staying alive, polling loop will retry.", exc)
-        discovery: Optional[Discovery] = None
+        discovery: Discovery | None = None
         if source_connected or not self.driver.catalogue_requires_connection:
             try:
                 discovery = await self.driver.discover()
                 self._discovered = True
                 if source_connected:
                     self._set_source_healthy(True)
-            except Exception as exc:  # noqa: BLE001 - same: retried by the loop
+            except Exception as exc:
                 self._set_source_healthy(False)
                 self._log.warning(
                     "Source discovery failed during startup: %s — staying alive, polling loop will retry.", exc
@@ -405,21 +407,23 @@ class ConnectorService(Service):
         try:
             try:
                 await self.driver.close()
-            except Exception as exc:  # noqa: BLE001 - a half-open session from the failed connect
+            except Exception as exc:
                 self._log.debug("Pre-discovery close failed: %s", exc)
             await self.driver.connect()
             discovery = await self.driver.discover()
             self._declare_discovery(discovery)
             self._discovered = True
             self._set_source_healthy(True)
-            self._log.info("[STARTUP-RETRY] Source discovery recovered: %d tags catalogued.", len(self._catalogue))
-        except Exception as exc:  # noqa: BLE001 - reported, retried on the next interval
+            self._log.info(
+                "[STARTUP-RETRY] Source discovery recovered: %d tags catalogued.", len(self._started_catalogue)
+            )
+        except Exception as exc:
             self._set_source_healthy(False)
             self._log.warning(
                 "Source discovery retry failed: %s — next attempt in %.0fs.", exc, DISCOVERY_RETRY_SECONDS
             )
 
-    def _declare_discovery(self, discovery: Optional[Discovery]) -> None:
+    def _declare_discovery(self, discovery: Discovery | None) -> None:
         """The discovered tags plus the two synthetic ones become the
         catalogue (ids minted or reused there); the driver's handles are
         re-keyed by tag id for the poll loop."""
@@ -444,10 +448,10 @@ class ConnectorService(Service):
             meta={"synthetic": True, "purpose": "source-connectivity"},
         )
         with self._lock:
-            self._catalogue.declare(tags)
+            self._started_catalogue.declare(tags)
             self._handles = {}
             for source, handle in handles.items():
-                tag_id = self._catalogue.tag_id(source)
+                tag_id = self._started_catalogue.tag_id(source)
                 if tag_id is not None:
                     self._handles[tag_id] = handle
             self._update_targets()
@@ -474,7 +478,7 @@ class ConnectorService(Service):
         return {
             tag_id
             for source in (HEARTBEAT_TAG_SOURCE, IS_CONNECTED_TAG_SOURCE)
-            if (tag_id := self._catalogue.tag_id(source)) is not None
+            if (tag_id := self._started_catalogue.tag_id(source)) is not None
         }
 
     # -- the poll loop ----------------------------------------------------
@@ -490,7 +494,7 @@ class ConnectorService(Service):
         # What every metric of this iteration carries: unix seconds
         # (the contract's timestamp is a number; a datetime would encode
         # to an ISO string the door refuses).
-        loop_start_epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        loop_start_epoch = datetime.datetime.now(datetime.UTC).timestamp()
         try:
             if not self._discovered and self._now() >= self._next_discovery_retry:
                 await self._retry_discovery()
@@ -503,8 +507,8 @@ class ConnectorService(Service):
                 await self._sleep(self.interval)
                 return
 
-            heartbeat_id = self._catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
-            is_connected_id = self._catalogue.tag_id(IS_CONNECTED_TAG_SOURCE)
+            heartbeat_id = self._started_catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
+            is_connected_id = self._started_catalogue.tag_id(IS_CONNECTED_TAG_SOURCE)
             heartbeat_targets = [t for t in targets if t.signal.data_tag == heartbeat_id]
             protocol_targets = [t for t in targets if t.signal.data_tag not in (heartbeat_id, is_connected_id)]
 
@@ -512,7 +516,7 @@ class ConnectorService(Service):
             # A lost source must not cost the heartbeat: the connector is
             # alive even when its source is not, and the heartbeat is what
             # says so. Re-raised after publishing, for the reconnect path.
-            source_lost: Optional[SourceDisconnectedError] = None
+            source_lost: SourceDisconnectedError | None = None
             if protocol_targets:
                 try:
                     raw_batch = list(await self.driver.read(protocol_targets))
@@ -566,11 +570,11 @@ class ConnectorService(Service):
             self._report_mqtt_outage(exc)
             for retry in range(self.reconnect_retries):
                 try:
-                    self._client.reconnect()
+                    self._started_client.reconnect()
                     self._mqtt_reconnects_total += 1
                     self._report_mqtt_recovered()
                     break
-                except Exception:  # noqa: BLE001 - retried with backoff
+                except Exception:
                     await self._sleep(1 + (self.reconnect_retries - retry) * 5)
             await self._sleep(0.001)
             return
@@ -598,7 +602,7 @@ class ConnectorService(Service):
                 self._log.info("Reconnecting to source (attempt %d/%d)", retry + 1, self.reconnect_retries)
                 try:
                     await self.driver.close()
-                except Exception as exc:  # noqa: BLE001 - closing a dead session may fail
+                except Exception as exc:
                     self._log.warning("Error closing source: %s", exc)
                 await self.driver.connect()
                 # Not source_healthy=1 here: connect() succeeding is not
@@ -606,7 +610,7 @@ class ConnectorService(Service):
                 # read sets it once the channel actually answers.
                 self._source_reconnects_total += 1
                 return
-            except Exception:  # noqa: BLE001 - retried with backoff
+            except Exception:
                 # SystemRandom jitter: security-independent, but it also makes
                 # the delay unpredictable to a peer forcing reconnects.
                 delay = 1 + (self.reconnect_retries - retry) * 5 + secrets.randbelow(501) / 1000
@@ -638,9 +642,9 @@ class ConnectorService(Service):
             prepared = self._catalogue_to_publish()
         if prepared is None:
             return
-        if not self._client.is_connected():
+        if not self._started_client.is_connected():
             raise MqttDisconnectedError("MQTT client not connected (checked before the catalogue publish).")
-        payload, revision = prepared
+        payload, _ = prepared
         try:
             self._publish_catalogue(prepared)
         except PublishRejected as exc:
@@ -649,7 +653,7 @@ class ConnectorService(Service):
         except (ConnectionError, PublishTimeout) as exc:
             # The broker is gone, not slow: the loop's outage path owns this.
             raise MqttDisconnectedError(str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - reported; retried next iteration
+        except Exception as exc:
             self._log.exception("Failed to publish the catalogue: %s", exc)
             return
         self._log.info(
@@ -696,7 +700,7 @@ class ConnectorService(Service):
         if not targets:
             return
         state = self._source_healthy
-        timestamp = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        timestamp = datetime.datetime.now(datetime.UTC).timestamp()
         for target in targets:
             key = str(target.topic)
             if self._is_connected_published.get(key) == state:
@@ -704,7 +708,7 @@ class ConnectorService(Service):
             metric = Metric(value=state, timestamp=timestamp, signal_id=target.signal.id)
             try:
                 self._client.publish(target.topic, metric, qos=1)
-            except Exception as exc:  # noqa: BLE001 - left for the next poll to retry
+            except Exception as exc:
                 self._log.warning("[IS_CONNECTED] publish failed for %s, will retry: %s", key, exc)
                 continue
             self._is_connected_published[key] = state
@@ -758,7 +762,7 @@ class ConnectorService(Service):
                 # failure.
                 self._buffer_pending(batch[index:])
                 raise MqttDisconnectedError(str(exc)) from exc
-            except Exception as exc:  # noqa: BLE001 - one metric's failure is not the batch's
+            except Exception as exc:
                 self._log.error("Publish error to %s: %s", topic, exc)
 
     # -- outage reporting -------------------------------------------------
@@ -803,13 +807,13 @@ class ConnectorService(Service):
     async def _teardown(self) -> None:
         try:
             self.close()
-        except Exception:  # noqa: BLE001 - shutdown must reach the driver regardless
+        except Exception:
             self._log.exception("Error during MQTT teardown")
         finally:
             self.telemetry.broker_healthy(False)
         try:
             await self.driver.close()
-        except Exception:  # noqa: BLE001 - best effort
+        except Exception:
             self._log.exception("Error during source teardown")
         finally:
             self.telemetry.source_healthy(False)

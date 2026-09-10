@@ -79,7 +79,7 @@ class FakeDoor:
     def queue(self, page: Page) -> None:
         self._pages.append(page)
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
         self.fetch_calls.append({"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids})
         if self._pages:
             return self._pages.pop(0)

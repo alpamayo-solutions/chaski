@@ -20,8 +20,8 @@ whichever event arrives first.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -58,14 +58,15 @@ class OnMetricSpec:
 
 # Methods carry ``__colca_triggers__: list[CronSpec | IntervalSpec | OnMetricSpec]`` once decorated.
 TriggerSpec = CronSpec | IntervalSpec | OnMetricSpec
+_TRIGGERS_ATTR = "__colca_triggers__"
 
 
 def _attach(method: Callable, spec: TriggerSpec) -> Callable:
     """Append a trigger spec to the method's marker list (creating it on first use)."""
-    existing = getattr(method, "__colca_triggers__", None)
+    existing = getattr(method, _TRIGGERS_ATTR, None)
     if existing is None:
         existing = []
-        setattr(method, "__colca_triggers__", existing)
+        setattr(method, _TRIGGERS_ATTR, existing)
     existing.append(spec)
     return method
 

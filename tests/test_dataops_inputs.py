@@ -232,7 +232,7 @@ def test_validate_windows_raises_named_error_over_retention():
     assert "ThirtyDayProducer" in message
     assert "my_input" in message
     assert "part_counter" in message
-    assert str(int(30 * 86400)) in message
+    assert str(30 * 86400) in message
     assert str(int(retention_s)) in message
 
 

@@ -16,13 +16,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
-from dataops_fakes import run_async
 from colca_data_contracts import container_resource_health_metrics
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import ServiceDetails
+from dataops_fakes import run_async
 
 from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_metric
 from chaski.door import KvEntry, Page, Record
@@ -56,7 +57,7 @@ class _FakeClient:
     def disconnect(self) -> None:
         pass
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions.append(str(topic))
 
     def message_callback_add(self, sub: str, callback) -> None:
@@ -65,10 +66,10 @@ class _FakeClient:
     def _handle_on_message(self, message) -> None:  # what ring_even_if_undecodable wraps
         pass
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         pass
 
 
@@ -78,7 +79,7 @@ class _FakeNodeDoor:
     the `_Signal` bound to its tag (autobind); the metrics stream serves one
     input record, once, from a real cursor table."""
 
-    instances: list["_FakeNodeDoor"] = []
+    instances: ClassVar[list[_FakeNodeDoor]] = []
 
     def __init__(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None) -> None:
         self.service = service
@@ -134,7 +135,7 @@ class _FakeNodeDoor:
                     )
                 )
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
         self.fetches.append((stream, cursor, signal_ids))
         position = self.cursors.get(cursor, 0)
         records = [
@@ -307,3 +308,9 @@ def test_add_refuses_a_non_producer_and_discover_adopts_a_package(tmp_path: Path
     assert [p.name for p in svc.producers] == ["p1"]
     assert svc.discover("userprods") == 0, "adopting the same package twice adds nothing"
     assert svc.discover("no.such.package") == 0
+
+
+def test_pending_uses_the_buffer_of_unbound_samples(tmp_path: Path) -> None:
+    # The SQLite buffer of a DataOpsService is its own attribute, not Service's buffer.
+    svc = DataOpsService("dataops", mount="site1", data_dir=tmp_path)
+    assert svc.pending() == []

@@ -47,8 +47,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable, Iterable
 from random import SystemRandom
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any
 
 import httpx
 
@@ -258,11 +259,7 @@ class Ingest:
     @staticmethod
     def _timestamp_of(record: Record) -> float:
         payload = record.payload
-        value: Any
-        if isinstance(payload, dict):
-            value = payload.get("timestamp")
-        else:
-            value = getattr(payload, "timestamp", None)
+        value: Any = payload.get("timestamp") if isinstance(payload, dict) else getattr(payload, "timestamp", None)
         return float(value) if value is not None else record.fallback_timestamp_s
 
     @staticmethod

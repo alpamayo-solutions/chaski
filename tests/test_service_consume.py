@@ -11,6 +11,7 @@ connection functions ``test_service_lifecycle.py`` uses; the HTTP side is
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
@@ -39,13 +40,13 @@ class _FakeClient:
     def disconnect(self) -> None:
         pass
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         pass
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         pass
 
 
@@ -70,7 +71,7 @@ class _FakeDoor:
     retained records; ``lwm`` (per stream) makes fetches below it report a
     gap like a pruned stream does."""
 
-    instances: list["_FakeDoor"] = []
+    instances: ClassVar[list[_FakeDoor]] = []
 
     def __init__(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None) -> None:
         self.base_url = base_url
@@ -87,7 +88,7 @@ class _FakeDoor:
     def close(self) -> None:
         self.closed = True
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
         self.calls.append(("fetch", stream, cursor, max, signal_ids))
         position = self.cursors.get((stream, cursor), 0)
         lwm = self.lwm.get(stream, 1)
@@ -97,10 +98,7 @@ class _FakeDoor:
                 stream=stream, from_offset=position + 1, to_offset=lwm - 1, first_ts=None, last_ts=None, approx=False
             )
         records = [r for r in self.streams.get(stream, []) if r.offset > position and r.offset >= lwm][:max]
-        if records:
-            next_offset = records[-1].offset + 1
-        else:
-            next_offset = position + 1 if position + 1 > lwm else lwm
+        next_offset = records[-1].offset + 1 if records else (position + 1 if position + 1 > lwm else lwm)
         return Page(records=records, next=next_offset, gap=gap)
 
     def ack(self, stream, cursor, offset) -> bool:
@@ -145,7 +143,7 @@ def _local_service(tmp_path: Path, monkeypatch, *, mount: str = "line1") -> Serv
 
 
 def _external_service(tmp_path: Path, monkeypatch) -> Service:
-    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")  # noqa: ARG005
+    monkeypatch.setattr("chaski.service._read_node_id", lambda url, timeout=10.0: "n-ext")
     monkeypatch.setattr("chaski.service._connect_external_mqtt", lambda *a, **k: _FakeClient())
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
     return Service("erp-bridge", "site1/erp", node="https://edge1.example", state_dir=tmp_path).start()
@@ -175,9 +173,9 @@ def test_external_service_opens_the_published_door_with_its_pinned_certificate(t
 
 def test_stream_and_kv_require_start(tmp_path, fake_door):
     svc = Service("erp-bridge", "line1", state_dir=tmp_path)
-    with pytest.raises(RuntimeError, match="start\\(\\).*stream"):
+    with pytest.raises(RuntimeError, match=r"start\(\).*stream"):
         svc.stream("annotations")
-    with pytest.raises(RuntimeError, match="start\\(\\).*kv"):
+    with pytest.raises(RuntimeError, match=r"start\(\).*kv"):
         svc.kv()
 
 

@@ -10,9 +10,9 @@ on the very next call.
 from __future__ import annotations
 
 import pytest
-from chaski.door import KvEntry
 
 from chaski.dataops import resolve
+from chaski.door import KvEntry
 
 
 def _entry(topic: str, payload: dict | None) -> KvEntry:
@@ -179,9 +179,9 @@ def test_a_pass_that_cannot_read_is_not_fatal():
 
     door = RefusingDoor([])
 
-    with resolve.one_pass(door):  # must not raise
-        with pytest.raises(RuntimeError):  # ... and the resolver still reports it
-            resolve.resolve_signal(door, "heartbeat")
+    # The pass itself must not raise, and the resolver still reports the failure.
+    with resolve.one_pass(door), pytest.raises(RuntimeError):
+        resolve.resolve_signal(door, "heartbeat")
 
 
 def test_a_nested_pass_reuses_the_outer_read():

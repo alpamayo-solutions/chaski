@@ -41,7 +41,7 @@ import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import httpx
 
@@ -178,7 +178,7 @@ class Door:
         service: str,
         *,
         timeout: float = 10.0,
-        cert: Optional[tuple[Path, Path]] = None,
+        cert: tuple[Path, Path] | None = None,
     ) -> None:
         self._service = service
         kwargs: dict[str, Any] = {
@@ -193,7 +193,7 @@ class Door:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "Door":
+    def __enter__(self) -> Door:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -215,7 +215,11 @@ class Door:
         sent as repeated ``signal_id`` query params and is valid only when
         ``stream == "metrics"`` (the door rejects it otherwise).
         """
-        params: list[tuple[str, str]] = [("stream", stream), ("cursor", cursor), ("max", str(max))]
+        params: list[tuple[str, str | int | float | bool | None]] = [
+            ("stream", stream),
+            ("cursor", cursor),
+            ("max", str(max)),
+        ]
         for signal_id in signal_ids or []:
             params.append(("signal_id", signal_id))
         resp = self._client.get("/fetch", params=params)
@@ -255,7 +259,7 @@ class Door:
         self,
         prefix: str = "",
         *,
-        contract: Union[str, Iterable[str], None] = None,
+        contract: str | Iterable[str] | None = None,
     ) -> list[KvEntry]:
         """``GET /kv?prefix=...`` — a snapshot of retained KV entries under
         ``prefix``, every page followed until the door returns an empty
@@ -273,7 +277,7 @@ class Door:
         entries: list[KvEntry] = []
         after = ""
         while True:
-            params: list[tuple[str, str]] = [("prefix", prefix), ("max", "10000")]
+            params: list[tuple[str, str | int | float | bool | None]] = [("prefix", prefix), ("max", "10000")]
             params.extend(("contract", name) for name in contracts)
             if after:
                 params.append(("after", after))
@@ -391,7 +395,7 @@ class Stream:
         """One page from the cursor's stored position. Never moves the cursor."""
         return self._door.fetch(self.name, self.cursor, max=self._max, signal_ids=self._signal_ids)
 
-    def ack(self, upto: Union[Record, int]) -> bool:
+    def ack(self, upto: Record | int) -> bool:
         """Ack ``upto`` (a record, or its offset) as the last PROCESSED
         position. Returns whether the cursor moved."""
         offset = upto.offset if isinstance(upto, Record) else int(upto)
@@ -429,7 +433,7 @@ class Stream:
                 return
             self._door.ack(self.name, self.cursor, ack_offset)
 
-    def follow(self, *, poll_interval: float = 1.0, stop: Optional[threading.Event] = None) -> Iterator[Record]:
+    def follow(self, *, poll_interval: float = 1.0, stop: threading.Event | None = None) -> Iterator[Record]:
         """:meth:`drain` forever — after an empty page, sleep ``poll_interval``
         (waking early when ``stop`` is set) and drain again. Ends when
         ``stop`` is set."""

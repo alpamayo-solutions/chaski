@@ -48,6 +48,8 @@ lint = [
   "ruff==0.16.6",
   "bandit==1.9.4",
   "mypy==2.3.1",
+  "pandas-stubs==3.0.5.260730",
+  "types-PyYAML==6.0.12.20260906",
 ]
 
 # Development against a colca checkout next to this one.
@@ -70,3 +72,25 @@ target-version = "py311"
 line-length = 120
 # The examples in Markdown are laid out by hand.
 extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "C4", "PIE", "RUF"]
+# Line length is the formatter's job.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.mypy]
+# numpy's stubs need 3.12 syntax; ruff keeps the code itself on 3.11.
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+# These publish no type information; colcad is only installed with the node extra.
+module = ["franzmq", "franzmq.*", "decouple", "apscheduler", "apscheduler.*", "colcad"]
+ignore_missing_imports = true

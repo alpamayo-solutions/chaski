@@ -85,7 +85,7 @@ async def serve(state: HealthState, port: int = PORT_DEFAULT) -> asyncio.Abstrac
                 b"Connection: close\r\n\r\n" + body
             )
             await writer.drain()
-        except Exception:  # noqa: BLE001 — a broken probe must not log-spam or crash
+        except Exception:
             log.debug("health request failed", exc_info=True)
         finally:
             writer.close()

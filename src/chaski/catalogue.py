@@ -30,11 +30,11 @@ content-hash guard implemented in both. There is one now.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Mapping, Optional
+from typing import Any
 
 import ulid as ulid_lib
-
 from colca_data_contracts.payload import DataTag, DataTags
 
 
@@ -96,7 +96,7 @@ class Catalogue:
         self._tags: dict[str, DataTag] = {}
         #: The revision (:meth:`revision`) the last successful publish
         #: carried, or the one seeded from the node's retained record.
-        self.last_published_revision: Optional[str] = None
+        self.last_published_revision: str | None = None
         #: Whether anything changed since the last publish decision. A
         #: dirty catalogue is hashed once and compared against
         #: ``last_published_revision``; a clean one is not hashed at all.
@@ -104,7 +104,7 @@ class Catalogue:
 
     # -- memory --------------------------------------------------------
 
-    def load_previous(self, payload: Optional[Mapping[str, Any]]) -> None:
+    def load_previous(self, payload: Mapping[str, Any] | None) -> None:
         """Seed from the retained ``_DataTags`` payload the node holds for
         this service (as ``GET /kv`` returns it: ``data_tags``, ``connector``,
         ``version``). Nothing to seed from is a valid first run."""
@@ -122,7 +122,7 @@ class Catalogue:
 
     # -- the two mutators ------------------------------------------------
 
-    def ensure(self, path: str, value: Any, unit: Optional[str] = None) -> tuple[str, bool]:
+    def ensure(self, path: str, value: Any, unit: str | None = None) -> tuple[str, bool]:
         """The ``publish()`` path: return ``(tag_id, changed)`` for ``path``,
         minting a tag the first time the path is seen or reviving a stale
         one. ``data_type`` is inferred from the first value; ``unit`` lands
@@ -203,17 +203,17 @@ class Catalogue:
 
     # -- reads -----------------------------------------------------------
 
-    def tag_id(self, source: str) -> Optional[str]:
+    def tag_id(self, source: str) -> str | None:
         tag = self._tags.get(source)
         return tag.id if tag else None
 
-    def source_for_tag(self, tag_id: str) -> Optional[str]:
+    def source_for_tag(self, tag_id: str) -> str | None:
         for source, tag in self._tags.items():
             if tag.id == tag_id:
                 return source
         return None
 
-    def tag(self, source: str) -> Optional[DataTag]:
+    def tag(self, source: str) -> DataTag | None:
         return self._tags.get(source)
 
     def __contains__(self, tag_id: object) -> bool:
@@ -228,7 +228,7 @@ class Catalogue:
     def payload(self) -> DataTags:
         return DataTags(data_tags=self.data_tags(), connector=self.connector)
 
-    def revision(self, payload: Optional[DataTags] = None) -> str:
+    def revision(self, payload: DataTags | None = None) -> str:
         """What the republish guard compares: the identity the record is
         published under plus the content hash of its tags. A re-registered
         service (new ULID, same tags) republishes; a restart that

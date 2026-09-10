@@ -25,7 +25,6 @@ from unittest.mock import patch
 
 import pytest
 from dataops_fakes import FakeDoor, FakeRuntime, run_async, signal_entry
-from chaski.door import Record
 
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
@@ -39,6 +38,7 @@ from chaski.dataops.service import (
     trim_buffer,
 )
 from chaski.dataops.triggers import every, on_metric
+from chaski.door import Record
 
 
 @pytest.fixture
@@ -530,13 +530,13 @@ def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
 
     # First pass resolves normally — denominator: proves resolution works
     # before the failure is introduced.
-    dispatch1, signal_ids1, unresolved1 = build_dispatch(runtime, instances)
+    _, signal_ids1, unresolved1 = build_dispatch(runtime, instances)
     assert signal_ids1 == ["sig-event"]
     assert unresolved1 == 0
 
     # KV starts refusing on the next pass's pinned read.
     door.fail = True
-    dispatch2, signal_ids2, unresolved2 = build_dispatch(runtime, instances)
+    dispatch2, signal_ids2, _ = build_dispatch(runtime, instances)
 
     assert signal_ids2 == ["sig-event"], "an already-resolved signal must not be dropped by a failed pass"
     assert list(dispatch2.keys()) == ["sig-event"]

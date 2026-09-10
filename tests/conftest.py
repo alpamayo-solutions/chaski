@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import pytest
-
-from pathlib import Path
 import sys
+from pathlib import Path
 
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -34,7 +33,7 @@ class _NoNodeDoor:
     def close(self) -> None:
         pass
 
-    def kv(self, prefix: str = "", *, contract=None):  # noqa: ARG002
+    def kv(self, prefix: str = "", *, contract=None):
         return []
 
 

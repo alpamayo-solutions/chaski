@@ -124,13 +124,13 @@ def _build_index(entries: list[Any]) -> _Index:
     return _Index(elements, annotation_types, signals, bindings)
 
 
-_pinned_index: contextvars.ContextVar["_Index | None"] = contextvars.ContextVar(
+_pinned_index: contextvars.ContextVar[_Index | None] = contextvars.ContextVar(
     "colca_dataops_resolve_pinned_index", default=None
 )
 
 
 @contextmanager
-def one_pass(door: "Door") -> "Iterator[bool]":
+def one_pass(door: Door) -> Iterator[bool]:
     """Resolve everything inside this block from ONE KV read.
 
     For a caller resolving many names at once — a producer's declared inputs,
@@ -166,7 +166,7 @@ def one_pass(door: "Door") -> "Iterator[bool]":
         return
     try:
         index = _build_index(door.kv(""))
-    except Exception as exc:  # noqa: BLE001 — see the docstring: never fatal
+    except Exception as exc:
         log.debug("could not pin a KV snapshot for this pass (%s); resolving one at a time", exc)
         yield False
         return
@@ -177,18 +177,18 @@ def one_pass(door: "Door") -> "Iterator[bool]":
         _pinned_index.reset(token)
 
 
-def _snapshot(door: "Door") -> _Index:
+def _snapshot(door: Door) -> _Index:
     """The pass's pinned index, or a fresh read when no pass is active."""
     pinned = _pinned_index.get()
     return pinned if pinned is not None else _build_index(door.kv(""))
 
 
-def resolve_system_element(door: "Door", name: str) -> str | None:
+def resolve_system_element(door: Door, name: str) -> str | None:
     """Return a SystemElement's ULID by exact name match, or ``None``."""
     return _snapshot(door).element_id_by_name.get(name)
 
 
-def resolve_signal(door: "Door", name: str, system_element_name: str | None = None) -> str | None:
+def resolve_signal(door: Door, name: str, system_element_name: str | None = None) -> str | None:
     """Return a Signal's ULID by ``(name, system_element_name)``, or ``None``.
 
     Scoped to a SystemElement when given — required whenever the same
@@ -212,12 +212,12 @@ def resolve_signal(door: "Door", name: str, system_element_name: str | None = No
     return None
 
 
-def resolve_annotation_type(door: "Door", name: str) -> str | None:
+def resolve_annotation_type(door: Door, name: str) -> str | None:
     """Return an AnnotationType's ULID by exact name match, or ``None``."""
     return _snapshot(door).annotation_type_id_by_name.get(name)
 
 
-def resolve_output_binding(door: "Door", tag_id: str) -> tuple[str, str] | None:
+def resolve_output_binding(door: Door, tag_id: str) -> tuple[str, str] | None:
     """Find the retained ``_Signal`` record bound to one of THIS service's
     own catalogue tags (design §5), the same direction a connector binds:
     a ``_Signal``'s ``data_tag`` names a tag ULID from the publisher's own

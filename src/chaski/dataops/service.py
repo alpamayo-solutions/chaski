@@ -72,6 +72,7 @@ Startup order inside :meth:`DataOpsService.serve`:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import importlib
 import logging
@@ -79,9 +80,10 @@ import pkgutil
 import signal
 import sys
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, cast
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -428,7 +430,7 @@ async def reresolve_loop(
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
             return  # stop was set
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         # A resolution pass is a KV read over sync httpx — worker thread,
@@ -632,7 +634,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
         for signal_id in mini_signal_ids:
             df = buffer.window(signal_id, start, now)
             for row in df.itertuples():
-                rows.append((row.ts, signal_id, row.value))
+                rows.append((cast(float, row.ts), signal_id, row.value))
         rows.sort(key=lambda r: r[0])
 
         failures = 0
@@ -705,7 +707,7 @@ def ring_even_if_undecodable(client) -> None:
     def guarded(message):
         try:
             return typed_dispatch(message)
-        except Exception:  # noqa: BLE001 — anything the decode raises, by design
+        except Exception:
             log.warning(
                 "undecodable message on %s — ringing the doorbell without reading it",
                 getattr(message, "topic", "?"),
@@ -765,9 +767,9 @@ class DataOpsService(Service):
         mount: str = "",
         *,
         node: Any = None,
-        data_dir: Optional[Path] = None,
-        retention: Optional[float] = None,
-        historian: Optional[Historian] = None,
+        data_dir: Path | None = None,
+        retention: float | None = None,
+        historian: Historian | None = None,
         poll_interval: float = 1.0,
         trim_interval: float = 3600.0,
         health_port: int = health.PORT_DEFAULT,
@@ -781,14 +783,14 @@ class DataOpsService(Service):
         self._trim_interval_s = trim_interval
         self._health_port = health_port
         self._producers: dict[str, type[Producer]] = {}
-        self._buffer: Optional[Buffer] = None
-        self._ingest: Optional[Ingest] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._local_buffer: Buffer | None = None
+        self._ingest: Ingest | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.instances: list[Producer] = []
 
     # -- the run list ----------------------------------------------------
 
-    def add(self, producer_cls: type[Producer]) -> "DataOpsService":
+    def add(self, producer_cls: type[Producer]) -> DataOpsService:
         """Run ``producer_cls``. Explicit registration — the counterpart of
         :meth:`discover`. A second class with the same ``name`` replaces
         the first (one producer per name, the buffer keys watermarks by it).
@@ -845,15 +847,15 @@ class DataOpsService(Service):
     @property
     def buffer(self) -> Buffer:
         """The one local state, open after :meth:`start`."""
-        if self._buffer is None:
+        if self._local_buffer is None:
             raise RuntimeError(
                 "chaski.DataOpsService: call start() (or run()/serve()) before buffer — "
                 "the buffer is opened alongside the door"
             )
-        return self._buffer
+        return self._local_buffer
 
     @property
-    def historian(self) -> Optional[Historian]:
+    def historian(self) -> Historian | None:
         return self._historian
 
     @property
@@ -862,20 +864,20 @@ class DataOpsService(Service):
 
     # -- lifecycle -------------------------------------------------------
 
-    def start(self, *, connect_timeout: float = 10.0) -> "DataOpsService":
+    def start(self, *, connect_timeout: float = 10.0) -> DataOpsService:
         """The base class's :meth:`~chaski.Service.start`, then open the
         buffer. Idempotent."""
         super().start(connect_timeout=connect_timeout)
-        if self._buffer is None:
+        if self._local_buffer is None:
             self._data_dir.mkdir(parents=True, exist_ok=True)
-            self._buffer = Buffer(self._data_dir / "buffer.sqlite3")
+            self._local_buffer = Buffer(self._data_dir / "buffer.sqlite3")
         return self
 
     def close(self) -> None:
         super().close()
-        if self._buffer is not None:
-            self._buffer.close()
-            self._buffer = None
+        if self._local_buffer is not None:
+            self._local_buffer.close()
+            self._local_buffer = None
 
     def instantiate(self) -> list[Producer]:
         """Instantiate every added producer and attach it to this runtime —
@@ -898,15 +900,18 @@ class DataOpsService(Service):
         Returns the catalogue's ``{source: tag_id}``. Requires
         :meth:`start`."""
         door = self.door
+        node_id, service_ulid = self._node_id, self._service_id
+        if node_id is None or service_ulid is None:
+            raise RuntimeError("chaski.DataOpsService: call start() before bind_outputs()")
         result = build_catalogue(
             instances,
             door,
-            node_id=self._node_id,
+            node_id=node_id,
             mount=self._mount,
             service_name=self.name,
-            service_ulid=self._service_id,
+            service_ulid=service_ulid,
         )
-        bind_annotation_outputs(instances, node_id=self._node_id, mount=self._mount)
+        bind_annotation_outputs(instances, node_id=node_id, mount=self._mount)
         return result
 
     def _open_ingest_stream(self, cursor: str, signal_ids: list[str] | None) -> Stream:
@@ -925,7 +930,7 @@ class DataOpsService(Service):
         store quota reached"), filling the broker's log with a line about
         deliveries this service never needed guaranteed.
         """
-        client = self._client
+        client = self._started_client
         loop = self._loop
 
         def _on_doorbell(_client, _userdata, _raw_message) -> None:
@@ -938,7 +943,7 @@ class DataOpsService(Service):
         client.subscribe(DOORBELL_WILDCARD, qos=0)
         log.info("doorbell: subscribed %s at qos 0", DOORBELL_WILDCARD)
 
-    async def serve(self, stop: Optional[asyncio.Event] = None) -> None:
+    async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
         the blocking wrapper with signal handling."""
@@ -1012,7 +1017,7 @@ class DataOpsService(Service):
         #    separate act, so a producer routinely starts before the tree it
         #    reads exists.
         health_state = health.HealthState(producers=len(instances), generation=self.buffer.generation)
-        ingest_task: Optional[asyncio.Task] = None
+        ingest_task: asyncio.Task | None = None
         if signal_ids:
             ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
             health_state.ingest_task = ingest_task
@@ -1028,7 +1033,7 @@ class DataOpsService(Service):
                 health_state.ingest_task = ingest_task
                 log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
-        reresolve_task: Optional[asyncio.Task] = None
+        reresolve_task: asyncio.Task | None = None
         if unresolved:
             log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
             reresolve_task = asyncio.ensure_future(
@@ -1097,7 +1102,5 @@ class DataOpsService(Service):
                 loop.add_signal_handler(sig, stop.set)
             await self.serve(stop)
 
-        try:
+        with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_main())
-        except KeyboardInterrupt:
-            pass

@@ -551,7 +551,7 @@ def test_a_crashing_binary_is_reported_as_crashed(tmp_path):
     wrapper.chmod(0o755)
     node = Node("fake", data_dir=tmp_path / "n", binary=str(wrapper))
 
-    with pytest.raises((RuntimeError, TimeoutError), match="boom|exit|healthy"):
+    with pytest.raises((RuntimeError, TimeoutError), match=r"boom|exit|healthy"):
         node.start(timeout=5.0)
 
 

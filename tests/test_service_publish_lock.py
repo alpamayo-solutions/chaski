@@ -25,9 +25,9 @@ from pathlib import Path
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
-from franzmq import Topic
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import DataTags, Metric, Signal
+from franzmq import Topic
 
 from chaski.service import Service
 
@@ -69,15 +69,15 @@ class _NetworkThreadClient:
     def disconnect(self) -> None:
         pass
 
-    def subscribe(self, topic, qos: int = 0, callback=None) -> None:  # noqa: ARG002
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
-    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True):  # noqa: ARG002
+    def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True):
         self.published.append((str(topic), payload))
         if wait:
             self._await_network_thread(str(topic))
 
-    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:  # noqa: ARG002
+    def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         self.tombstoned.append(str(topic))
         if wait:
             self._await_network_thread(str(topic))
@@ -208,7 +208,7 @@ def test_the_lock_is_free_while_a_publish_waits(service):
     taken = threading.Event()
 
     def grab_the_lock() -> None:
-        with svc._lock:  # noqa: SLF001 - the rule under test IS this lock
+        with svc._lock:
             taken.set()
 
     original = client.publish

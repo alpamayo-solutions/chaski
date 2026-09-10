@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.server
 import json
 import threading
+from typing import ClassVar
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
@@ -26,8 +27,8 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     fresh handler instance per request.
     """
 
-    responses: dict[str, tuple[int, dict]] = {}
-    requests: list[dict] = []
+    responses: ClassVar[dict[str, tuple[int, dict]]] = {}
+    requests: ClassVar[list[dict]] = []
 
     def _record(self, method: str) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -59,11 +60,11 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler naming)
+    def do_GET(self) -> None:
         self._record("GET")
         self._respond()
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         self._record("POST")
         self._respond()
 

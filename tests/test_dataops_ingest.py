@@ -20,10 +20,10 @@ import logging
 import httpx
 import pytest
 from dataops_fakes import FakeDoor, run_async, stream_opener
-from chaski.door import Gap, Page, Record
 
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.ingest import Ingest, cursor_name
+from chaski.door import Gap, Page, Record
 
 CURSOR_PREFIX = "c/dataops/"
 
@@ -374,7 +374,7 @@ class FlakyDoor(FakeDoor):
         super().__init__()
         self._fail_remaining = fail_times
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
         if self._fail_remaining > 0:
             self._fail_remaining -= 1
             self.fetch_calls.append({"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids})
@@ -412,7 +412,7 @@ async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
     which is what turns the health door 503."""
 
     class BrokenDoor(FakeDoor):
-        def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+        def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
             raise RuntimeError("not a transport error")
 
     ingest = _ingest(BrokenDoor(), buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
@@ -500,7 +500,7 @@ async def test_a_drain_runs_off_the_loop_so_timers_keep_firing(buffer):
     import time as time_mod
 
     class SlowDoor(FakeDoor):
-        def fetch(self, stream, cursor, *, max=1000, signal_ids=None):  # noqa: A002
+        def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
             time_mod.sleep(0.3)  # a synchronous door call, as in production
             return super().fetch(stream, cursor, max=max, signal_ids=signal_ids)
 

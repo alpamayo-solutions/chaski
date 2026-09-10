@@ -28,12 +28,12 @@ says what the operator of the PARENT does with it.
 from __future__ import annotations
 
 import json
-import os
 import logging
+import os
 import secrets
 import shutil
 import ssl
-import subprocess
+import subprocess  # colcad runs as a child process  # nosec B404
 import threading
 import time
 import urllib.error
@@ -42,7 +42,7 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import ulid as ulid_lib
 import yaml
@@ -86,7 +86,7 @@ class NodeStatus:
     ``None`` otherwise."""
 
     state: str
-    detail: Optional[str] = None
+    detail: str | None = None
 
 
 _COLCAD_BUNDLE_ENV = "COLCAD_CONTRACTS_BUNDLE"
@@ -103,7 +103,7 @@ def _resolve_contracts_bundle() -> str:
     if override:
         return override
     try:
-        from colcad import BUNDLE_PATH  # type: ignore[import-not-found]
+        from colcad import BUNDLE_PATH
     except ImportError:
         BUNDLE_PATH = None
     if BUNDLE_PATH is not None and Path(BUNDLE_PATH).exists():
@@ -127,7 +127,7 @@ def _resolve_colcad_binary() -> str:
     if override:
         return override
     try:
-        from colcad import BINARY_PATH  # type: ignore[import-not-found]
+        from colcad import BINARY_PATH
 
         # A locally path-sourced colcad (dev/lock resolution only —
         # see pyproject.toml [tool.uv.sources]) imports
@@ -165,8 +165,10 @@ def _fetch_json(url: str, timeout: float) -> dict:
     """GET url and decode its JSON body. Module-level so tests can monkeypatch
     it instead of running a real parent — the TOFU flow below is the only
     caller."""
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"chaski.Node: {url!r} is not an http(s) URL")
     context = _insecure_ssl_context() if url.startswith("https://") else None
-    with urllib.request.urlopen(url, timeout=timeout, context=context) as response:  # noqa: S310
+    with urllib.request.urlopen(url, timeout=timeout, context=context) as response:  # noqa: S310  # nosec B310
         return json.load(response)
 
 
@@ -238,12 +240,12 @@ class Node:
         self,
         name: str,
         *,
-        parent: Optional[Union[str, tuple[str, str]]] = None,
-        data_dir: Optional[Union[str, Path]] = None,
-        retention: Optional[str] = None,
+        parent: str | tuple[str, str] | None = None,
+        data_dir: str | Path | None = None,
+        retention: str | None = None,
         log_level: str = "info",
-        binary: Optional[str] = None,
-        contracts_bundle: Optional[str] = None,
+        binary: str | None = None,
+        contracts_bundle: str | None = None,
     ) -> None:
         """``parent`` is ``None`` (root / not yet enrolled), a bare URL
         (trust-on-first-use), or ``(url, pubkey)`` (an explicit pin — see the
@@ -258,33 +260,33 @@ class Node:
         self._binary = binary
         self._contracts_bundle = contracts_bundle
 
-        self._process: Optional[subprocess.Popen] = None
-        self.ulid: Optional[str] = None
-        self.pubkey: Optional[str] = None
-        self.admin_token: Optional[str] = None
+        self._process: subprocess.Popen | None = None
+        self.ulid: str | None = None
+        self.pubkey: str | None = None
+        self.admin_token: str | None = None
         self._ports: dict[str, int] = {}
 
         # Resolved by _resolve_parent(), called from _write_config(): the
         # actual (url, pubkey) colcad's config carries, whatever shape the
         # constructor argument came in.
-        self.parent_url: Optional[str] = None
-        self.parent_pubkey: Optional[str] = None
+        self.parent_url: str | None = None
+        self.parent_pubkey: str | None = None
 
         # True once this process has observed uplink state "connected" —
         # the fact that turns a later "connecting" into "offline" rather
         # than "awaiting_enrollment" (status() below).
         self._ever_connected = False
 
-        self._log_writer: Optional[_RotatingLogWriter] = None
-        self._log_thread: Optional[threading.Thread] = None
-        self._log_tail: "deque[str]" = deque(maxlen=_LOG_TAIL_LINES)
+        self._log_writer: _RotatingLogWriter | None = None
+        self._log_thread: threading.Thread | None = None
+        self._log_tail: deque[str] = deque(maxlen=_LOG_TAIL_LINES)
 
     # -- parent trust (TOFU) ---------------------------------------------
 
     def _pin_path(self) -> Path:
         return self.data_dir / "parent.pin.json"
 
-    def _read_pin(self) -> Optional[dict[str, str]]:
+    def _read_pin(self) -> dict[str, str] | None:
         path = self._pin_path()
         if not path.exists():
             return None
@@ -297,7 +299,7 @@ class Node:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._pin_path().write_text(json.dumps({"url": url, "pubkey": pubkey}), encoding="utf-8")
 
-    def _resolve_parent(self) -> Optional[dict[str, str]]:
+    def _resolve_parent(self) -> dict[str, str] | None:
         """Turn the constructor's ``parent`` into the ``{url, pubkey}`` block
         colcad's config carries, applying TOFU for a bare URL. Sets
         ``self.parent_url``/``self.parent_pubkey`` as a side effect —
@@ -366,7 +368,7 @@ class Node:
     def _config_path(self) -> Path:
         return self.data_dir / "config.yaml"
 
-    def _load_existing(self) -> Optional[dict[str, Any]]:
+    def _load_existing(self) -> dict[str, Any] | None:
         path = self._config_path()
         if not path.exists():
             return None
@@ -414,7 +416,7 @@ class Node:
 
     # -- lifecycle -------------------------------------------------------
 
-    def start(self, *, timeout: float = 30.0) -> "Node":
+    def start(self, *, timeout: float = 30.0) -> Node:
         """Write config, launch colcad, and wait for its local /healthz."""
         if self._process is not None and self._process.poll() is None:
             return self
@@ -425,7 +427,7 @@ class Node:
         # nothing to read.
         self._addr_file().unlink(missing_ok=True)
         self._log_writer = _RotatingLogWriter(self.data_dir / "colcad.log")
-        self._process = subprocess.Popen(  # noqa: S603 - binary is resolved above, not shell-interpreted
+        self._process = subprocess.Popen(  # noqa: S603 - binary is resolved above, not shell-interpreted  # nosec B603
             [binary, str(self._config_path())],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -482,7 +484,7 @@ class Node:
     def _wait_healthy(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         url = f"http://127.0.0.1:{self._ports['api_local']}/healthz"
-        last_error: Optional[BaseException] = None
+        last_error: BaseException | None = None
         while time.monotonic() < deadline:
             if self._process is not None and self._process.poll() is not None:
                 raise RuntimeError(self._crash_message(self._process.returncode))
@@ -491,7 +493,7 @@ class Node:
                 self.pubkey = payload.get("pubkey")
                 self.ulid = payload.get("ulid") or self.ulid
                 return
-            except Exception as exc:  # noqa: BLE001 - retried until the deadline
+            except Exception as exc:
                 last_error = exc
             time.sleep(0.2)
         raise TimeoutError(f"colcad did not become healthy within {timeout}s: {last_error}")
@@ -513,7 +515,7 @@ class Node:
             self._log_writer.close()
             self._log_writer = None
 
-    def __enter__(self) -> "Node":
+    def __enter__(self) -> Node:
         return self.start()
 
     def __exit__(self, *exc_info: Any) -> None:
@@ -528,19 +530,19 @@ class Node:
         if self._process is not None and self._process.poll() is not None:
             raise NodeCrashed(self._crash_message(self._process.returncode))
 
-    def _crash_message(self, exit_code: Optional[int]) -> str:
+    def _crash_message(self, exit_code: int | None) -> str:
         tail = "\n".join(self._log_tail) or "(no log output captured)"
         return (
             f"chaski.Node {self.name!r}: colcad exited on its own (code {exit_code}). "
             f"Last {len(self._log_tail)} log line(s):\n{tail}"
         )
 
-    def _try_healthz(self) -> Optional[dict]:
+    def _try_healthz(self) -> dict | None:
         if not self._ports:
             return None
         try:
             return _fetch_json(f"http://127.0.0.1:{self._ports['api_local']}/healthz", 2.0)
-        except Exception:  # noqa: BLE001 - "not answering yet" is the caller's answer
+        except Exception:
             return None
 
     def status(self) -> NodeStatus:
@@ -582,7 +584,7 @@ class Node:
         than waiting out the deadline for a process that is never coming
         back."""
         deadline = time.monotonic() + timeout
-        last: Optional[NodeStatus] = None
+        last: NodeStatus | None = None
         while time.monotonic() < deadline:
             self._check_alive()
             last = self.status()
@@ -597,7 +599,7 @@ class Node:
 
     # -- placement ---------------------------------------------------------
 
-    def enroll_hint(self, *, mount: Optional[str] = None, token_env: str = "COLCA_ADMIN_TOKEN") -> str:
+    def enroll_hint(self, *, mount: str | None = None, token_env: str = "COLCA_ADMIN_TOKEN") -> str:  # noqa: S107 - an environment variable name
         """The one-liner the parent's operator runs once (gap 2): this
         node's API door is loopback-only by design (no inbound port needed —
         the uplink is outbound), so enrollment reads the pubkey locally
@@ -615,7 +617,7 @@ class Node:
             f'{{"ulid": "{self.ulid}", "kind": "node", "element": "<that element id>", "pubkey": "{self.pubkey}"}}'
         )
 
-    def retire_hint(self, *, token_env: str = "COLCA_ADMIN_TOKEN") -> str:
+    def retire_hint(self, *, token_env: str = "COLCA_ADMIN_TOKEN") -> str:  # noqa: S107 - an environment variable name
         """The one-liner that removes this node from its parent's registry.
         Deleting the local data directory (this node's identity and its
         durable streams) is deliberately the integrator's own act, not

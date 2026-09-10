@@ -12,8 +12,8 @@ from __future__ import annotations
 import json
 
 import pytest
-from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry
 from colca_data_contracts import derive_annotation_id
+from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry
 
 from chaski.dataops import outputs
 from chaski.dataops.base import Producer
