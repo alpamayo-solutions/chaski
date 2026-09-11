@@ -7,7 +7,7 @@ readme = "README.md"
 license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
-  "colca-data-contracts",
+  "colca-data-contracts>=0.1,<0.2",
   "franzmq==0.6.3",
   "paho-mqtt==2.1.0",
   "ulid-py>=1.1",
@@ -28,11 +28,10 @@ dataops = [
   "pandas>=2.1",
   "python-decouple>=3.8",
 ]
-# The colcad binary for this platform, from the Colca release you run against.
-# A local checkout resolves it to colca/pywheel, which has no binary; Node then
-# looks at COLCAD_BINARY and PATH.
+# The colcad binary for this platform. A local checkout resolves it to
+# colca/pywheel, which has no binary; Node then looks at COLCAD_BINARY and PATH.
 node = [
-  "colcad",
+  "colcad>=0.1,<0.2",
 ]
 test = [
   "pytest>=8.4,<10",
