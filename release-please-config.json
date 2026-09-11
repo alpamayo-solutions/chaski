@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "68629d66aa294e4b8dda79924c8b9f33b8dccd1f",
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "chaski",
+      "bump-minor-pre-major": true,
+      "release-as": "0.1.0",
+      "changelog-sections": [
+        { "type": "feat", "section": "Features" },
+        { "type": "fix", "section": "Fixes" },
+        { "type": "perf", "section": "Performance" },
+        { "type": "refactor", "section": "Changes" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "build", "section": "Build", "hidden": true },
+        { "type": "ci", "section": "CI", "hidden": true },
+        { "type": "chore", "section": "Chores", "hidden": true },
+        { "type": "style", "section": "Style", "hidden": true },
+        { "type": "test", "section": "Tests", "hidden": true }
+      ]
+    }
+  }
+}

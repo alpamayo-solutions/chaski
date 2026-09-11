@@ -56,10 +56,13 @@ the same check locally.
 
 ## Releases
 
-Maintainers release by pushing a tag `vX.Y.Z`, or `vX.Y.Z-rc.N` for a release
-candidate, on `main`. Once lint and tests have passed, CI creates a GitHub
-release with the wheel, the sdist, an SBOM, checksums, and notes built from
-the commit subjects.
+[release-please](https://github.com/googleapis/release-please) keeps a release
+pull request open that proposes the next version and the changelog, both taken
+from the commit subjects: `fix` bumps the patch version, `feat` and breaking
+changes bump the minor version. The major version never changes on its own;
+1.0 and later are set by hand. Merging that pull request tags the release, and
+CI then attaches the wheel, the sdist, an SBOM and checksums to the GitHub
+release.
 
 ## Contributor License Agreement
 
