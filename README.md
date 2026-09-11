@@ -4,6 +4,7 @@
 [![codeql](https://github.com/alpamayo-solutions/chaski/actions/workflows/codeql.yml/badge.svg)](https://github.com/alpamayo-solutions/chaski/actions/workflows/codeql.yml)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE.md)
 
+<!-- --8<-- [start:site] the Colca documentation site shows everything down to the end marker -->
 A Python SDK for [Colca](https://github.com/alpamayo-solutions/colca).
 
 - `Service` publishes data to a node: through its local door inside the
@@ -139,6 +140,7 @@ the parent is unreachable, and pins the parent's key on first contact.
 
 chaski uses the same topic root as every Colca process: `colca`, or whatever
 `COLCA_TOPIC_ROOT` names.
+<!-- --8<-- [end:site] -->
 
 ## Contributing and license
 
