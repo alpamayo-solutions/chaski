@@ -6,9 +6,12 @@ exists so that we can keep distributing the project under its current license,
 change to the future license the project already promises (Apache 2.0, see
 `LICENSE.md`), and defend the project if anyone challenges its origin.
 
-You accept it by signing it on your first pull request. If you contribute on
-behalf of your employer, make sure you are allowed to, or have your employer
-sign it as an entity.
+Unless you are a member of the GitHub organisation that owns this repository,
+you accept it by ticking the box "I agree to the Contributor License Agreement"
+in each pull request. For larger contributions, or when you contribute on behalf
+of your employer, we may also ask you to sign it and send it to
+info@alpamayo-solutions.com. If you contribute on behalf of your employer, make
+sure you are allowed to, or have your employer sign it as an entity.
 
 ## 1. Definitions
 
@@ -16,8 +19,8 @@ sign it as an entity.
 code, documentation, tests, examples or anything else, in a pull request, an
 issue, a patch or by any other means.
 
-"You" means the individual who signs, or the legal entity on whose behalf the
-signature is given, together with every entity it controls.
+"You" means the individual who accepts this agreement, or the legal entity on
+whose behalf it is accepted, together with every entity it controls.
 
 ## 2. Copyright license
 

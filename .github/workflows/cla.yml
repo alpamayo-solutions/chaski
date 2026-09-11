@@ -1,0 +1,39 @@
+name: cla
+
+# Contributors outside the organisation agree to CLA.md by ticking a box in the
+# pull request description. Members, collaborators and bots are not asked.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the CLA box
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          case "$ASSOCIATION" in
+            OWNER | MEMBER | COLLABORATOR)
+              echo "$AUTHOR belongs to the organisation ($ASSOCIATION), no confirmation needed."
+              exit 0
+              ;;
+          esac
+          if [[ "$AUTHOR" == *"[bot]" ]]; then
+            echo "$AUTHOR is a bot, no confirmation needed."
+            exit 0
+          fi
+          box='^[[:space:]]*[-*] \[x\] I agree to the Contributor License Agreement'
+          if printf '%s\n' "$BODY" | grep -qiE "$box"; then
+            echo "$AUTHOR agreed to the Contributor License Agreement."
+          else
+            echo "::error::Tick \"I agree to the Contributor License Agreement\" in the pull request description."
+            exit 1
+          fi
