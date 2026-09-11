@@ -62,7 +62,7 @@ from the commit subjects: `fix` bumps the patch version, `feat` and breaking
 changes bump the minor version. The major version never changes on its own;
 1.0 and later are set by hand. Merging that pull request tags the release, and
 CI then attaches the wheel, the sdist, an SBOM and checksums to the GitHub
-release.
+release and uploads the wheel and sdist to PyPI.
 
 ## Contributor License Agreement
 

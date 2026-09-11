@@ -19,25 +19,23 @@ roads of the Inca empire.
 
 ## Install
 
-chaski needs Python 3.11 or newer. Its wheel is attached to each
-[chaski release](https://github.com/alpamayo-solutions/chaski/releases), and the
-`colca-data-contracts` it builds on to each
-[Colca release](https://github.com/alpamayo-solutions/colca/releases):
+chaski needs Python 3.11 or newer:
 
 ```bash
-pip install colca_data_contracts-<version>-py3-none-any.whl chaski-<version>-py3-none-any.whl
+pip install chaski
 ```
 
-Or straight from git:
+Add the `dataops` extra for `DataOpsService`, and the `node` extra for `Node`,
+which brings the `colcad` binary for your platform: `pip install "chaski[node]"`.
+Without it, `Node` looks for `colcad` on `PATH` or at `COLCAD_BINARY`.
+
+Each [release](https://github.com/alpamayo-solutions/chaski/releases) also
+carries the wheel and sdist, and the latest code installs straight from git:
 
 ```bash
 pip install "colca-data-contracts @ git+https://github.com/alpamayo-solutions/colca#subdirectory=contracts"
 pip install "chaski @ git+https://github.com/alpamayo-solutions/chaski"
 ```
-
-Add the `dataops` extra for `DataOpsService`. `Node` needs the `colcad` binary:
-install the `colcad` wheel for your platform from the Colca release, put
-`colcad` on `PATH`, or point `COLCAD_BINARY` at it.
 
 ## Publish data
 
