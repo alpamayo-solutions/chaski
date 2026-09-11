@@ -7,7 +7,6 @@
       "release-type": "simple",
       "package-name": "chaski",
       "bump-minor-pre-major": true,
-      "release-as": "0.1.0",
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
         { "type": "fix", "section": "Fixes" },
