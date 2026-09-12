@@ -108,6 +108,29 @@ def import_package(package: str) -> list[str]:
     return names
 
 
+def _claim_producers_built_in(module_names: Iterable[str]) -> None:
+    """Point a producer built with ``type()`` at the module that holds it.
+
+    Such a class names the module that made the call as its own (``abc``, for
+    ``Producer``'s metaclass), so discovery would skip it and its code hash
+    would cover the wrong source.
+    """
+    for module_name in module_names:
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for value in list(vars(module).values()):
+            if isinstance(value, type) and issubclass(value, Producer) and not _held_by_own_module(value):
+                value.__module__ = module_name
+
+
+def _held_by_own_module(cls: type) -> bool:
+    obj: Any = sys.modules.get(cls.__module__)
+    for part in cls.__qualname__.split("."):
+        obj = getattr(obj, part, None)
+    return obj is cls
+
+
 def import_directory(path: Path) -> list[str]:
     """Import every top-level ``*.py`` under ``path`` so its ``Producer``
     subclasses register. Returns the imported module names.
@@ -640,6 +663,7 @@ class DataOpsService(Service):
         """Import ``package`` (and every submodule under it) and run every
         concrete producer it defines. Returns how many were added."""
         modules = set(import_package(package))
+        _claim_producers_built_in(modules)
         return self._adopt(lambda cls: cls.__module__ in modules or cls.__module__.startswith(f"{package}."))
 
     def discover_directory(self, path: Path) -> int:
@@ -647,6 +671,7 @@ class DataOpsService(Service):
         :func:`import_directory`) and run every concrete producer those
         files define. Returns how many were added."""
         modules = set(import_directory(path))
+        _claim_producers_built_in(modules)
         return self._adopt(lambda cls: cls.__module__ in modules)
 
     def _adopt(self, owned: Callable[[type[Producer]], bool]) -> int:

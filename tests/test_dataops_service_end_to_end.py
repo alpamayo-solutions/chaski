@@ -303,6 +303,28 @@ def test_add_refuses_a_non_producer_and_discover_adopts_a_package(tmp_path: Path
     assert svc.discover("no.such.package") == 0
 
 
+def test_discover_adopts_a_producer_built_with_type(tmp_path: Path, monkeypatch):
+    # A class built by calling the metaclass names abc as its module. Discovery
+    # must still find it, and its code hash must cover the module holding it.
+    from chaski.dataops.codehash import compute_code_hash
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "builtprods.py").write_text(
+        "from chaski.dataops import Producer, every\n"
+        "async def tick(self):\n"
+        "    pass\n"
+        "Built = type(Producer)('Built', (Producer,), {\n"
+        "    'name': 'built', 'system_element_name': 'se', 'tick': every('10s')(tick),\n"
+        "})\n"
+    )
+    svc = DataOpsService("dataops", state_dir=tmp_path / "state")
+    assert svc.discover("builtprods") == 1
+    (built,) = svc.producers
+    assert built.name == "built"
+    assert built.__module__ == "builtprods"
+    assert compute_code_hash(built)
+
+
 def test_pending_uses_the_buffer_of_unbound_samples(tmp_path: Path) -> None:
     # The SQLite buffer of a DataOpsService is its own attribute, not Service's buffer.
     svc = DataOpsService("dataops", mount="site1", data_dir=tmp_path)
