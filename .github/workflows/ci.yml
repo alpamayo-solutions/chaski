@@ -87,11 +87,30 @@ jobs:
         working-directory: chaski
         run: uv run --python ${{ matrix.python-version }} --extra test pytest
 
+  released-colca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        colca: ["0.1.9", "0.2.0"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          version: "0.11.17"
+      - name: Test published contracts and embedded broker dependencies
+        env:
+          COLCA_VERSION: ${{ matrix.colca }}
+        run: >-
+          uv run --python 3.12 --no-sources --extra test --extra node
+          --with "colca-data-contracts==$COLCA_VERSION"
+          --with "colcad==$COLCA_VERSION" pytest
+
   # Pushes to main and version tags build the package once lint and tests pass;
   # a version tag also publishes a release.
 
   package:
-    needs: [lint, test]
+    needs: [lint, test, released-colca]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10

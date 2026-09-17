@@ -202,10 +202,17 @@ def test_binary_resolution_prefers_explicit_argument_over_everything(monkeypatch
     assert node._binary == "/explicit/colcad"
 
 
-def test_binary_resolution_order_env_then_wheel_then_path(monkeypatch):
+def test_binary_resolution_order_env_then_wheel_then_path(monkeypatch, tmp_path):
     monkeypatch.delenv(node_mod._COLCAD_ENV, raising=False)
+    monkeypatch.setitem(sys.modules, "colcad", None)
     monkeypatch.setattr(node_mod.shutil, "which", lambda name: "/usr/local/bin/colcad")
     assert node_mod._resolve_colcad_binary() == "/usr/local/bin/colcad"
+
+    wheel = types.ModuleType("colcad")
+    wheel.BINARY_PATH = tmp_path / "colcad"
+    wheel.BINARY_PATH.touch()
+    monkeypatch.setitem(sys.modules, "colcad", wheel)
+    assert node_mod._resolve_colcad_binary() == str(wheel.BINARY_PATH)
 
     monkeypatch.setenv(node_mod._COLCAD_ENV, "/from/env/colcad")
     assert node_mod._resolve_colcad_binary() == "/from/env/colcad"
@@ -225,6 +232,7 @@ def test_binary_resolution_falls_through_a_wheel_with_no_binary_populated(monkey
 
 def test_binary_resolution_failure_names_the_node_extra(monkeypatch):
     monkeypatch.delenv(node_mod._COLCAD_ENV, raising=False)
+    monkeypatch.setitem(sys.modules, "colcad", None)
     monkeypatch.setattr(node_mod.shutil, "which", lambda name: None)
     with pytest.raises(RuntimeError, match=r"chaski\[node\]"):
         node_mod._resolve_colcad_binary()
