@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/alpamayo-solutions/chaski/compare/v0.1.2...v0.2.0) (2026-09-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* run against colca 0.3 ([#6](https://github.com/alpamayo-solutions/chaski/issues/6))
+
+### Features
+
+* run against colca 0.3 ([#6](https://github.com/alpamayo-solutions/chaski/issues/6)) ([5c74a07](https://github.com/alpamayo-solutions/chaski/commit/5c74a07346fa580969348abd196f0f82b86118f2))
+
 ## [0.1.2](https://github.com/alpamayo-solutions/chaski/compare/v0.1.1...v0.1.2) (2026-09-12)
 
 
