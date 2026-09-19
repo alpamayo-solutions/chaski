@@ -51,8 +51,48 @@ class OnMetricSpec:
     input_name: str
 
 
-# Methods carry ``__colca_triggers__: list[CronSpec | IntervalSpec | OnMetricSpec]`` once decorated.
-TriggerSpec = CronSpec | IntervalSpec | OnMetricSpec
+@dataclass(frozen=True)
+class OnConstantSpec:
+    """Event-driven trigger: fire for every ``_Constant`` record at a
+    node-local path matching ``path_or_pattern``.
+
+    ``path_or_pattern`` is an MQTT topic filter over the node-local path: an
+    exact path (``"line1/operator/activeRecipeId"``) matches only itself;
+    ``+`` matches exactly one path segment and ``#`` matches it and
+    everything under it (``"catalog/#"``), the same wildcards any MQTT
+    subscription accepts. The node retains the current record at its own
+    topic, so subscribing also delivers whatever is already there — a
+    producer sees a constant that was set before it started without waiting
+    for a change.
+
+    The decorated method receives the decoded
+    :class:`colca_data_contracts.Constant`, or ``None`` when the record was
+    retired: an empty retained payload is the wire tombstone for "this path
+    has no value anymore", the same convention ``_Metric``/``_Signal`` use.
+    ``@on_constant`` decorators may stack on one method, like ``@on_metric``.
+    """
+
+    path_or_pattern: str
+
+
+@dataclass(frozen=True)
+class OnSignalSpec:
+    """Event-driven trigger: fire whenever a ``_Signal`` binding appears,
+    changes or disappears at a node-local path matching ``path_or_pattern`` —
+    an integration taking over a field, changing what it reads from, or
+    releasing it back to operator/catalog input. Same path/pattern semantics
+    as :class:`OnConstantSpec`.
+
+    The decorated method receives the decoded
+    :class:`colca_data_contracts.Signal`, or ``None`` when the binding was
+    retired (the wire tombstone).
+    """
+
+    path_or_pattern: str
+
+
+# Methods carry ``__colca_triggers__: list[TriggerSpec]`` once decorated.
+TriggerSpec = CronSpec | IntervalSpec | OnMetricSpec | OnConstantSpec | OnSignalSpec
 _TRIGGERS_ATTR = "__colca_triggers__"
 
 
@@ -154,5 +194,61 @@ def on_metric(input_name: str) -> Callable[[Callable], Callable]:
 
     def decorator(fn: Callable) -> Callable:
         return _attach(fn, OnMetricSpec(input_name=input_name))
+
+    return decorator
+
+
+def _check_path_or_pattern(path_or_pattern: str) -> str:
+    if not path_or_pattern or not isinstance(path_or_pattern, str):
+        raise ValueError(f"path_or_pattern must be a non-empty string, got {path_or_pattern!r}")
+    return path_or_pattern
+
+
+def on_constant(path_or_pattern: str) -> Callable[[Callable], Callable]:
+    """Fire whenever a ``_Constant`` record at ``path_or_pattern`` is written
+    or retired — an operator or catalog value chaski has no declared-input
+    abstraction for (a ``_Constant`` is not read as a windowed input the way
+    a ``_Signal``'s ``_Metric`` history is).
+
+    ``path_or_pattern`` is a node-local path, or an MQTT filter over one
+    (``+``/``#``) — see :class:`~chaski.dataops.triggers.OnConstantSpec`.
+    Stacks with other triggers, ``@on_constant`` included, so one method can
+    watch several paths.
+
+    Example::
+
+        class Recipe(Producer):
+            @on_constant("line1/operator/activeRecipeId")
+            @on_constant("catalog/recipes/#")
+            async def recompute(self, constant):
+                ...  # `constant` is None when the record was retired
+
+    Delivery is retained: subscribing also delivers whatever is already set,
+    so a producer sees today's operator/catalog state without waiting for
+    the next write.
+    """
+    spec = OnConstantSpec(path_or_pattern=_check_path_or_pattern(path_or_pattern))
+
+    def decorator(fn: Callable) -> Callable:
+        return _attach(fn, spec)
+
+    return decorator
+
+
+def on_signal(path_or_pattern: str) -> Callable[[Callable], Callable]:
+    """Fire whenever a ``_Signal`` binding at ``path_or_pattern`` appears,
+    changes or disappears — an integration taking over a field or releasing
+    it, which changes who owns a value without chaski ever seeing a new
+    ``_Metric``.
+
+    Same path/pattern and retained-delivery semantics as :func:`on_constant`;
+    see :class:`~chaski.dataops.triggers.OnSignalSpec`. The decorated method
+    receives the decoded ``Signal``, or ``None`` when the binding was
+    retired.
+    """
+    spec = OnSignalSpec(path_or_pattern=_check_path_or_pattern(path_or_pattern))
+
+    def decorator(fn: Callable) -> Callable:
+        return _attach(fn, spec)
 
     return decorator

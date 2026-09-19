@@ -1,11 +1,11 @@
 """Unit tests for Producer discovery, trigger metadata and the watermark."""
 
 import pytest
-from dataops_fakes import FakeDoor, FakeRuntime
+from dataops_fakes import FakeDoor, FakeRuntime, run_async
 
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
-from chaski.dataops.triggers import IntervalSpec, cron, every
+from chaski.dataops.triggers import IntervalSpec, OnConstantSpec, OnSignalSpec, cron, every, on_constant, on_signal
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +102,76 @@ def test_cron_rejects_invalid_expression():
         cron("0 6 * *")  # only 4 fields
     with pytest.raises(ValueError):
         cron("0 6 * * * *")  # 6 fields
+
+
+# ─── on_constant / on_signal ────────────────────────────────────────────────
+
+
+def test_on_constant_and_on_signal_attach_their_own_spec():
+    @on_constant("line1/operator/setpoint")
+    async def m1(self, constant):
+        pass
+
+    @on_signal("line1/temperature")
+    async def m2(self, signal):
+        pass
+
+    (spec1,) = m1.__colca_triggers__
+    (spec2,) = m2.__colca_triggers__
+    assert spec1 == OnConstantSpec(path_or_pattern="line1/operator/setpoint")
+    assert spec2 == OnSignalSpec(path_or_pattern="line1/temperature")
+
+
+def test_on_constant_and_on_signal_stack_like_on_metric():
+    class P(Producer):
+        name = "constant_signal_stack"
+        system_element_name = "SE-1"
+
+        @on_constant("a/b")
+        @on_constant("catalog/#")
+        @on_signal("a/temperature")
+        async def recompute(self, record):
+            pass
+
+    kinds = sorted(type(spec).__name__ for _method, spec in P._triggers)
+    assert kinds == ["OnConstantSpec", "OnConstantSpec", "OnSignalSpec"]
+
+
+def test_on_constant_rejects_an_empty_path():
+    with pytest.raises(ValueError):
+        on_constant("")
+    with pytest.raises(ValueError):
+        on_constant(None)  # type: ignore[arg-type]
+
+
+def test_on_signal_rejects_an_empty_path():
+    with pytest.raises(ValueError):
+        on_signal("")
+
+
+# ─── on_ready: the lifecycle hook between binding and the first trigger ────
+
+
+def test_on_ready_defaults_to_a_no_op():
+    inst = _make_producer("on_ready_default")
+    result = run_async(inst.on_ready)()  # must not raise
+    assert result is None
+
+
+@run_async
+async def test_on_ready_can_be_overridden():
+    calls = []
+
+    class P(Producer):
+        name = "on_ready_override"
+        system_element_name = "SE-1"
+
+        async def on_ready(self) -> None:
+            calls.append("ready")
+
+    inst = P()
+    await inst.on_ready()
+    assert calls == ["ready"]
 
 
 # ─── watermark ──────────────────────────────────────────────────────────────
