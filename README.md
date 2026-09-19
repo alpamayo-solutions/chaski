@@ -19,7 +19,7 @@ roads of the Inca empire.
 
 ## Install
 
-chaski needs Python 3.11 or newer:
+chaski needs Python 3.11 or newer and runs against Colca 0.3 up to 0.6:
 
 ```bash
 pip install chaski
