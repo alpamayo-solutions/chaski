@@ -21,6 +21,10 @@ producer runtime.
   ``_Annotation`` records.
 * **A code change replays**: :func:`replay_changed_producers`, keyed by
   :func:`~chaski.dataops.codehash.compute_code_hash`.
+* **``_Constant``/``_Signal`` are watched, not ingested**:
+  :mod:`chaski.dataops.watch` subscribes ``@on_constant``/``@on_signal``
+  triggers directly on the node's retained records — neither contract has a
+  stream to poll or buffer.
 
 Startup order inside :meth:`DataOpsService.serve`:
 
@@ -29,18 +33,21 @@ Startup order inside :meth:`DataOpsService.serve`:
     whose ``setup()`` raises is skipped with a logged reason
  3. publish the ``SignalOutput`` catalogue if it changed, and bind every
     output, ``AnnotationOutput`` included
- 4. check every input window against the broker's metrics retention
- 5. build the ``signal_id -> [handler]`` dispatch table and the set of input
+ 4. run every producer's ``on_ready()`` — outputs are bound, and no trigger
+    has fired yet, so this is where startup compute belongs
+ 5. check every input window against the broker's metrics retention
+ 6. build the ``signal_id -> [handler]`` dispatch table and the set of input
     signal ids
- 6. replay every producer whose code hash changed, a new one included: reset
+ 7. replay every producer whose code hash changed, a new one included: reset
     its watermark to the earliest buffered point of its inputs and feed the
     buffered records through the live handlers. Unchanged producers are left
     alone
- 7. retire the previous generation's ingest cursor, if one is known
- 8. start the ingest task, and a retry loop for inputs that did not resolve
- 9. ring the MQTT doorbell
- 10. schedule cron and interval ticks, and the periodic buffer trim
- 11. open the health door and block until ``stop``, then unwind in reverse
+ 8. retire the previous generation's ingest cursor, if one is known
+ 9. start the ingest task, and a retry loop for inputs that did not resolve
+ 10. ring the MQTT doorbell, and subscribe every ``@on_constant``/
+     ``@on_signal`` trigger (:mod:`chaski.dataops.watch`)
+ 11. schedule cron and interval ticks, and the periodic buffer trim
+ 12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 """
 
@@ -68,7 +75,7 @@ from colca_data_contracts import Metric, topic_prefix
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
 
-from . import codehash, health, resolve
+from . import codehash, health, resolve, watch
 from .base import Producer, Runtime
 from .buffer import Buffer
 from .ingest import Ingest
@@ -544,16 +551,29 @@ def _earliest_across(buffer: Buffer, signal_ids: Iterable[str]) -> float | None:
 
 
 def ring_even_if_undecodable(client) -> None:
-    """Keep the doorbell ringing for a message franzmq cannot decode.
+    """Make every subscription on ``client`` survive a message franzmq cannot
+    decode — the doorbell's own need, and equally
+    :mod:`chaski.dataops.watch`'s: a ``_Constant``/``_Signal`` tombstone (an
+    empty retained payload — the documented "this record was retired"
+    convention) is exactly the kind of message franzmq's typed decode was not
+    written to expect.
 
     franzmq decodes every inbound message on paho's network thread before
-    dispatching, and an undecodable one would kill that thread. The doorbell
-    never reads the payload, so on a decode failure the raw message goes to
-    the matching callbacks instead, with a warning naming the topic.
+    dispatching, and an undecodable one would kill that thread — every
+    subscription on this client, doorbell and typed alike, since one client
+    thread serves them all. On a decode failure the raw, undecoded message
+    goes to the matching callbacks instead (their own decoding, if any, is
+    on them), with a warning naming the topic.
+
+    Idempotent: patches ``client._handle_on_message`` once per client, so the
+    doorbell and :func:`chaski.dataops.watch.start` can both call this on the
+    same client without wrapping it twice.
     """
     from paho.mqtt.client import Client as PahoClient
 
     typed_dispatch = client._handle_on_message
+    if getattr(typed_dispatch, "_tolerates_undecodable", False):
+        return
     raw_dispatch = PahoClient._handle_on_message
 
     def guarded(message):
@@ -561,12 +581,13 @@ def ring_even_if_undecodable(client) -> None:
             return typed_dispatch(message)
         except Exception:
             log.warning(
-                "undecodable message on %s — ringing the doorbell without reading it",
+                "undecodable message on %s — dispatching it undecoded instead",
                 getattr(message, "topic", "?"),
                 exc_info=True,
             )
             return raw_dispatch(client, message)
 
+    guarded._tolerates_undecodable = True  # type: ignore[attr-defined]  # the idempotence marker itself
     client._handle_on_message = guarded
 
 
@@ -787,6 +808,20 @@ class DataOpsService(Service):
         client.subscribe(DOORBELL_WILDCARD, qos=0)
         log.info("doorbell: subscribed %s at qos 0", DOORBELL_WILDCARD)
 
+    def _watch_constants_and_signals(self, instances: list[Producer]) -> None:
+        """Subscribe every ``@on_constant``/``@on_signal`` trigger declared
+        across ``instances`` — see :mod:`chaski.dataops.watch`. A no-op when
+        nothing declared either."""
+        constant_triggers, signal_triggers = watch.gather_triggers(instances)
+        watch.start(
+            self._started_client,
+            cast(str, self._node_id),
+            self.door,
+            cast(asyncio.AbstractEventLoop, self._loop),
+            constant_triggers,
+            signal_triggers,
+        )
+
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
@@ -816,20 +851,29 @@ class DataOpsService(Service):
         # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs.
         self.bind_outputs(instances)
 
-        # 4) Refuse windows longer than the broker's retention without a historian.
+        # 4) Outputs are bound and no trigger has fired yet: producers do
+        #    startup compute here instead of retrying publish() on the
+        #    RuntimeError it raises before binding.
+        for instance in instances:
+            try:
+                await instance.on_ready()
+            except Exception:
+                log.exception("Producer %s on_ready() failed — its triggers are still wired", instance.name)
+
+        # 5) Refuse windows longer than the broker's retention without a historian.
         validate_windows(
             instances,
             retention_s=self.retention_s,
             historian_configured=self._historian is not None,
         )
 
-        # 5) The on_metric dispatch table and the declared input signal ids.
+        # 6) The on_metric dispatch table and the declared input signal ids.
         dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
-        # 6) Replay producers whose code changed.
+        # 7) Replay producers whose code changed.
         await replay_changed_producers(self, instances)
 
-        # 7) Retire the previous generation's cursor (if any) and build the
+        # 8) Retire the previous generation's cursor (if any) and build the
         #    ingest loop over this service's own consume lane.
         ingest = Ingest(
             self._open_ingest_stream,
@@ -844,7 +888,7 @@ class DataOpsService(Service):
         ingest.retire_previous_generation()
         self._ingest = ingest
 
-        # 8) Start ingest in the background and keep retrying unresolved inputs.
+        # 9) Start ingest in the background and keep retrying unresolved inputs.
         health_state = health.HealthState(producers=len(instances), generation=self.buffer.generation)
         ingest_task: asyncio.Task | None = None
         if signal_ids:
@@ -869,10 +913,11 @@ class DataOpsService(Service):
                 reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
             )
 
-        # 9) The doorbell.
+        # 10) The doorbell, and every @on_constant/@on_signal subscription.
         self._ring_doorbell()
+        self._watch_constants_and_signals(instances)
 
-        # 10) Schedule cron/interval triggers (everything except @on_metric),
+        # 11) Schedule cron/interval triggers (everything except @on_metric),
         #     plus the service's own periodic buffer trim.
         scheduler = AsyncIOScheduler()
         for instance in instances:
@@ -891,7 +936,7 @@ class DataOpsService(Service):
         scheduler.start()
         log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
 
-        # 11) The health door runs on this loop on purpose (see chaski.dataops.health).
+        # 12) The health door runs on this loop on purpose (see chaski.dataops.health).
         health_server = await health.serve(health_state, port=self._health_port)
 
         try:

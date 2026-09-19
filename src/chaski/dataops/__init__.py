@@ -17,7 +17,7 @@ from .ingest import Ingest
 from .inputs import Historian, SignalRangeInput, WindowExceedsRetentionError, validate_windows
 from .outputs import AnnotationOutput, SignalOutput, bind_annotation_outputs, build_catalogue
 from .service import DataOpsService, build_dispatch, import_directory, import_package
-from .triggers import cron, every, on_metric, parse_duration
+from .triggers import cron, every, on_constant, on_metric, on_signal, parse_duration
 
 __all__ = [
     "AnnotationOutput",
@@ -37,7 +37,9 @@ __all__ = [
     "every",
     "import_directory",
     "import_package",
+    "on_constant",
     "on_metric",
+    "on_signal",
     "parse_duration",
     "validate_windows",
 ]
