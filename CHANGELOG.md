@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/alpamayo-solutions/chaski/compare/v0.2.0...v0.2.1) (2026-09-19)
+
+
+### Fixes
+
+* a retired binding reaches the service instead of killing it ([#9](https://github.com/alpamayo-solutions/chaski/issues/9)) ([2599890](https://github.com/alpamayo-solutions/chaski/commit/2599890711df8b1174b5ca402ed296573574edf3))
+
 ## [0.2.0](https://github.com/alpamayo-solutions/chaski/compare/v0.1.2...v0.2.0) (2026-09-18)
 
 
