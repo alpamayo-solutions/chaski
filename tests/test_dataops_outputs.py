@@ -406,3 +406,48 @@ def test_a_refused_scan_idles_the_publish_instead_of_killing_the_tick():
         pass
     else:
         raise AssertionError("a non-429 refusal must propagate, not idle")
+
+
+def test_delete_removes_one_annotation_not_another_that_started_at_the_same_instant(buffer):
+    """Two machines' annotations from one producer start at the same instant:
+    clear_window over that instant would take out both, delete names one."""
+    door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    out = _bound_annotation_output(door, buffer)
+    press_a = out.write_interval(1000.0, value="jam", signal_ids=["sig-a"])
+    press_b = out.write_interval(1000.0, value="jam", signal_ids=["sig-b"])
+    assert press_a != press_b
+    door.published.clear()
+
+    deleted = out.delete(1000.0, signal_ids=["sig-a"])
+
+    assert deleted == press_a
+    assert len(door.published) == 1
+    topic, payload_json = door.published[0]
+    assert topic == f"colca/v1/_Annotation/{NODE_ID}/line1/press/downtime/{press_a}"
+    payload = json.loads(payload_json)
+    assert payload["annotation_id"] == press_a
+    assert payload["deleted"] is True
+    assert payload["signal_ids"] == ["sig-a"]
+
+
+def test_delete_needs_no_buffer_record_of_the_write(tmp_path):
+    """A producer that keeps no state deletes from the event alone: the id is
+    derived, so an emptied buffer (a new generation) still names it."""
+    door1 = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    b1 = Buffer(tmp_path / "first.sqlite3")
+    try:
+        written = _bound_annotation_output(door1, b1).write_interval(1000.0, value="jam", signal_ids=["sig-a"])
+    finally:
+        b1.close()
+
+    door2 = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    b2 = Buffer(tmp_path / "second.sqlite3")
+    try:
+        out = _bound_annotation_output(door2, b2)
+        assert out.clear_window(0.0, 2000.0) == 0, "the fresh buffer holds no record of the write"
+        deleted = out.delete(1000.0, signal_ids=["sig-a"])
+    finally:
+        b2.close()
+
+    assert deleted == written
+    assert json.loads(door2.published[-1][1])["annotation_id"] == written
