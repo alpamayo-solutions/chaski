@@ -81,7 +81,7 @@ from .buffer import Buffer
 from .ingest import Ingest
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import bind_annotation_outputs, build_catalogue, declared_outputs
-from .triggers import CronSpec, IntervalSpec, OnMetricSpec
+from .triggers import CronSpec, IntervalSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
 
@@ -195,7 +195,10 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
     """Wire each (method, cron-or-interval) pair onto the scheduler.
 
     ``OnMetricSpec`` triggers are not scheduled here; they are in the dispatch
-    table from :func:`build_dispatch`. Every job is wrapped by :func:`off_loop`.
+    table from :func:`build_dispatch`. ``OnConstantSpec``/``OnSignalSpec``
+    triggers are not scheduled here either; :func:`watch.gather_triggers`
+    subscribes them onto the constant/signal MQTT watch. Every job this
+    function DOES schedule is wrapped by :func:`off_loop`.
     """
     count = 0
     for method_name, spec in instance.__class__._triggers:
@@ -206,8 +209,8 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
         elif isinstance(spec, IntervalSpec):
             ap_trigger = IntervalTrigger(seconds=spec.seconds)
             kind = f"every({spec.seconds}s)"
-        elif isinstance(spec, OnMetricSpec):
-            continue  # handled by the ingest dispatch table
+        elif isinstance(spec, (OnMetricSpec, OnConstantSpec, OnSignalSpec)):
+            continue  # each owned and scheduled elsewhere (see docstring)
         else:
             log.warning("Unknown trigger spec %r on %s.%s — skipped", spec, instance.name, method_name)
             continue
