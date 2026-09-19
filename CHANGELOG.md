@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/alpamayo-solutions/chaski/compare/v0.2.1...v0.3.0) (2026-09-19)
+
+
+### Features
+
+* **dataops:** on_constant/on_signal triggers and an on_ready hook ([#11](https://github.com/alpamayo-solutions/chaski/issues/11)) ([d8d0db6](https://github.com/alpamayo-solutions/chaski/commit/d8d0db67eb119074f8dca05b97683c3691d8cac3))
+
 ## [0.2.1](https://github.com/alpamayo-solutions/chaski/compare/v0.2.0...v0.2.1) (2026-09-19)
 
 
