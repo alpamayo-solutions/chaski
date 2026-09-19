@@ -140,7 +140,30 @@ class Producer(ABC):
     # ------------------------------------------------------------------ lifecycle
 
     async def setup(self) -> None:  # noqa: B027 - optional hook
-        """Override to load initial state (e.g. cursor from DB). Default no-op."""
+        """Override to load initial state (e.g. cursor from DB). Default no-op.
+
+        Runs before this producer's ``SignalOutput``s are bound
+        (``DataOpsService.serve``'s own startup order) — a ``publish()``
+        called from here raises. Use :meth:`on_ready` for startup work that
+        needs to publish.
+        """
+
+    async def on_ready(self) -> None:  # noqa: B027 - optional hook
+        """Override for startup work that needs outputs already bound.
+        Default no-op.
+
+        Called once per run, after every producer's outputs are catalogued
+        and bound and before any trigger — ``@every``/``@cron``,
+        ``@on_metric``, ``@on_constant``, ``@on_signal`` — can fire. A
+        producer that wants to compute and publish once at startup does it
+        here instead of retrying ``publish()`` on the ``RuntimeError`` it
+        raises before binding, or racing its own first trigger.
+
+        An exception here is logged and does not stop this producer's
+        triggers from being wired; a producer whose startup compute may fail
+        should catch what it expects to fail and complain through its own
+        outputs, the way a trigger handler would.
+        """
 
     async def teardown(self) -> None:  # noqa: B027 - optional hook
         """Override for shutdown cleanup. Default no-op."""

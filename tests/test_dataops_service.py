@@ -11,6 +11,7 @@ A fake `Door` (KV only) stands in for resolution.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from unittest.mock import patch
@@ -27,9 +28,10 @@ from chaski.dataops.service import (
     decode_metric,
     make_handler,
     off_loop,
+    schedule_periodic,
     trim_buffer,
 )
-from chaski.dataops.triggers import every, on_metric
+from chaski.dataops.triggers import every, on_constant, on_metric, on_signal
 from chaski.door import Record
 
 
@@ -415,6 +417,47 @@ def test_a_periodic_tick_is_scheduled_as_a_plain_function_not_a_coroutine():
         assert "tick failed" in str(exc)
     else:
         raise AssertionError("a failing tick must propagate, not vanish")
+
+
+def test_schedule_periodic_ignores_on_constant_and_on_signal_specs_without_warning(caplog):
+    """`OnConstantSpec`/`OnSignalSpec` triggers are scheduled by
+    `watch.gather_triggers`, not here — `schedule_periodic` must skip them
+    silently, the same as it already silently skips `OnMetricSpec` (handled
+    by the ingest dispatch table), not log them as an unrecognised spec.
+
+    Regression for the dataops image logging "Unknown trigger spec
+    OnConstantSpec/OnSignalSpec ... skipped" at startup for every producer
+    using either decorator, even though `watch.gather_triggers` already
+    wires them up correctly — `schedule_periodic` just did not know about
+    the two spec types yet.
+    """
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    class _MixedTriggerProducer(Producer):
+        name = "mixed_trigger_test"
+        system_element_name = "SE-Mixed"
+
+        @every("10s")
+        async def tick(self) -> None:
+            pass
+
+        @on_constant("line1/operator/activeRecipeId")
+        async def on_recipe_changed(self, constant) -> None:
+            pass
+
+        @on_signal("line1/mas2/sta1/aggos/grit")
+        async def on_grit_binding_changed(self, signal) -> None:
+            pass
+
+    scheduler = AsyncIOScheduler()
+    instance = _MixedTriggerProducer()
+
+    with caplog.at_level(logging.WARNING, logger="chaski.dataops"):
+        count = schedule_periodic(scheduler, instance)
+
+    assert count == 1, "only the @every tick is this function's own job to schedule"
+    assert [job.id for job in scheduler.get_jobs()] == ["mixed_trigger_test.tick::every(10.0s)"]
+    assert "Unknown trigger spec" not in caplog.text
 
 
 # ─── timestamp fallback: colca's record.ts is milliseconds ───────────────

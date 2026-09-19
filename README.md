@@ -120,6 +120,38 @@ and read windows of buffered values (`self.temperature.fetch(start, end)`).
 When a producer's code changes, the service replays the window its inputs
 cover.
 
+`@on_constant`/`@on_signal` fire on an operator/catalog `_Constant` write or a
+`_Signal` binding appearing or disappearing — an integration taking over a
+field, or releasing it — neither of which is a `_Metric`, so `@on_metric`
+never sees them:
+
+```python
+from chaski.dataops import Producer, SignalOutput, on_constant, on_signal
+
+class Ownership(Producer):
+    name = "ownership"
+    system_element_name = "oven"
+
+    active_recipe = SignalOutput("activeRecipe", "string", "who set it and to what")
+
+    async def on_ready(self) -> None:
+        ...  # compute and publish once at startup; outputs are already bound here
+
+    @on_constant("oven/operator/activeRecipeId")
+    async def on_operator_write(self, constant) -> None:
+        ...  # `constant` is None when the record was retired
+
+    @on_signal("oven/temperature")
+    async def on_integration_binding(self, signal) -> None:
+        ...  # `signal` is None once the binding is released
+```
+
+`path_or_pattern` is a node-local path, or an MQTT filter over one (`+`/`#`);
+delivery is retained, so subscribing also delivers whatever is already set.
+`on_ready()` runs once per producer, after every output is bound and before
+any trigger — `@every`/`@cron`/`@on_metric`/`@on_constant`/`@on_signal` —
+can fire, for startup work that needs to publish.
+
 ## Run a node
 
 ```python

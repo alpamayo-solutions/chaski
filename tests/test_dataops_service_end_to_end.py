@@ -21,7 +21,7 @@ from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import ServiceDetails
 from dataops_fakes import run_async
 
-from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_metric
+from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_constant, on_metric, on_signal
 from chaski.door import KvEntry, Page, Record
 from chaski.service import Service
 
@@ -32,14 +32,25 @@ class _FakeReasonCode:
     is_failure = False
 
 
+class _FakeMessage:
+    """What franzmq hands a ``client.subscribe(..., callback=)`` callback: a
+    decoded payload (``None`` for a tombstone), never raw bytes."""
+
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+
 class _FakeClient:
     """franzmq.Client stand-in with the two paho-level attributes the
-    doorbell uses (``message_callback_add``, ``_handle_on_message``)."""
+    doorbell uses (``message_callback_add``, ``_handle_on_message``), plus
+    enough of ``subscribe(..., callback=)`` for ``chaski.dataops.watch`` to
+    register and fire a typed callback without a real MQTT broker."""
 
     def __init__(self) -> None:
         self.published: list[tuple[str, object]] = []
         self.subscriptions: list[str] = []
         self.callbacks: dict[str, object] = {}
+        self.typed_callbacks: dict[str, object] = {}
         self.on_connect = None
         self.node_id = None
 
@@ -55,6 +66,14 @@ class _FakeClient:
 
     def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions.append(str(topic))
+        if callback is not None:
+            self.typed_callbacks[str(topic)] = callback
+
+    def deliver(self, topic: str, payload: object) -> None:
+        """Simulate a retained/live delivery on ``topic`` to whatever was
+        subscribed there with a typed callback (``chaski.dataops.watch``'s
+        own subscription style) — ``payload=None`` is a tombstone."""
+        self.typed_callbacks[topic](_FakeMessage(payload))
 
     def message_callback_add(self, sub: str, callback) -> None:
         self.callbacks[sub] = callback
@@ -168,6 +187,30 @@ class Doubler(Producer):
     async def recompute(self, metric) -> None:
         self.doubled.publish(metric.value * 2, metric.timestamp)
         self.advance_watermark(metric.timestamp)
+
+
+class ReadyAndWatched(Producer):
+    """Exercises `on_ready` (publish at startup with no retry loop) and
+    `@on_constant`/`@on_signal` (no `@on_metric` equivalent exists for either)."""
+
+    name = "ready_and_watched"
+    system_element_name = "oven"
+
+    ready = SignalOutput("ready", "bool", "set once, from on_ready")
+    last_constant = SignalOutput("lastConstant", "string", "the constant's own value, or 'retired'")
+    last_signal = SignalOutput("lastSignal", "string", "the signal's own id, or 'retired'")
+
+    async def on_ready(self) -> None:
+        # Outputs are bound by the time this runs — no RuntimeError, no retry.
+        self.ready.publish(True)
+
+    @on_constant("oven/operator/setpoint")
+    async def on_setpoint(self, constant) -> None:
+        self.last_constant.publish("retired" if constant is None else str(constant.value))
+
+    @on_signal("oven/temperature")
+    async def on_temperature_signal(self, signal) -> None:
+        self.last_signal.publish("retired" if signal is None else signal.id)
 
 
 @pytest.fixture(autouse=True)
@@ -329,3 +372,104 @@ def test_pending_uses_the_buffer_of_unbound_samples(tmp_path: Path) -> None:
     # The SQLite buffer of a DataOpsService is its own attribute, not Service's buffer.
     svc = DataOpsService("dataops", mount="site1", data_dir=tmp_path)
     assert svc.pending() == []
+
+
+# ─── on_ready: startup compute with outputs already bound ──────────────────
+
+
+@run_async
+async def test_on_ready_runs_after_outputs_are_bound_with_no_retry_needed(tmp_path: Path, monkeypatch):
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc.add(ReadyAndWatched)
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: _FakeNodeDoor.instances and _FakeNodeDoor.instances[0].metrics())
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    door = _FakeNodeDoor.instances[0]
+    (ready_metric,) = [(t, p) for t, p in door.metrics() if t.endswith("/oven/ready")]
+    assert ready_metric[1]["value"] is True
+
+
+# ─── @on_constant / @on_signal: MQTT-driven, no stream involved ────────────
+
+
+@run_async
+async def test_on_constant_fires_on_write_and_sees_the_tombstone_as_none(tmp_path: Path, monkeypatch):
+    from colca_data_contracts.payload import Constant, ConstantDataType
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc.add(ReadyAndWatched)
+
+    topic = f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint"
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: topic in client.subscriptions)
+
+        client.deliver(
+            topic,
+            Constant(id="c-1", name="setpoint", data_type=ConstantDataType.FLOAT64, value=42.0),
+        )
+        await _poll_until(
+            lambda: any(t.endswith("/oven/lastConstant") for t, _ in _FakeNodeDoor.instances[0].metrics())
+        )
+        first = [p for t, p in _FakeNodeDoor.instances[0].metrics() if t.endswith("/oven/lastConstant")][-1]
+        assert first["value"] == "42.0"
+
+        client.deliver(topic, None)  # the wire tombstone: the constant was retired
+        await _poll_until(
+            lambda: (
+                [p for t, p in _FakeNodeDoor.instances[0].metrics() if t.endswith("/oven/lastConstant")][-1]["value"]
+                == "retired"
+            )
+        )
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    # Subscribed at qos=1, scoped to this service's own node — and never
+    # through the metrics stream: `ReadyAndWatched` declares no
+    # `SignalRangeInput`, so nothing was ever fetched at all.
+    assert f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint" in client.subscriptions
+    assert _FakeNodeDoor.instances[0].fetches == []
+
+
+@run_async
+async def test_on_signal_fires_on_binding_change_and_on_release(tmp_path: Path, monkeypatch):
+    from colca_data_contracts.payload import Signal as SignalRecord
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc.add(ReadyAndWatched)
+
+    topic = f"colca/v1/_Signal/{NODE_ID}/oven/temperature"
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: topic in client.subscriptions)
+
+        client.deliver(topic, SignalRecord(id="sig-bound", name="temperature"))
+        await _poll_until(lambda: any(t.endswith("/oven/lastSignal") for t, _ in _FakeNodeDoor.instances[0].metrics()))
+        bound = [p for t, p in _FakeNodeDoor.instances[0].metrics() if t.endswith("/oven/lastSignal")][-1]
+        assert bound["value"] == "sig-bound"
+
+        client.deliver(topic, None)  # an integration released the field
+        await _poll_until(
+            lambda: (
+                [p for t, p in _FakeNodeDoor.instances[0].metrics() if t.endswith("/oven/lastSignal")][-1]["value"]
+                == "retired"
+            )
+        )
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
