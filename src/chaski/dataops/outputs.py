@@ -13,7 +13,8 @@ Both publish through the local door, never MQTT directly and never a database.
 * ``AnnotationOutput``: publishes ``_Annotation`` records on the
   ``annotations`` stream. ``write_interval`` derives the id from
   ``(annotation_type_id, source, time_start, signal_ids)``, so publishing an
-  interval again updates it. ``clear_window`` publishes delete markers only for
+  interval again updates it, and ``delete`` with the same start and signals
+  removes it. ``clear_window`` publishes delete markers only for
   ids this output recorded emitting in the buffer, so a producer cannot delete
   annotations it did not write.
 
@@ -267,6 +268,36 @@ class AnnotationOutput(_PerInstance):
         runtime.door.publish(self._topic(annotation_id), payload.encode())
         runtime.buffer.record_emitted_annotation(source, annotation_id, ts_start)
         log.debug("AnnotationOutput[%s]: published %s @ %s..%s", self.annotation_name, annotation_id, ts_start, ts_end)
+        return annotation_id
+
+    def delete(self, time_start: Any, signal_ids: Iterable[str] | None = None) -> str:
+        """Publish a delete marker for the one annotation ``write_interval``
+        wrote for this ``time_start`` and signal set, and return its id.
+
+        The id is derived exactly as ``write_interval`` derives it, and this
+        output's own ``source`` is half of it, so only an annotation this
+        producer wrote can be named. Unlike ``clear_window`` it needs no
+        buffer record: a producer that keeps no state can delete an
+        annotation from the event that describes it, and one annotation is
+        not taken out with every other one that started in the same window.
+        """
+        runtime = self._runtime()
+        source = self._require_source()
+        type_id = self.type_id
+
+        ts_start = _epoch(time_start)
+        signals = list(signal_ids or [])
+        annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
+        payload = AnnotationPayload(
+            annotation_id=annotation_id,
+            annotation_type_id=type_id,
+            time_start=ts_start,
+            signal_ids=signals,
+            source=source,
+            deleted=True,
+        )
+        runtime.door.publish(self._topic(annotation_id), payload.encode())
+        log.debug("AnnotationOutput[%s]: deleted %s @ %s", self.annotation_name, annotation_id, ts_start)
         return annotation_id
 
     def clear_window(self, start: Any, end: Any) -> int:
