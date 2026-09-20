@@ -13,8 +13,10 @@ Both publish through the local door, never MQTT directly and never a database.
 * ``AnnotationOutput``: publishes ``_Annotation`` records on the
   ``annotations`` stream. ``write_interval`` derives the id from
   ``(annotation_type_id, source, time_start, signal_ids)``, so publishing an
-  interval again updates it, and ``delete`` with the same start and signals
-  removes it. ``clear_window`` publishes delete markers only for
+  interval again updates it, and ``delete`` removes it. Both also take the
+  ``annotation_id`` a write returned, which is how a producer keeping that id
+  updates an annotation whose start or signal set has moved since.
+  ``clear_window`` publishes delete markers only for
   ids this output recorded emitting in the buffer, so a producer cannot delete
   annotations it did not write.
 
@@ -240,12 +242,21 @@ class AnnotationOutput(_PerInstance):
         time_end: Any = None,
         value: Any = None,
         signal_ids: Iterable[str] | None = None,
+        annotation_id: str | None = None,
     ) -> str:
         """Publish (create or update) one annotation and return its id.
 
         The id is derived from ``(annotation_type_id, source, time_start,
         signal_ids)``, so publishing the same interval again, for example to
         set ``time_end``, updates it.
+
+        ``annotation_id`` addresses an annotation this output already wrote,
+        by the id that write returned, and is how a producer updates one
+        whose start or signal set has moved since — both are part of the
+        derivation, so re-deriving would name a different annotation and
+        leave the original as it was. A producer keeping the returned id
+        with whatever it is projecting (a session, an order) never has to
+        reproduce the derivation's inputs at all.
         """
         runtime = self._runtime()
         source = self._require_source()
@@ -254,7 +265,8 @@ class AnnotationOutput(_PerInstance):
         ts_end = _epoch(time_end) if time_end is not None else None
         signals = list(signal_ids or [])
         type_id = self.type_id
-        annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
+        if annotation_id is None:
+            annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
 
         payload = AnnotationPayload(
             annotation_id=annotation_id,
@@ -270,24 +282,36 @@ class AnnotationOutput(_PerInstance):
         log.debug("AnnotationOutput[%s]: published %s @ %s..%s", self.annotation_name, annotation_id, ts_start, ts_end)
         return annotation_id
 
-    def delete(self, time_start: Any, signal_ids: Iterable[str] | None = None) -> str:
-        """Publish a delete marker for the one annotation ``write_interval``
-        wrote for this ``time_start`` and signal set, and return its id.
+    def delete(
+        self,
+        time_start: Any = None,
+        signal_ids: Iterable[str] | None = None,
+        annotation_id: str | None = None,
+    ) -> str:
+        """Publish a delete marker for one annotation — the one
+        ``write_interval`` wrote for this ``time_start`` and signal set, or
+        the one ``annotation_id`` names — and return its id.
 
-        The id is derived exactly as ``write_interval`` derives it, and this
-        output's own ``source`` is half of it, so only an annotation this
-        producer wrote can be named. Unlike ``clear_window`` it needs no
-        buffer record: a producer that keeps no state can delete an
-        annotation from the event that describes it, and one annotation is
-        not taken out with every other one that started in the same window.
+        Deriving the id takes this output's own ``source`` as half of it, so
+        only an annotation this producer wrote can be named that way, and an
+        id it returned is its own by the same argument. Unlike
+        ``clear_window`` neither form needs a buffer record, and neither
+        takes out every other annotation that started in the same window.
         """
         runtime = self._runtime()
         source = self._require_source()
         type_id = self.type_id
 
-        ts_start = _epoch(time_start)
+        if time_start is None and annotation_id is None:
+            raise TypeError(
+                "AnnotationOutput.delete needs the annotation's time_start, or the annotation_id it was written under"
+            )
+        # A marker's own time_start is not read by any consumer — the id is
+        # the identity — so deleting by id need not know when it started.
+        ts_start = _epoch(time_start) if time_start is not None else 0.0
         signals = list(signal_ids or [])
-        annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
+        if annotation_id is None:
+            annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
         payload = AnnotationPayload(
             annotation_id=annotation_id,
             annotation_type_id=type_id,

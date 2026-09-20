@@ -451,3 +451,51 @@ def test_delete_needs_no_buffer_record_of_the_write(tmp_path):
 
     assert deleted == written
     assert json.loads(door2.published[-1][1])["annotation_id"] == written
+
+
+def test_an_annotation_is_updated_by_the_id_its_write_returned(buffer):
+    """The case re-deriving cannot serve: an annotation whose signal set grew
+    and whose start was corrected while it was open. The producer kept the id
+    the create returned, and closes THAT annotation."""
+    door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    out = _bound_annotation_output(door, buffer)
+
+    opened = out.write_interval(1000.0, value="jam", signal_ids=["sig-a"])
+    closed = out.write_interval(
+        990.0,
+        1200.0,
+        value="jam",
+        signal_ids=["sig-a", "sig-b"],
+        annotation_id=opened,
+    )
+
+    assert closed == opened
+    assert [t for t, _p in door.published] == [door.published[0][0]] * 2, "an update republishes at the SAME topic"
+    payload = json.loads(door.published[-1][1])
+    assert (payload["time_start"], payload["time_end"]) == (990.0, 1200.0)
+    assert payload["signal_ids"] == ["sig-a", "sig-b"]
+    assert derive_annotation_id("at-1", "dataops/press", 990.0, ["sig-a", "sig-b"]) != closed, (
+        "the point of passing the id: re-deriving from the moved start and signals names another annotation"
+    )
+
+
+def test_delete_by_id_needs_no_start_time(buffer):
+    door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    out = _bound_annotation_output(door, buffer)
+    opened = out.write_interval(1000.0, value="jam", signal_ids=["sig-a"])
+    door.published.clear()
+
+    deleted = out.delete(annotation_id=opened)
+
+    assert deleted == opened
+    payload = json.loads(door.published[0][1])
+    assert payload["annotation_id"] == opened
+    assert payload["deleted"] is True
+
+
+def test_delete_with_neither_a_start_nor_an_id_is_refused(buffer):
+    door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    out = _bound_annotation_output(door, buffer)
+
+    with pytest.raises(TypeError, match="time_start, or the annotation_id"):
+        out.delete()
