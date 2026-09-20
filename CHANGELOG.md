@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/alpamayo-solutions/chaski/compare/v0.3.1...v0.4.0) (2026-09-20)
+
+
+### Features
+
+* **dataops:** delete one annotation by the identity write_interval gave it ([#16](https://github.com/alpamayo-solutions/chaski/issues/16)) ([56171e0](https://github.com/alpamayo-solutions/chaski/commit/56171e02f31822a0ec4e40a48dee9dfc1194fceb))
+* **dataops:** update or delete an annotation by the id its write returned ([#18](https://github.com/alpamayo-solutions/chaski/issues/18)) ([f9dcc32](https://github.com/alpamayo-solutions/chaski/commit/f9dcc32dd32bf224c8f1fdd78c0dbe7c6fdaf549))
+
 ## [0.3.1](https://github.com/alpamayo-solutions/chaski/compare/v0.3.0...v0.3.1) (2026-09-19)
 
 
