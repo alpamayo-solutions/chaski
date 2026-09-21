@@ -16,9 +16,11 @@ from pathlib import Path
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
 from colca_data_contracts.local_service import LocalServiceIdentity
-from colca_data_contracts.payload import DataTags, Metric, Signal
+from colca_data_contracts.payload import DataTag, DataTags, Metric, Signal
 from franzmq import Topic
 
+from chaski.catalogue import Catalogue
+from chaski.door import KvEntry
 from chaski.service import Service
 
 _PUBACK_TIMEOUT = 5.0
@@ -204,3 +206,65 @@ def test_the_lock_is_free_while_a_publish_waits(service):
 
     client.publish = publish_and_probe  # type: ignore[method-assign]
     svc.publish("orders", 1)
+
+
+def test_first_publish_republishes_a_retained_legacy_boolean_with_the_same_tag_id(tmp_path, monkeypatch):
+    previous = Catalogue(connector="svc-ulid")
+    previous.declare(
+        {
+            "enabled": DataTag(
+                id="",
+                name="enabled",
+                source="enabled",
+                is_writable=False,
+                is_readable=True,
+                data_type="bool",
+            )
+        }
+    )
+    legacy = previous.payload().__dict__
+    previous_id = legacy["data_tags"][0]["id"]
+
+    class RetainedDoor:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def kv(self, prefix: str = "", *, contract=None):
+            return [
+                KvEntry(
+                    path="erp",
+                    node_id="n-edge1",
+                    topic="colca/v1/_DataTags/n-edge1/erp",
+                    payload=legacy,
+                    ts=0.0,
+                    offset=1,
+                )
+            ]
+
+    client = _NetworkThreadClient()
+    identity = LocalServiceIdentity(
+        service_id="svc-ulid",
+        service_name="erp",
+        node_id="n-edge1",
+        system_element_id=None,
+        mount="",
+    )
+    monkeypatch.setattr("chaski.service.Door", RetainedDoor)
+    monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
+    monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))
+    monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
+    svc = Service("erp", state_dir=tmp_path)
+    try:
+        svc.start()
+        svc.publish("enabled", True)
+
+        catalogues = [payload for _topic, payload in client.published if isinstance(payload, DataTags)]
+        assert len(catalogues) == 1
+        assert catalogues[0].data_tags[0].id == previous_id
+        assert catalogues[0].data_tags[0].data_type == "boolean"
+    finally:
+        svc.close()
+        client.shutdown()

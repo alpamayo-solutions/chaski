@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
-from colca_data_contracts.payload import DataTag
+from colca_data_contracts.payload import DataTag, SignalDataType
 
 from chaski.catalogue import Catalogue, element_for, infer_data_type
 
@@ -30,7 +30,7 @@ def _retained(cat: Catalogue) -> dict:
 def test_infer_data_type_orders_bool_before_int():
     # bool is an int subclass in Python — this must not misreport a flag as
     # a number.
-    assert infer_data_type(True) == "bool"
+    assert infer_data_type(True) == "boolean"
     assert infer_data_type(3) == "int"
     assert infer_data_type(3.5) == "float"
     assert infer_data_type("running") == "string"
@@ -69,6 +69,16 @@ def test_ensure_emits_no_element_for_a_top_level_path_on_a_mounted_catalogue():
     cat = Catalogue(connector="svc1", mount="line1")
     cat.ensure("temp", 21.5)
     assert "element" not in cat.data_tags()[0].meta
+
+
+def test_a_published_boolean_uses_the_signal_data_type_vocabulary():
+    cat = Catalogue(connector="svc1")
+
+    cat.ensure("enabled", True)
+
+    tag = cat.tag("enabled")
+    assert tag is not None
+    assert SignalDataType(tag.data_type) == SignalDataType.BOOLEAN
 
 
 def test_the_catalogue_grows_monotonically_as_new_paths_are_published():
@@ -185,6 +195,33 @@ def test_a_restart_reuses_every_id_from_the_retained_record_and_the_guard_is_arm
     # Denominator: a genuinely changed catalogue does NOT match.
     second.declare({"a": _tag("a", meta_key=2)})
     assert second.revision() != second.last_published_revision
+
+
+def test_a_restart_migrates_a_legacy_bool_tag_and_republishes_it_with_the_same_id():
+    first = Catalogue(connector="svc1")
+    first.declare({"enabled": _tag("enabled", data_type="bool")})
+    first.record_published(first.revision())
+    retained = _retained(first)
+    original_id = first.tag_id("enabled")
+
+    second = Catalogue(connector="svc1")
+    second.load_previous(retained)
+
+    migrated = second.tag("enabled")
+    assert migrated is not None
+    assert migrated.id == original_id
+    assert migrated.data_type == "boolean"
+    assert second.dirty is True
+    assert second.last_published_revision == first.last_published_revision
+    assert second.revision() != second.last_published_revision
+
+    second.record_published(second.revision())
+    third = Catalogue(connector="svc1")
+    third.load_previous(_retained(second))
+    assert third.tag_id("enabled") == original_id
+    assert third.tag("enabled").data_type == "boolean"
+    assert third.dirty is False
+    assert third.revision() == third.last_published_revision
 
 
 def test_the_revision_carries_the_publishing_identity_so_a_re_registered_service_republishes():

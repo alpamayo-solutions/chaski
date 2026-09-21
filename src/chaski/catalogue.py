@@ -30,7 +30,7 @@ def infer_data_type(value: Any) -> str:
     """The DataTag.data_type inferred from a value's Python type — bool
     before int (bool is an int subclass in Python)."""
     if isinstance(value, bool):
-        return "bool"
+        return "boolean"
     if isinstance(value, int):
         return "int"
     if isinstance(value, float):
@@ -91,15 +91,23 @@ class Catalogue:
         ``version``). Nothing to seed from is a valid first run."""
         if not payload:
             return
+        migrated = False
         for raw in payload.get("data_tags") or []:
             if not raw.get("source") or not raw.get("id"):
                 continue
             tag = _tag_from_record(raw)
+            if tag.data_type == "bool":
+                tag = replace(tag, data_type="boolean")
+                migrated = True
             self._tags[tag.source] = tag
         version = payload.get("version")
         if version:
             self.last_published_revision = f"{payload.get('connector')}\x00{version}"
-        self.dirty = False
+        # ``bool`` was emitted by chaski <= 0.4 but is not in the Signal data
+        # type vocabulary. Retain the old revision while marking the corrected
+        # catalogue dirty so the normal publish guard republishes it with the
+        # same tag ids.
+        self.dirty = migrated
 
     # -- the two mutators ------------------------------------------------
 
