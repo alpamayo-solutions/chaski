@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 if TYPE_CHECKING:
     from chaski.door import Door
@@ -55,6 +55,8 @@ class _Index:
     signals_by_name: dict[str, list[dict[str, Any]]]
     binding_by_tag: dict[str, tuple[str, str]]
     metric_topic_by_signal_id: dict[str, str]
+    element_path_by_id: dict[str, str]
+    signal_path_by_id: dict[str, str]
 
 
 def _build_index(entries: list[Any]) -> _Index:
@@ -63,6 +65,8 @@ def _build_index(entries: list[Any]) -> _Index:
     signals: dict[str, list[dict[str, Any]]] = {}
     bindings: dict[str, tuple[str, str]] = {}
     metric_topics: dict[str, str] = {}
+    element_paths: dict[str, str] = {}
+    signal_paths: dict[str, str] = {}
 
     for entry in entries:
         topic = entry.topic
@@ -75,6 +79,8 @@ def _build_index(entries: list[Any]) -> _Index:
             # The first match in snapshot order wins.
             if name is not None and identifier and name not in elements:
                 elements[name] = identifier
+            if identifier:
+                element_paths[identifier] = _path_of(topic)
         elif _ANNOTATION_TYPE_TOPIC in topic:
             name, identifier = payload.get("name"), payload.get("id")
             if name is not None and identifier and name not in annotation_types:
@@ -87,10 +93,11 @@ def _build_index(entries: list[Any]) -> _Index:
             identifier = payload.get("id")
             if identifier:
                 metric_topics[identifier] = _metric_topic_for(topic)
+                signal_paths[identifier] = _path_of(topic)
             if tag and identifier and payload.get("is_published", False) and tag not in bindings:
                 bindings[tag] = (_metric_topic_for(topic), identifier)
 
-    return _Index(elements, annotation_types, signals, bindings, metric_topics)
+    return _Index(elements, annotation_types, signals, bindings, metric_topics, element_paths, signal_paths)
 
 
 _pinned_index: contextvars.ContextVar[_Index | None] = contextvars.ContextVar(
@@ -170,6 +177,26 @@ def resolve_signal(door: Door, name: str, system_element_name: str | None = None
     return None
 
 
+def signals_outside_element(door: Door, system_element_id: str, signal_ids: Iterable[str]) -> list[str]:
+    """The ids among ``signal_ids`` that the snapshot places outside the
+    subtree of ``system_element_id``, in the order given.
+
+    An element or signal the snapshot does not know is not reported: this
+    finds the placements that are known to be wrong, not the ones that cannot
+    be checked yet.
+    """
+    index = _snapshot(door)
+    root = index.element_path_by_id.get(system_element_id)
+    if root is None:
+        return []
+    outside = []
+    for signal_id in signal_ids:
+        path = index.signal_path_by_id.get(signal_id)
+        if path is not None and not (root == "" or path.startswith(root + "/")):
+            outside.append(signal_id)
+    return outside
+
+
 def resolve_annotation_type(door: Door, name: str) -> str | None:
     """Return an AnnotationType's ULID by exact name match, or ``None``."""
     return _snapshot(door).annotation_type_id_by_name.get(name)
@@ -184,6 +211,11 @@ def resolve_output_binding(door: Door, tag_id: str) -> tuple[str, str] | None:
     every call, so a new binding is picked up on the next publish.
     """
     return _snapshot(door).binding_by_tag.get(tag_id)
+
+
+def _path_of(topic: str) -> str:
+    """``colca/v1/{contract}/{node}/{path…}`` -> ``{path…}``."""
+    return "/".join(topic.split("/")[4:])
 
 
 def _metric_topic_for(signal_topic: str) -> str:

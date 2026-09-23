@@ -243,6 +243,8 @@ class AnnotationOutput(_PerInstance):
         value: Any = None,
         signal_ids: Iterable[str] | None = None,
         annotation_id: str | None = None,
+        system_element_id: str | None = None,
+        related_annotation_ids: Iterable[str] | None = None,
     ) -> str:
         """Publish (create or update) one annotation and return its id.
 
@@ -257,6 +259,13 @@ class AnnotationOutput(_PerInstance):
         leave the original as it was. A producer keeping the returned id
         with whatever it is projecting (a session, an order) never has to
         reproduce the derivation's inputs at all.
+
+        ``signal_ids`` are what the annotation was computed from.
+        ``system_element_id`` is where it belongs, and every signal must lie
+        below that element: a signal the node's KV places elsewhere raises
+        ``ValueError`` and nothing is published. ``related_annotation_ids``
+        are the annotations this one belongs to, such as the panel a head
+        pass is part of. Neither is part of the id.
         """
         runtime = self._runtime()
         source = self._require_source()
@@ -265,6 +274,13 @@ class AnnotationOutput(_PerInstance):
         ts_end = _epoch(time_end) if time_end is not None else None
         signals = list(signal_ids or [])
         type_id = self.type_id
+        if system_element_id is not None and signals:
+            outside = resolve.signals_outside_element(runtime.door, system_element_id, signals)
+            if outside:
+                raise ValueError(
+                    f"AnnotationOutput[{self.annotation_name!r}]: signal(s) {outside} are not below "
+                    f"system element {system_element_id!r}"
+                )
         if annotation_id is None:
             annotation_id = derive_annotation_id(type_id, source, ts_start, signals)
 
@@ -276,6 +292,8 @@ class AnnotationOutput(_PerInstance):
             value=value,
             signal_ids=signals,
             source=source,
+            system_element_id=system_element_id,
+            related_annotation_ids=list(related_annotation_ids or []),
         )
         runtime.door.publish(self._topic(annotation_id), payload.encode())
         runtime.buffer.record_emitted_annotation(source, annotation_id, ts_start)
