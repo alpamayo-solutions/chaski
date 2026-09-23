@@ -69,6 +69,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -89,6 +90,10 @@ log = logging.getLogger("chaski.dataops")
 
 #: A burst of input metrics within this window wakes the ingest once.
 WAKE_COALESCE_S = 0.2
+#: After a failed read of the input topics, the first retry waits this long,
+#: doubling per consecutive failure up to :data:`WAKE_RETRY_MAX_S`.
+WAKE_RETRY_S = 1.0
+WAKE_RETRY_MAX_S = 30.0
 #: colca's default metrics retention — what a declared window is checked
 #: against when the service is given no ``retention=`` of its own.
 DEFAULT_RETENTION_S = 14 * 24 * 3600.0
@@ -663,6 +668,8 @@ class DataOpsService(Service):
         self._ingest: Ingest | None = None
         self._wake_topics: set[str] = set()
         self._wake_pending = False
+        self._wake_failures = 0
+        self._wake_retry: asyncio.TimerHandle | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self.instances: list[Producer] = []
 
@@ -754,6 +761,7 @@ class DataOpsService(Service):
         return self
 
     def close(self) -> None:
+        self._cancel_wake_retry()
         super().close()
         if self._local_buffer is not None:
             self._local_buffer.close()
@@ -802,11 +810,32 @@ class DataOpsService(Service):
         late-resolved input starts waking the ingest from then on.
 
         QoS 0: a lost message costs one wake, which the poll interval covers.
+
+        The topics come from ``/kv``, which the node rate-limits. A transport
+        error there (429, 5xx, a timeout) keeps the topics already
+        subscribed and retries with backoff, or sooner if the inputs rebind;
+        until then the poll interval covers the wakes that are missed.
         """
         client = self._client
         if client is None:
             return
-        topics = set(resolve.resolve_metric_topics(self.door, signal_ids).values())
+        self._cancel_wake_retry()
+        try:
+            topics = set(resolve.resolve_metric_topics(self.door, signal_ids).values())
+        except httpx.HTTPError as exc:
+            self._wake_failures += 1
+            delay = min(WAKE_RETRY_S * 2 ** (self._wake_failures - 1), WAKE_RETRY_MAX_S)
+            log.warning(
+                "Could not read the input topics to wake on (attempt %d): %s — keeping %d topic(s), retrying in %.0fs",
+                self._wake_failures,
+                exc,
+                len(self._wake_topics),
+                delay,
+            )
+            if self._loop is not None:
+                self._wake_retry = self._loop.call_later(delay, self._wake_on_inputs, list(signal_ids))
+            return
+        self._wake_failures = 0
         if len(topics) < len(signal_ids):
             log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
         tolerate_undecodable(client)
@@ -818,6 +847,11 @@ class DataOpsService(Service):
             client.unsubscribe(topic)
         self._wake_topics = topics
         log.info("ingest wakes on %d input topic(s)", len(topics))
+
+    def _cancel_wake_retry(self) -> None:
+        if self._wake_retry is not None:
+            self._wake_retry.cancel()
+            self._wake_retry = None
 
     def _on_input_metric(self, _client, _userdata, _message) -> None:
         loop = self._loop
