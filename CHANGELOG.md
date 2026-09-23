@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/alpamayo-solutions/chaski/compare/v0.5.1...v0.6.0) (2026-09-23)
+
+
+### Features
+
+* **dataops:** send an annotation's element and related annotations ([#23](https://github.com/alpamayo-solutions/chaski/issues/23)) ([655ac31](https://github.com/alpamayo-solutions/chaski/commit/655ac317212072365b34f75a6ba86966d57505de))
+
 ## [0.5.1](https://github.com/alpamayo-solutions/chaski/compare/v0.5.0...v0.5.1) (2026-09-23)
 
 
