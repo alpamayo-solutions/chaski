@@ -18,7 +18,7 @@ tombstone case to the handler as ``None``, so this module does no decoding of
 its own — the crash a hand-rolled subscription like this used to risk (an
 unconditional ``json.loads`` on a tombstone's empty payload, killing the whole
 MQTT client) is guarded once, for every subscription this service makes,
-by :func:`chaski.dataops.service.ring_even_if_undecodable`.
+by :func:`chaski.dataops.service.tolerate_undecodable`.
 
 Delivery happens on franzmq's own callback thread (:class:`franzmq.Client`
 runs a message's registered callbacks off the network thread already); each
@@ -46,7 +46,7 @@ from .triggers import OnConstantSpec, OnSignalSpec
 log = logging.getLogger("chaski.dataops.watch")
 
 #: qos=1: a missed `_Constant`/`_Signal` write is a missed decision, unlike
-#: the doorbell (qos=0), which only wakes a poll that runs again regardless.
+#: the input wake (qos=0), which only wakes a poll that runs again regardless.
 _QOS = 1
 
 
@@ -88,9 +88,9 @@ def start(
     # Imported here, not at module level: chaski.dataops.service imports this
     # module to call start() from DataOpsService.serve(), so a top-level
     # import back the other way would be circular.
-    from .service import ring_even_if_undecodable
+    from .service import tolerate_undecodable
 
-    ring_even_if_undecodable(client)
+    tolerate_undecodable(client)
     count = 0
     for path_or_pattern, handler in constant_triggers:
         _subscribe(client, Constant, node_id, path_or_pattern, handler, door, loop)
@@ -124,8 +124,9 @@ def _subscribe(
 
 def _callback(handler: Callable, door: Any, loop: asyncio.AbstractEventLoop) -> Callable[[Any], None]:
     """franzmq calls this off the event loop (its own callback thread); hand
-    the dispatch back to the loop the way :meth:`chaski.service.Service._ring_doorbell`
-    hands the ingest wake-up back."""
+    the dispatch back to the loop the way
+    :meth:`chaski.dataops.service.DataOpsService._on_input_metric` hands the
+    ingest wake-up back."""
 
     def _on_message(message: Any) -> None:
         record = message.payload  # already decoded; None is the tombstone

@@ -19,9 +19,10 @@ the ack redelivers the page, and appends are idempotent on
 returns a ``gap`` with the surviving records. It is logged as a warning with
 the pruned range, and processing continues.
 
-**MQTT is only a doorbell.** A delivery on ``colca/v1/_Metric/#`` calls
-:meth:`Ingest.wake`, which cuts the poll sleep short; the message itself is
-never read.
+**MQTT only wakes it.** A message on one of the service's input topics calls
+:meth:`Ingest.wake` (through
+:meth:`chaski.dataops.service.DataOpsService._wake_on_inputs`), which cuts
+the poll sleep short; the message itself is not read.
 """
 
 from __future__ import annotations
@@ -230,7 +231,7 @@ class Ingest:
             gap.approx,
         )
 
-    # ------------------------------------------------------------------ doorbell
+    # ------------------------------------------------------------------ wake
 
     def wake(self) -> None:
         """Signal that new data may be waiting, cutting the poll sleep short.

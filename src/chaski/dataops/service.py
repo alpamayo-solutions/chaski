@@ -7,9 +7,10 @@ producer runtime.
 * **One ingest lane**: :class:`~chaski.dataops.ingest.Ingest` over
   ``self.stream("metrics", cursor="ingest-<generation>", signal_ids=...)``,
   acking after processing. There is no second path to the data.
-* **MQTT is only a doorbell**: :meth:`DataOpsService._ring_doorbell`
-  subscribes ``<root>/v1/_Metric/#`` at QoS 0 to wake the ingest loop early.
-  The payload is never read.
+* **MQTT wakes the ingest for the service's own inputs**:
+  :meth:`DataOpsService._wake_on_inputs` subscribes the ``_Metric`` topic of
+  each resolved input signal at QoS 0, again whenever the inputs resolve
+  anew, and turns a burst of messages into one wake. The payload is not read.
 * **The buffer is the only local state**: one SQLite
   :class:`~chaski.dataops.buffer.Buffer` under ``data_dir`` holds input
   windows and watermarks; :func:`trim_buffer` prunes it.
@@ -44,8 +45,9 @@ Startup order inside :meth:`DataOpsService.serve`:
     alone
  8. retire the previous generation's ingest cursor, if one is known
  9. start the ingest task, and a retry loop for inputs that did not resolve
- 10. ring the MQTT doorbell, and subscribe every ``@on_constant``/
-     ``@on_signal`` trigger (:mod:`chaski.dataops.watch`)
+ 10. subscribe every ``@on_constant``/``@on_signal`` trigger
+     (:mod:`chaski.dataops.watch`); the input topics that wake the ingest
+     are subscribed when its stream opens (step 8)
  11. schedule cron and interval ticks, and the periodic buffer trim
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
@@ -70,7 +72,7 @@ from typing import Any, cast
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from colca_data_contracts import Metric, topic_prefix
+from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
@@ -85,7 +87,8 @@ from .triggers import CronSpec, IntervalSpec, OnConstantSpec, OnMetricSpec, OnSi
 
 log = logging.getLogger("chaski.dataops")
 
-DOORBELL_WILDCARD = f"{topic_prefix()}_Metric/#"
+#: A burst of input metrics within this window wakes the ingest once.
+WAKE_COALESCE_S = 0.2
 #: colca's default metrics retention — what a declared window is checked
 #: against when the service is given no ``retention=`` of its own.
 DEFAULT_RETENTION_S = 14 * 24 * 3600.0
@@ -550,12 +553,12 @@ def _earliest_across(buffer: Buffer, signal_ids: Iterable[str]) -> float | None:
     return min(values) if values else None
 
 
-# ─── the doorbell ───────────────────────────────────────────────────────────
+# ─── MQTT dispatch ──────────────────────────────────────────────────────────
 
 
-def ring_even_if_undecodable(client) -> None:
+def tolerate_undecodable(client) -> None:
     """Make every subscription on ``client`` survive a message franzmq cannot
-    decode — the doorbell's own need, and equally
+    decode — the input wake's own need, and equally
     :mod:`chaski.dataops.watch`'s: a ``_Constant``/``_Signal`` tombstone (an
     empty retained payload — the documented "this record was retired"
     convention) is exactly the kind of message franzmq's typed decode was not
@@ -563,13 +566,13 @@ def ring_even_if_undecodable(client) -> None:
 
     franzmq decodes every inbound message on paho's network thread before
     dispatching, and an undecodable one would kill that thread — every
-    subscription on this client, doorbell and typed alike, since one client
+    subscription on this client, input wake and typed alike, since one client
     thread serves them all. On a decode failure the raw, undecoded message
     goes to the matching callbacks instead (their own decoding, if any, is
     on them), with a warning naming the topic.
 
     Idempotent: patches ``client._handle_on_message`` once per client, so the
-    doorbell and :func:`chaski.dataops.watch.start` can both call this on the
+    input wake and :func:`chaski.dataops.watch.start` can both call this on the
     same client without wrapping it twice.
     """
     from paho.mqtt.client import Client as PahoClient
@@ -658,6 +661,8 @@ class DataOpsService(Service):
         self._producers: dict[str, type[Producer]] = {}
         self._local_buffer: Buffer | None = None
         self._ingest: Ingest | None = None
+        self._wake_topics: set[str] = set()
+        self._wake_pending = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self.instances: list[Producer] = []
 
@@ -788,28 +793,47 @@ class DataOpsService(Service):
         return result
 
     def _open_ingest_stream(self, cursor: str, signal_ids: list[str] | None) -> Stream:
+        self._wake_on_inputs(signal_ids or [])
         return self.stream("metrics", cursor=cursor, signal_ids=signal_ids)
 
-    def _ring_doorbell(self) -> None:
-        """Subscribe ``colca/v1/_Metric/#`` only to wake the ingest loop; the
-        payload is never read. The session is persistent, so the subscription
-        survives a reconnect.
+    def _wake_on_inputs(self, signal_ids: list[str]) -> None:
+        """Subscribe the ``_Metric`` topic of each input signal, and drop the
+        ones no longer read. Called whenever the ingest stream (re)opens, so a
+        late-resolved input starts waking the ingest from then on.
 
-        QoS 0 on purpose: at QoS 1 the broker would track every metric in
-        flight for a doorbell that needs no delivery guarantee.
+        QoS 0: a lost message costs one wake, which the poll interval covers.
         """
-        client = self._started_client
+        client = self._client
+        if client is None:
+            return
+        topics = set(resolve.resolve_metric_topics(self.door, signal_ids).values())
+        if len(topics) < len(signal_ids):
+            log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
+        tolerate_undecodable(client)
+        for topic in sorted(topics - self._wake_topics):
+            client.message_callback_add(topic, self._on_input_metric)
+            client.subscribe(topic, qos=0)
+        for topic in sorted(self._wake_topics - topics):
+            client.message_callback_remove(topic)
+            client.unsubscribe(topic)
+        self._wake_topics = topics
+        log.info("ingest wakes on %d input topic(s)", len(topics))
+
+    def _on_input_metric(self, _client, _userdata, _message) -> None:
         loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._wake_soon)
 
-        def _on_doorbell(_client, _userdata, _raw_message) -> None:
-            ingest = self._ingest
-            if ingest is not None and loop is not None:
-                loop.call_soon_threadsafe(ingest.wake)
+    def _wake_soon(self) -> None:
+        if self._wake_pending or self._loop is None:
+            return
+        self._wake_pending = True
+        self._loop.call_later(WAKE_COALESCE_S, self._wake_now)
 
-        ring_even_if_undecodable(client)
-        client.message_callback_add(DOORBELL_WILDCARD, _on_doorbell)
-        client.subscribe(DOORBELL_WILDCARD, qos=0)
-        log.info("doorbell: subscribed %s at qos 0", DOORBELL_WILDCARD)
+    def _wake_now(self) -> None:
+        self._wake_pending = False
+        if self._ingest is not None:
+            self._ingest.wake()
 
     def _watch_constants_and_signals(self, instances: list[Producer]) -> None:
         """Subscribe every ``@on_constant``/``@on_signal`` trigger declared
@@ -916,8 +940,7 @@ class DataOpsService(Service):
                 reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
             )
 
-        # 10) The doorbell, and every @on_constant/@on_signal subscription.
-        self._ring_doorbell()
+        # 10) Every @on_constant/@on_signal subscription.
         self._watch_constants_and_signals(instances)
 
         # 11) Schedule cron/interval triggers (everything except @on_metric),
