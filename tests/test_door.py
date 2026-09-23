@@ -457,3 +457,28 @@ def test_publish_raises_on_http_error(stub_server, door):
 
     with pytest.raises(httpx.HTTPStatusError):
         door.publish("colca/v1/_Metric/n-1/line1/press1", json.dumps({"value": 1}))
+
+
+# Scenario: an alarm's condition has gone and the record must stop standing.
+# Input: retire() on the record's topic
+# Expected: `/publish` with the topic and NO `payload` key at all — an empty
+# object or a null would be a payload, and the door validates those against the
+# contract's schema and refuses them.
+def test_retire_sends_no_payload_key(stub_server, door):
+    _, handler_cls = stub_server
+    handler_cls.responses["/publish"] = (200, {"stream": "alarms", "offset": 11, "topic": "t"})
+
+    door.retire("colca/v1/_AlarmState/n-1/line1/press1/threshold")
+
+    req = _last_request(handler_cls)
+    assert req["path"] == "/publish"
+    assert req["body"] == {"topic": "colca/v1/_AlarmState/n-1/line1/press1/threshold"}
+    assert "payload" not in req["body"]
+
+
+def test_retire_raises_on_http_error(stub_server, door):
+    _, handler_cls = stub_server
+    handler_cls.responses["/publish"] = (500, {"error": "boom"})
+
+    with pytest.raises(httpx.HTTPStatusError):
+        door.retire("colca/v1/_AlarmState/n-1/line1/press1/threshold")

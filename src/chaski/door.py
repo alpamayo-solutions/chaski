@@ -303,6 +303,17 @@ class Door:
         resp = self._client.post("/publish", json={"topic": topic, "payload": json.loads(payload)})
         resp.raise_for_status()
 
+    def retire(self, topic: str) -> None:
+        """``POST /publish`` with NO payload — the tombstone.
+
+        Not ``publish(topic, "{}")`` and not ``"null"``: both are a payload,
+        which the door validates against the contract's schema and refuses.
+        Retiring means the key is absent — for a retained contract, what is not
+        in the node's KV is not standing.
+        """
+        resp = self._client.post("/publish", json={"topic": topic})
+        resp.raise_for_status()
+
 
 class Stream:
     """A named cursor over one colca stream, as ``Service.stream()`` returns it.
