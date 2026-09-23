@@ -287,6 +287,69 @@ def test_write_interval_derives_a_deterministic_id_and_publishes(buffer):
     assert payload["deleted"] is False
 
 
+def _placement_entries():
+    """line1 with head1 below it, and line2; a signal under head1 and one under line2."""
+    return [
+        _annotation_type_entry("head_pass", "at-hp"),
+        kv_entry(f"colca/v1/_SystemElement/{NODE_ID}/line1", {"id": "el-line1", "name": "line1"}),
+        kv_entry(f"colca/v1/_SystemElement/{NODE_ID}/line1/head1", {"id": "el-head1", "name": "head1"}),
+        kv_entry(f"colca/v1/_SystemElement/{NODE_ID}/line2", {"id": "el-line2", "name": "line2"}),
+        kv_entry(f"colca/v1/_Signal/{NODE_ID}/line1/head1/current", {"id": "sig-current", "name": "current"}),
+        kv_entry(f"colca/v1/_Signal/{NODE_ID}/line2/speed", {"id": "sig-speed", "name": "speed"}),
+    ]
+
+
+def test_write_interval_sends_the_element_and_related_annotations(buffer):
+    door = FakeDoor(_placement_entries())
+    out = _bound_annotation_output(door, buffer, name="head_pass")
+
+    got_id = out.write_interval(
+        1000.0,
+        1001.0,
+        signal_ids=["sig-current"],
+        system_element_id="el-line1",
+        related_annotation_ids=["panel-7"],
+    )
+
+    payload = json.loads(door.published[0][1])
+    assert payload["system_element_id"] == "el-line1"
+    assert payload["related_annotation_ids"] == ["panel-7"]
+    # Placement and relations are not part of the id.
+    assert got_id == derive_annotation_id("at-hp", "dataops/press", 1000.0, ["sig-current"])
+
+
+def test_write_interval_without_placement_sends_the_defaults(buffer):
+    door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
+    out = _bound_annotation_output(door, buffer)
+
+    out.write_interval(1000.0)
+
+    payload = json.loads(door.published[0][1])
+    assert payload["system_element_id"] is None
+    assert payload["related_annotation_ids"] == []
+
+
+def test_write_interval_refuses_a_signal_outside_its_element(buffer):
+    door = FakeDoor(_placement_entries())
+    out = _bound_annotation_output(door, buffer, name="head_pass")
+
+    with pytest.raises(ValueError, match="sig-speed"):
+        out.write_interval(1000.0, signal_ids=["sig-current", "sig-speed"], system_element_id="el-line1")
+
+    assert door.published == []
+
+
+def test_write_interval_publishes_a_placement_it_cannot_check_yet(buffer):
+    """An element or signal the KV does not know yet is not a known violation."""
+    door = FakeDoor(_placement_entries())
+    out = _bound_annotation_output(door, buffer, name="head_pass")
+
+    out.write_interval(1000.0, signal_ids=["sig-new"], system_element_id="el-line1")
+    out.write_interval(1001.0, signal_ids=["sig-speed"], system_element_id="el-new")
+
+    assert len(door.published) == 2
+
+
 def test_same_interval_republished_updates_in_place_not_duplicates(buffer):
     door = FakeDoor([_annotation_type_entry("downtime", "at-1")])
     out = _bound_annotation_output(door, buffer)
