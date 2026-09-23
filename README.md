@@ -152,6 +152,34 @@ delivery is retained, so subscribing also delivers whatever is already set.
 any trigger — `@every`/`@cron`/`@on_metric`/`@on_constant`/`@on_signal` —
 can fire, for startup work that needs to publish.
 
+`@on_command` executes a command sent to an exact node-local path and answers
+it with an `_Ack` beside it (`_Ack/<node>/<path>`). A person may command but
+not write data, so this is how a value a producer owns gets set from a UI:
+
+```python
+from chaski.dataops import Command, CommandRejected, Producer, on_command
+
+class Selection(Producer):
+    name = "selection"
+    system_element_name = "oven"
+
+    @on_command("oven/operator/setRecipe")            # _CmdParam unless contract= says otherwise
+    async def set_recipe(self, command: Command) -> str:
+        recipe = command.params.get("recipeId")
+        if recipe not in self.recipes:
+            raise CommandRejected(422, f"unknown recipe {recipe!r}")
+        ...  # write the value, set by command.actor_id
+        return f"recipe {recipe} set"             # the 200 ack's message
+```
+
+The command is read from the node's `commands` stream through a durable
+cursor of the service's own, so `command.actor_id`/`actor_label` are the
+node's attestation, not the sender's claim; its MQTT topic only wakes the
+drain. An expired command (`expires_at`, unix ms) is answered `498` without
+running the handler, `CommandRejected` answers its own code, any other
+exception `500`. A page of commands is acked after it was handled, so a
+restart can deliver a command twice: handlers must be idempotent.
+
 ## Run a node
 
 ```python

@@ -451,6 +451,17 @@ def test_publish_embeds_payload_as_json_value_not_a_double_encoded_string(stub_s
     }
 
 
+def test_publish_returns_the_ack_of_a_command_the_node_executes_itself(stub_server, door):
+    _, handler_cls = stub_server
+    ack = {"correlation_id": "c-1", "result_code": 200, "message": "1 constant(s)"}
+    handler_cls.responses["/publish"] = (200, {"stream": "commands", "offset": 4, "command": ack})
+
+    body = door.publish("colca/v1/_CmdConfigure/n-1/constant/upsert", json.dumps({"correlation_id": "c-1"}))
+
+    assert body is not None
+    assert body["command"] == ack
+
+
 def test_publish_raises_on_http_error(stub_server, door):
     _, handler_cls = stub_server
     handler_cls.responses["/publish"] = (500, {"error": "boom"})

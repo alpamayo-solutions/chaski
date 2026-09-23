@@ -91,8 +91,21 @@ class OnSignalSpec:
     path_or_pattern: str
 
 
+@dataclass(frozen=True)
+class OnCommandSpec:
+    """Command trigger: execute every command of ``contract`` addressed to the
+    exact node-local ``path`` (verb included, ``"line1/operator/setProduct"``).
+
+    The decorated method receives a :class:`chaski.dataops.commands.Command`
+    and returns the acknowledgement's message; see :func:`on_command`.
+    """
+
+    path: str
+    contract: str = "_CmdParam"
+
+
 # Methods carry ``__colca_triggers__: list[TriggerSpec]`` once decorated.
-TriggerSpec = CronSpec | IntervalSpec | OnMetricSpec | OnConstantSpec | OnSignalSpec
+TriggerSpec = CronSpec | IntervalSpec | OnMetricSpec | OnConstantSpec | OnSignalSpec | OnCommandSpec
 _TRIGGERS_ATTR = "__colca_triggers__"
 
 
@@ -247,6 +260,47 @@ def on_signal(path_or_pattern: str) -> Callable[[Callable], Callable]:
     retired.
     """
     spec = OnSignalSpec(path_or_pattern=_check_path_or_pattern(path_or_pattern))
+
+    def decorator(fn: Callable) -> Callable:
+        return _attach(fn, spec)
+
+    return decorator
+
+
+def on_command(path: str, contract: str = "_CmdParam") -> Callable[[Callable], Callable]:
+    """Execute the commands of ``contract`` sent to the node-local ``path``.
+
+    ``path`` is exact and includes the verb (``"line1/operator/setProduct"``);
+    wildcards are refused. ``contract`` is a command contract (``_CmdParam``
+    by default, ``_CmdOperate``, ...). Stacks, so one method can serve several
+    paths.
+
+    The method receives a :class:`~chaski.dataops.commands.Command` and
+    returns the message of a ``200`` acknowledgement. Raising
+    :class:`~chaski.dataops.commands.CommandRejected` answers with its code
+    instead; any other exception answers ``500``. An expired command is
+    answered ``498`` without calling the method.
+
+    Example::
+
+        class Selection(Producer):
+            @on_command("line1/operator/setProduct")
+            async def set_product(self, command):
+                sku = command.params.get("sku")
+                if sku not in self.catalog:
+                    raise CommandRejected(422, f"unknown product {sku!r}")
+                ...
+                return f"product {sku} set"
+
+    A command can arrive twice (a page is re-read after a crash), so the
+    method must be idempotent: setting a value is, adding to one is not.
+    """
+    path = _check_path_or_pattern(path)
+    if "+" in path.split("/") or "#" in path.split("/"):
+        raise ValueError(f"on_command takes an exact path, got the pattern {path!r}")
+    if not isinstance(contract, str) or not contract.startswith("_Cmd"):
+        raise ValueError(f"contract must be a command contract (_Cmd...), got {contract!r}")
+    spec = OnCommandSpec(path=path.strip("/"), contract=contract)
 
     def decorator(fn: Callable) -> Callable:
         return _attach(fn, spec)

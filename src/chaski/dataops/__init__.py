@@ -13,15 +13,18 @@ node sees one more local service, not a kind of its own.
 
 from .base import Producer, Runtime
 from .buffer import Buffer
+from .commands import Command, CommandRejected
 from .ingest import Ingest
 from .inputs import Historian, SignalRangeInput, WindowExceedsRetentionError, validate_windows
 from .outputs import AnnotationOutput, SignalOutput, bind_annotation_outputs, build_catalogue
 from .service import DataOpsService, build_dispatch, import_directory, import_package
-from .triggers import cron, every, on_constant, on_metric, on_signal, parse_duration
+from .triggers import cron, every, on_command, on_constant, on_metric, on_signal, parse_duration
 
 __all__ = [
     "AnnotationOutput",
     "Buffer",
+    "Command",
+    "CommandRejected",
     "DataOpsService",
     "Historian",
     "Ingest",
@@ -37,6 +40,7 @@ __all__ = [
     "every",
     "import_directory",
     "import_package",
+    "on_command",
     "on_constant",
     "on_metric",
     "on_signal",
