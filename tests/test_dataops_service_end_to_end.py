@@ -78,7 +78,13 @@ class _FakeClient:
     def message_callback_add(self, sub: str, callback) -> None:
         self.callbacks[sub] = callback
 
-    def _handle_on_message(self, message) -> None:  # what ring_even_if_undecodable wraps
+    def message_callback_remove(self, sub: str) -> None:
+        self.callbacks.pop(sub, None)
+
+    def unsubscribe(self, topic) -> None:
+        self.subscriptions.remove(str(topic))
+
+    def _handle_on_message(self, message) -> None:  # what tolerate_undecodable wraps
         pass
 
     def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
@@ -290,10 +296,11 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
     # The buffer is the only local state: the point landed, the watermark advanced, in data_dir.
     assert (tmp_path / "data" / "buffer.sqlite3").exists()
 
-    # The doorbell rang on the base class's own client, and the service is a
-    # plain local service to the node: registration is CONNECTOR-typed, and
-    # close() marked it inactive like any Service.
-    assert "colca/v1/_Metric/#" in client.subscriptions
+    # The ingest wakes on its own input's topic only, on the base class's own
+    # client, and the service is a plain local service to the node:
+    # registration is CONNECTOR-typed, and close() marked it inactive.
+    assert f"colca/v1/_Metric/{NODE_ID}/oven/temperature" in client.subscriptions
+    assert not any(t.endswith("/#") and "_Metric" in t for t in client.subscriptions)
     details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
     assert details[0].name == "dataops" and details[0].service_type.value == "connector"
     assert details[-1].is_active is False

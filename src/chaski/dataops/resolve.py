@@ -54,6 +54,7 @@ class _Index:
     annotation_type_id_by_name: dict[str, str]
     signals_by_name: dict[str, list[dict[str, Any]]]
     binding_by_tag: dict[str, tuple[str, str]]
+    metric_topic_by_signal_id: dict[str, str]
 
 
 def _build_index(entries: list[Any]) -> _Index:
@@ -61,6 +62,7 @@ def _build_index(entries: list[Any]) -> _Index:
     annotation_types: dict[str, str] = {}
     signals: dict[str, list[dict[str, Any]]] = {}
     bindings: dict[str, tuple[str, str]] = {}
+    metric_topics: dict[str, str] = {}
 
     for entry in entries:
         topic = entry.topic
@@ -83,10 +85,12 @@ def _build_index(entries: list[Any]) -> _Index:
                 signals.setdefault(name, []).append(payload)
             tag = payload.get("data_tag")
             identifier = payload.get("id")
+            if identifier:
+                metric_topics[identifier] = _metric_topic_for(topic)
             if tag and identifier and payload.get("is_published", False) and tag not in bindings:
                 bindings[tag] = (_metric_topic_for(topic), identifier)
 
-    return _Index(elements, annotation_types, signals, bindings)
+    return _Index(elements, annotation_types, signals, bindings, metric_topics)
 
 
 _pinned_index: contextvars.ContextVar[_Index | None] = contextvars.ContextVar(
@@ -126,6 +130,15 @@ def _snapshot(door: Door) -> _Index:
     """The pass's pinned index, or a fresh read when no pass is active."""
     pinned = _pinned_index.get()
     return pinned if pinned is not None else _build_index(door.kv(""))
+
+
+def resolve_metric_topics(door: Door, signal_ids: list[str]) -> dict[str, str]:
+    """``{signal_id: its _Metric topic}`` for the ids a snapshot knows. Outside
+    a pass, only the ``_Signal`` records are read."""
+    pinned = _pinned_index.get()
+    index = pinned if pinned is not None else _build_index(door.kv("", contract="_Signal"))
+    known = index.metric_topic_by_signal_id
+    return {sid: known[sid] for sid in signal_ids if sid in known}
 
 
 def resolve_system_element(door: Door, name: str) -> str | None:

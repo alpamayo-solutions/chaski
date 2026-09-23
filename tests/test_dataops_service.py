@@ -17,7 +17,7 @@ import time
 from unittest.mock import patch
 
 import pytest
-from dataops_fakes import FakeDoor, FakeRuntime, run_async, signal_entry
+from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async, signal_entry
 
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
@@ -353,29 +353,115 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
     assert list(df["value"]) == [], "a late-resolved input must be trimmed on the very next trim run, without a restart"
 
 
-def test_the_doorbell_rings_for_a_metric_franzmq_cannot_decode():
-    """An undecodable message still rings the doorbell; a well-formed one takes
-    the typed path."""
+def test_an_input_topic_still_wakes_for_a_metric_franzmq_cannot_decode():
+    """An undecodable message still reaches the input wake; a well-formed one
+    takes the typed path."""
     import json
 
     import franzmq
     from paho.mqtt.client import MQTTMessage
 
-    from chaski.dataops.service import DOORBELL_WILDCARD, ring_even_if_undecodable
+    from chaski.dataops.service import tolerate_undecodable
 
-    client = franzmq.Client(client_id="doorbell-test")
-    rings: list[str] = []
-    client.message_callback_add(DOORBELL_WILDCARD, lambda c, u, m: rings.append(m.topic))
-    ring_even_if_undecodable(client)
+    topic = "colca/v1/_Metric/n1/line1/temp"
+    client = franzmq.Client(client_id="wake-test")
+    wakes: list[str] = []
+    client.message_callback_add(topic, lambda c, u, m: wakes.append(m.topic))
+    tolerate_undecodable(client)
 
     def deliver(payload: dict) -> None:
-        message = MQTTMessage(mid=1, topic=b"colca/v1/_Metric/n1/line1/temp")
+        message = MQTTMessage(mid=1, topic=topic.encode())
         message.payload = json.dumps(payload).encode()
         client._handle_on_message(message)
 
     deliver({"v": 1.0, "value": 1.0, "signal_id": "s"})  # no timestamp: the decode raises
     deliver({"v": 2.0, "value": 2.0, "signal_id": "s", "timestamp": 1.0})  # decodes fine
-    assert rings == ["colca/v1/_Metric/n1/line1/temp"] * 2, rings
+    assert wakes == [topic] * 2, wakes
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.subscribed: list[str] = []
+        self.unsubscribed: list[str] = []
+        self.callbacks: dict[str, object] = {}
+
+    def subscribe(self, topic, qos: int = 0, callback=None) -> None:
+        self.subscribed.append(topic)
+
+    def unsubscribe(self, topic) -> None:
+        self.unsubscribed.append(topic)
+
+    def message_callback_add(self, sub, callback) -> None:
+        self.callbacks[sub] = callback
+
+    def message_callback_remove(self, sub) -> None:
+        self.callbacks.pop(sub, None)
+
+    def _handle_on_message(self, message) -> None:
+        pass
+
+
+def _service_with(door, client):
+    from chaski.dataops.service import DataOpsService
+
+    class _Service(DataOpsService):
+        @property
+        def door(self):
+            return door
+
+    service = _Service("dataops")
+    service._client = client
+    return service
+
+
+def test_the_ingest_wakes_only_on_its_own_input_topics():
+    door = FakeDoor(
+        [
+            signal_entry("s-temp", "temp", path="line1/temp"),
+            signal_entry("s-speed", "speed", path="line1/speed"),
+            signal_entry("s-other", "other", path="line1/other"),
+        ]
+    )
+    client = _RecordingClient()
+    service = _service_with(door, client)
+
+    service._wake_on_inputs(["s-temp"])
+    assert client.subscribed == [f"colca/v1/_Metric/{NODE_ID}/line1/temp"]
+
+    service._wake_on_inputs(["s-temp", "s-speed"])  # a late-resolved input joins
+    assert client.subscribed[-1] == f"colca/v1/_Metric/{NODE_ID}/line1/speed"
+
+    service._wake_on_inputs(["s-speed"])  # an input no longer read leaves
+    assert client.unsubscribed == [f"colca/v1/_Metric/{NODE_ID}/line1/temp"]
+    assert set(client.callbacks) == {f"colca/v1/_Metric/{NODE_ID}/line1/speed"}
+    assert not any(t.endswith("#") for t in client.subscribed)
+
+
+def test_a_burst_of_input_metrics_wakes_the_ingest_once():
+    import asyncio
+
+    from chaski.dataops.service import WAKE_COALESCE_S
+
+    class _Ingest:
+        wakes = 0
+
+        def wake(self) -> None:
+            self.wakes += 1
+
+    service = _service_with(FakeDoor(), _RecordingClient())
+    loop = asyncio.new_event_loop()
+    try:
+        service._loop = loop
+        service._ingest = ingest = _Ingest()
+        for _ in range(20):
+            service._on_input_metric(None, None, None)
+        loop.run_until_complete(asyncio.sleep(WAKE_COALESCE_S * 2))
+        assert ingest.wakes == 1
+        service._on_input_metric(None, None, None)
+        loop.run_until_complete(asyncio.sleep(WAKE_COALESCE_S * 2))
+        assert ingest.wakes == 2
+    finally:
+        loop.close()
 
 
 def test_a_periodic_tick_is_scheduled_as_a_plain_function_not_a_coroutine():

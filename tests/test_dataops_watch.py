@@ -3,7 +3,7 @@
 A real `franzmq.Client` plays the MQTT side — subscribing and delivering a
 message through it, rather than a hand-rolled stand-in, is what proves the
 tombstone case actually decodes to `None` instead of crashing the client
-(the gap `chaski.dataops.service.ring_even_if_undecodable` exists for).
+(the gap `chaski.dataops.service.tolerate_undecodable` exists for).
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ async def test_a_tombstone_is_delivered_as_none_not_a_crash():
 
     # An empty retained payload: the documented wire tombstone for "this
     # record was retired" — franzmq's own typed decode was not written to
-    # expect it (chaski.dataops.service.ring_even_if_undecodable's own gap).
+    # expect it (chaski.dataops.service.tolerate_undecodable's own gap).
     _deliver(client, f"colca/v1/_Constant/{NODE_ID}/line1/operator/setpoint", b"")
     await asyncio.sleep(0.05)
 
