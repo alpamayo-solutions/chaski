@@ -415,11 +415,13 @@ def _service_with(door, client):
 
 
 def test_the_ingest_wakes_only_on_its_own_input_topics():
-    door = FakeDoor([
-        signal_entry("s-temp", "temp", path="line1/temp"),
-        signal_entry("s-speed", "speed", path="line1/speed"),
-        signal_entry("s-other", "other", path="line1/other"),
-    ])
+    door = FakeDoor(
+        [
+            signal_entry("s-temp", "temp", path="line1/temp"),
+            signal_entry("s-speed", "speed", path="line1/speed"),
+            signal_entry("s-other", "other", path="line1/other"),
+        ]
+    )
     client = _RecordingClient()
     service = _service_with(door, client)
 
