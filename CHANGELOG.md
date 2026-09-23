@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/alpamayo-solutions/chaski/compare/v0.5.0...v0.5.1) (2026-09-23)
+
+
+### Fixes
+
+* **dataops:** wake the ingest only on the service's own input topics ([#21](https://github.com/alpamayo-solutions/chaski/issues/21)) ([2922ea5](https://github.com/alpamayo-solutions/chaski/commit/2922ea5bef49b8f4be18b42c756a1a1e14925cb8))
+
 ## [0.5.0](https://github.com/alpamayo-solutions/chaski/compare/v0.4.0...v0.5.0) (2026-09-23)
 
 
