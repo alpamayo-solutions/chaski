@@ -16,6 +16,7 @@ import threading
 import time
 from unittest.mock import patch
 
+import httpx
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async, signal_entry
 
@@ -435,6 +436,84 @@ def test_the_ingest_wakes_only_on_its_own_input_topics():
     assert client.unsubscribed == [f"colca/v1/_Metric/{NODE_ID}/line1/temp"]
     assert set(client.callbacks) == {f"colca/v1/_Metric/{NODE_ID}/line1/speed"}
     assert not any(t.endswith("#") for t in client.subscribed)
+
+
+class _ThrottledDoor(FakeDoor):
+    """``/kv`` answers 429 while ``throttled`` is set, as the node's request
+    limit does at startup."""
+
+    throttled = True
+
+    def kv(self, prefix: str = "", *, contract=None):
+        if self.throttled:
+            request = httpx.Request("GET", "http://node/kv")
+            raise httpx.HTTPStatusError(
+                "429 Too Many Requests", request=request, response=httpx.Response(429, request=request)
+            )
+        return super().kv(prefix, contract=contract)
+
+
+def test_a_throttled_topic_read_keeps_the_service_and_retries(monkeypatch):
+    import chaski.dataops.service as service_module
+
+    monkeypatch.setattr(service_module, "WAKE_RETRY_S", 0.01)
+    door = _ThrottledDoor(
+        [
+            signal_entry("s-temp", "temp", path="line1/temp"),
+            signal_entry("s-speed", "speed", path="line1/speed"),
+        ]
+    )
+    door.throttled = False
+    client = _RecordingClient()
+    service = _service_with(door, client)
+    loop = asyncio.new_event_loop()
+    service._loop = loop
+    try:
+        service._wake_on_inputs(["s-temp"])
+        assert client.subscribed == [f"colca/v1/_Metric/{NODE_ID}/line1/temp"]
+
+        door.throttled = True
+        service._wake_on_inputs(["s-temp", "s-speed"])  # must not raise
+        assert client.unsubscribed == []  # the topics already held stay
+        assert set(client.callbacks) == {f"colca/v1/_Metric/{NODE_ID}/line1/temp"}
+
+        loop.run_until_complete(asyncio.sleep(0.05))  # still throttled: retried, backed off
+        assert service._wake_failures >= 2
+
+        door.throttled = False
+        loop.run_until_complete(asyncio.sleep(0.5))
+        assert set(client.callbacks) == {
+            f"colca/v1/_Metric/{NODE_ID}/line1/temp",
+            f"colca/v1/_Metric/{NODE_ID}/line1/speed",
+        }
+        assert service._wake_retry is None
+    finally:
+        service._cancel_wake_retry()
+        loop.close()
+
+
+def test_a_rebind_supersedes_a_pending_topic_retry(monkeypatch):
+    import chaski.dataops.service as service_module
+
+    monkeypatch.setattr(service_module, "WAKE_RETRY_S", 60.0)
+    door = _ThrottledDoor([signal_entry("s-temp", "temp", path="line1/temp")])
+    client = _RecordingClient()
+    service = _service_with(door, client)
+    loop = asyncio.new_event_loop()
+    service._loop = loop
+    try:
+        service._wake_on_inputs(["s-temp"])
+        pending = service._wake_retry
+        assert pending is not None
+
+        door.throttled = False
+        service._wake_on_inputs(["s-temp"])  # the rebind reads at once
+        assert pending.cancelled()
+        assert service._wake_retry is None
+        assert client.subscribed == [f"colca/v1/_Metric/{NODE_ID}/line1/temp"]
+    finally:
+        service._cancel_wake_retry()
+        loop.close()
 
 
 def test_a_burst_of_input_metrics_wakes_the_ingest_once():

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/alpamayo-solutions/chaski/compare/v0.6.0...v0.6.1) (2026-09-23)
+
+
+### Fixes
+
+* **dataops:** keep the service up when the wake-topic read fails ([#25](https://github.com/alpamayo-solutions/chaski/issues/25)) ([cf014f8](https://github.com/alpamayo-solutions/chaski/commit/cf014f8ad8511583d754f2be07f02d2c6deae127))
+
 ## [0.6.0](https://github.com/alpamayo-solutions/chaski/compare/v0.5.1...v0.6.0) (2026-09-23)
 
 
