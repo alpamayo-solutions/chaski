@@ -77,13 +77,13 @@ from colca_data_contracts import Metric
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
 
-from . import codehash, health, resolve, watch
+from . import codehash, commands, health, resolve, watch
 from .base import Producer, Runtime
 from .buffer import Buffer
 from .ingest import Ingest
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import bind_annotation_outputs, build_catalogue, declared_outputs
-from .triggers import CronSpec, IntervalSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
+from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
 
@@ -200,7 +200,8 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
     ``OnMetricSpec`` triggers are not scheduled here; they are in the dispatch
     table from :func:`build_dispatch`. ``OnConstantSpec``/``OnSignalSpec``
     triggers are not scheduled here either; :func:`watch.gather_triggers`
-    subscribes them onto the constant/signal MQTT watch. Every job this
+    subscribes them onto the constant/signal MQTT watch. ``OnCommandSpec``
+    triggers run on :class:`commands.CommandExecutor`. Every job this
     function DOES schedule is wrapped by :func:`off_loop`.
     """
     count = 0
@@ -212,7 +213,7 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
         elif isinstance(spec, IntervalSpec):
             ap_trigger = IntervalTrigger(seconds=spec.seconds)
             kind = f"every({spec.seconds}s)"
-        elif isinstance(spec, (OnMetricSpec, OnConstantSpec, OnSignalSpec)):
+        elif isinstance(spec, (OnMetricSpec, OnConstantSpec, OnSignalSpec, OnCommandSpec)):
             continue  # each owned and scheduled elsewhere (see docstring)
         else:
             log.warning("Unknown trigger spec %r on %s.%s — skipped", spec, instance.name, method_name)
@@ -664,6 +665,7 @@ class DataOpsService(Service):
         self._wake_topics: set[str] = set()
         self._wake_pending = False
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
 
     # -- the run list ----------------------------------------------------
@@ -849,6 +851,31 @@ class DataOpsService(Service):
             signal_triggers,
         )
 
+    def _execute_commands(self, instances: list[Producer]) -> commands.CommandExecutor | None:
+        """Build the executor for every ``@on_command`` declared across
+        ``instances`` and subscribe its wake-ups — see
+        :mod:`chaski.dataops.commands`. ``None``, with no subscription and no
+        cursor, when nothing declared one."""
+        handlers = commands.gather(instances)
+        if not handlers:
+            return None
+        executor = commands.CommandExecutor(
+            self.door,
+            self.stream(commands.STREAM, cursor=commands.CURSOR),
+            handlers,
+            cast(str, self._node_id),
+        )
+        executor.subscribe(self._started_client, cast(asyncio.AbstractEventLoop, self._loop))
+        return executor
+
+    def _broker_state_changed(self, connected: bool) -> None:
+        """Back on the broker: commands sent while the link was down only
+        rang a bell nobody heard, so drain once."""
+        super()._broker_state_changed(connected)
+        loop, executor = self._loop, self._commands
+        if connected and loop is not None and executor is not None:
+            loop.call_soon_threadsafe(executor.wake)
+
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
@@ -940,8 +967,13 @@ class DataOpsService(Service):
                 reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
             )
 
-        # 10) Every @on_constant/@on_signal subscription.
+        # 10) Every @on_constant/@on_signal subscription, and the @on_command
+        #     executor with its wake-ups.
         self._watch_constants_and_signals(instances)
+        self._commands = self._execute_commands(instances)
+        commands_task: asyncio.Task | None = None
+        if self._commands is not None:
+            commands_task = asyncio.ensure_future(self._commands.run_forever(stop))
 
         # 11) Schedule cron/interval triggers (everything except @on_metric),
         #     plus the service's own periodic buffer trim.
@@ -974,6 +1006,12 @@ class DataOpsService(Service):
                 # `stop` is already set, so the loop returns on its next wait;
                 # cancel covers the case where it is mid-KV-read.
                 reresolve_task.cancel()
+            if commands_task is not None:
+                try:
+                    await asyncio.wait_for(commands_task, timeout=10.0)
+                except Exception:
+                    log.exception("Command executor did not shut down cleanly")
+                self._commands = None
             if ingest_task is not None:
                 ingest.wake()
                 try:

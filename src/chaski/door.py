@@ -294,14 +294,22 @@ class Door:
         resp = self._client.post("/ack", json={"cursor": cursor, "stream": stream, "delete": True})
         resp.raise_for_status()
 
-    def publish(self, topic: str, payload: str) -> None:
+    def publish(self, topic: str, payload: str) -> dict | None:
         """``POST /publish``: publish one record under this service's identity.
 
         ``payload`` is a JSON string. It is embedded as a JSON value, not as a
         string, so the stored record matches what an MQTT publisher sends.
+
+        Returns the door's response body, ``None`` when it is empty. A command
+        the node executes itself (``_CmdConfigure``) is answered in it: the
+        ``_Ack`` is under ``"command"``.
         """
         resp = self._client.post("/publish", json={"topic": topic, "payload": json.loads(payload)})
         resp.raise_for_status()
+        if not resp.content:
+            return None
+        body = resp.json()
+        return body if isinstance(body, dict) else None
 
     def retire(self, topic: str) -> None:
         """``POST /publish`` with NO payload — the tombstone.
