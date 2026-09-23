@@ -12,6 +12,7 @@ from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 
 from chaski.dataops import Command, CommandRejected, on_command
 from chaski.dataops.base import Producer
+from chaski.dataops import commands
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
 from chaski.door import Page, Record, Stream
@@ -112,8 +113,9 @@ def test_command_topics_and_subscription():
         def message_callback_add(self, topic, callback) -> None:
             pass
 
-        def subscribe(self, topic, qos) -> None:
+        def subscribe(self, topic, qos):
             self.subscribed.append((topic, qos))
+            return 0, len(self.subscribed)
 
     client = Client()
     assert ex.subscribe(client, asyncio.new_event_loop()) == 2
@@ -121,6 +123,36 @@ def test_command_topics_and_subscription():
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct", 1),
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setRecipe", 1),
     ]
+
+
+def test_a_refused_subscription_is_sent_again():
+    """mochi refuses a SUBSCRIBE whose id collides with one of its in-flight
+    deliveries ("packet identifier in use", 0x91)."""
+    ex, _producer, _door = executor()
+
+    class Client:
+        on_subscribe = None
+
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        def message_callback_add(self, topic, callback) -> None:
+            pass
+
+        def subscribe(self, topic, qos):
+            self.subscribed.append(topic)
+            return 0, len(self.subscribed)
+
+    client = Client()
+    loop = asyncio.new_event_loop()
+    try:
+        ex.subscribe(client, loop)
+        client.on_subscribe(client, None, 1, [0x91], None)  # setProduct refused
+        client.on_subscribe(client, None, 2, [1], None)  # setRecipe granted
+        loop.run_until_complete(asyncio.sleep(commands._SUBSCRIBE_RETRY_S + 0.2))
+    finally:
+        loop.close()
+    assert client.subscribed[2:] == [f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct"]
 
 
 # ─── execution ───────────────────────────────────────────────────────────
