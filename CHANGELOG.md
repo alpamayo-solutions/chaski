@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/alpamayo-solutions/chaski/compare/v0.6.1...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* **dataops:** execute commands from a producer ([@on](https://github.com/on)_command) ([#26](https://github.com/alpamayo-solutions/chaski/issues/26)) ([5c50765](https://github.com/alpamayo-solutions/chaski/commit/5c5076554508c98737bad7f27220fbd72ad692e4))
+
 ## [0.6.1](https://github.com/alpamayo-solutions/chaski/compare/v0.6.0...v0.6.1) (2026-09-23)
 
 
