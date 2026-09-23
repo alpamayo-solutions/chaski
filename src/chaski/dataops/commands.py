@@ -203,8 +203,11 @@ class CommandExecutor:
             with lock:
                 topic = pending.pop(mid, None)
             if topic is not None and any(_refused(code) for code in reason_codes or ()):
-                log.warning("commands: subscription to %s refused (%s) — retrying", topic,
-                            ", ".join(str(code) for code in reason_codes))
+                log.warning(
+                    "commands: subscription to %s refused (%s) — retrying",
+                    topic,
+                    ", ".join(str(code) for code in reason_codes),
+                )
                 loop.call_soon_threadsafe(loop.call_later, _SUBSCRIBE_RETRY_S, _send, topic)
             if original is not None:
                 original(c, userdata, mid, reason_codes, properties)
