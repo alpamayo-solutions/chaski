@@ -1,8 +1,9 @@
 """Shared stand-ins for the ``chaski.dataops`` tests.
 
-A :class:`FakeDoor` answers ``kv()`` from a canned snapshot, records
-``publish()`` calls and serves ``fetch``/``ack`` from queued pages. A
-:class:`FakeRuntime` gives a producer the fake door, a real
+A :class:`FakeDoor` answers ``kv()`` from a canned snapshot, serves
+``fetch``/``ack`` from queued pages and keeps in ``published`` what was sent
+to the node. A :class:`FakeRuntime` gives a producer the fake door, a
+``send`` that lands there, a real
 :class:`~chaski.dataops.Buffer` on a temporary SQLite file, and an optional
 historian stand-in.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 from typing import Any
 
 from chaski.door import KvEntry, Page, Stream
@@ -43,7 +45,7 @@ def signal_entry(signal_id: str, name: str, *, path: str | None = None, node_id:
 
 class FakeDoor:
     """A Door stand-in: canned ``kv()`` snapshot (mutate ``.entries`` between
-    calls to simulate a KV change), recorded ``publish()`` calls, fixed
+    calls to simulate a KV change), the records sent to the node, fixed
     ``self_info()``, and queued pages for ``fetch``/``ack``/``delete_cursor``."""
 
     def __init__(
@@ -58,14 +60,11 @@ class FakeDoor:
         self._pages: list[Page] = []
         self._self_info = {"ulid": ulid, "name": name, "node": NODE_ID, "element": "", "mount": mount}
 
-    # -- kv / publish / self --------------------------------------------
+    # -- kv / self --------------------------------------------------------
 
     def kv(self, prefix: str = "", *, contract: Any = None) -> list[KvEntry]:
         self.kv_calls += 1
         return list(self.entries)
-
-    def publish(self, topic: str, payload: str) -> None:
-        self.published.append((topic, payload))
 
     def self_info(self) -> dict:
         return dict(self._self_info)
@@ -110,3 +109,13 @@ class FakeRuntime:
         self.door = door
         self.buffer = buffer
         self.historian = historian
+
+    def send(self, topic: str, payload: str, *, retain: bool = False) -> None:
+        self.door.published.append((topic, payload))
+
+    def retract(self, topic: str) -> None:
+        self.door.published.append((topic, ""))
+
+    def command(self, contract: str, path: str, fields: dict | None = None, *, timeout: float = 30.0) -> dict:
+        self.door.published.append((f"colca/v1/{contract}/{NODE_ID}/{path}", json.dumps(fields or {})))
+        return {"result_code": 200, "message": ""}

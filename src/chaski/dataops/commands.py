@@ -16,8 +16,8 @@ QoS 1; a message wakes a drain of the stream and is not read itself. The
 executor drains once at startup, once per wake and once after the broker link
 comes back. There is no timed poll.
 
-**Answers.** Each command is answered at ``_Ack/<node>/<path>`` with
-``{correlation_id, result_code, message, performed_at}``:
+**Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
+with ``{correlation_id, result_code, message, performed_at}``:
 
 ======  =====================================================
 200     the handler returned; its string is the message
@@ -152,16 +152,19 @@ def _deadline(raw: Any) -> float | None:
 
 class CommandExecutor:
     """Drains the ``commands`` stream for the declared commands and answers
-    them. ``handlers`` comes from :func:`gather`."""
+    them. ``handlers`` comes from :func:`gather`; ``send`` publishes the
+    ack (the service's :meth:`~chaski.Service.send`)."""
 
     def __init__(
         self,
         door: Any,
+        send: Callable[[str, str], None],
         stream: Stream,
         handlers: dict[tuple[str, str], Callable],
         node_id: str,
     ) -> None:
         self._door = door
+        self._send = send
         self._stream = stream
         self._handlers = handlers
         self._node_id = node_id
@@ -314,7 +317,7 @@ class CommandExecutor:
             "message": message,
             "performed_at": time.time(),
         }
-        await asyncio.to_thread(self._door.publish, self.ack_topic(path), json.dumps(answer))
+        await asyncio.to_thread(self._send, self.ack_topic(path), json.dumps(answer))
 
     async def _run(self, handler: Any, command: Command) -> tuple[int, str]:
         producer = handler.__self__

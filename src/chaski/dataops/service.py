@@ -687,8 +687,8 @@ class DataOpsService(Service):
 
     @property
     def door(self) -> Door:
-        """The door every input resolves and every output publishes
-        through — the base class's own, open after :meth:`start`."""
+        """The door every input resolves through — the base class's own,
+        open after :meth:`start`. Outputs write with :meth:`send`."""
         return self._require_http("door")
 
     @property
@@ -853,6 +853,7 @@ class DataOpsService(Service):
             return None
         executor = commands.CommandExecutor(
             self.door,
+            self.send,
             self.stream(commands.STREAM, cursor=commands.CURSOR),
             handlers,
             cast(str, self._node_id),

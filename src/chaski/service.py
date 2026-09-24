@@ -33,6 +33,12 @@ returns a snapshot of the node's retained state, and ``stream(name)`` a
 durable cursor over one of its streams (``chaski.door.Stream``), both with the
 service's own identity.
 
+**Records and commands.** Everything a service writes goes over its MQTT
+session: ``send(topic, payload)`` publishes any other record at QoS 1 and
+waits for the PUBACK, ``retract(topic)`` retires a state record, and
+``command(contract, path, fields)`` sends a command to the service's node and
+returns its ``_Ack``. HTTP is for reading.
+
 **Bridges.** A bridge to an ERP or MES is a plain ``Service``: it polls the
 foreign system and ``publish()``-es what it learns, and follows a stream with
 ``stream()`` to write back. What it may do comes from its enrollment grants.
@@ -53,7 +59,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from urllib.parse import urlsplit
 
 import paho.mqtt.client as pahomqtt
@@ -79,6 +85,7 @@ from cryptography.x509.oid import NameOID
 from franzmq import Client, Topic
 
 from .catalogue import Catalogue, element_for
+from .command import CommandSender
 from .door import Door, KvEntry, Stream
 
 logger = logging.getLogger(__name__)
@@ -292,11 +299,14 @@ def tolerate_undecodable(client: Any) -> None:
     def guarded(message: Any) -> Any:
         try:
             return typed_dispatch(message)
-        except Exception:
-            logger.warning(
-                "undecodable message on %s — dispatching it undecoded instead",
+        except Exception as exc:
+            # One line: a configure ack (``state_writes``) lands here on every
+            # command, which is expected, not a fault.
+            logger.info(
+                "undecodable message on %s (%s: %s) — dispatching it undecoded instead",
                 getattr(message, "topic", "?"),
-                exc_info=True,
+                type(exc).__name__,
+                exc,
             )
             return raw_dispatch(client, message)
 
@@ -414,6 +424,7 @@ class Service:
         self._seen: set[str] = set()
         self._last_status = "healthy"
         self._last_detail = ""
+        self._command_sender: CommandSender | None = None
 
         if isinstance(node, LocalDoor):
             self._external = False
@@ -606,6 +617,8 @@ class Service:
         if str(old_filter) != str(self._signal_filter):
             client.unsubscribe(old_filter)
         client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
+        if self._command_sender is not None:
+            self._command_sender.resubscribe(client)
         with self._lock:
             details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
@@ -675,6 +688,7 @@ class Service:
         # Load the previous catalogue before subscribing: retained _Signal
         # records name the last run's ids, and bindings for unknown ids are
         # dropped (see _on_signal).
+        self._command_sender = CommandSender(self._started_client, str(self._node_id))
         with self._lock:
             self._started_catalogue.load_previous(self._previous_catalogue())
         self._started_client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
@@ -804,6 +818,48 @@ class Service:
                 len(queue),
                 _MAX_BUFFERED_PER_PATH,
             )
+
+    # -- records and commands ------------------------------------------------
+
+    def _require_client(self, method: str) -> Any:
+        if self._closed:
+            raise RuntimeError("chaski.Service is closed")
+        if self._client is None:
+            raise RuntimeError(f"chaski.Service: call start() (or use `with Service(...) as svc:`) before {method}()")
+        return self._client
+
+    def send(self, topic: str, payload: str, *, retain: bool = False) -> None:
+        """Publish one record at ``topic`` on this service's MQTT session, at
+        QoS 1, and wait for the node's PUBACK.
+
+        ``payload`` is the record as a JSON string. ``retain`` for a state
+        record. A record the node refuses raises
+        ``franzmq.errors.PublishRejected``; no PUBACK in time raises
+        ``PublishTimeout``. Must not be called from an MQTT callback, which
+        cannot wait for its own PUBACK.
+        """
+        # franzmq sends ``payload.encode()``, which a JSON string already has.
+        self._require_client("send").publish(topic, payload, qos=1, retain=retain)
+
+    def retract(self, topic: str) -> None:
+        """Retire the state record at ``topic``: an empty retained payload,
+        which the node keeps as a tombstone and drops from its KV."""
+        self._require_client("retract").publish_tombstone(topic, qos=1)
+
+    def command(
+        self,
+        contract: str,
+        path: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Send one command to ``path`` on this service's node and return its
+        ``_Ack`` as the executor wrote it (``result_code``, ``message``, and
+        whatever else it carries, such as ``state_writes``). See
+        :meth:`chaski.command.CommandSender.command`."""
+        self._require_client("command")
+        return cast(CommandSender, self._command_sender).command(contract, path, fields, timeout=timeout)
 
     # -- consuming ---------------------------------------------------------
 
