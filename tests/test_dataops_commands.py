@@ -69,7 +69,12 @@ def executor(*records: Record) -> tuple[CommandExecutor, Selection, FakeDoor]:
     producer = Selection().attach(FakeRuntime(door, buffer=None))
     if records:
         door.queue(Page(records=list(records), next=records[-1].offset + 1))
-    return CommandExecutor(door, Stream(door, "commands", CURSOR), gather([producer]), NODE_ID), producer, door
+    runtime = producer.runtime
+    return (
+        CommandExecutor(door, runtime.send, Stream(door, "commands", CURSOR), gather([producer]), NODE_ID),
+        producer,
+        door,
+    )
 
 
 def acks(door: FakeDoor) -> list[tuple[str, dict]]:
