@@ -152,14 +152,14 @@ class Buffer:
             row = self._conn.execute("SELECT MIN(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
-    def trim(self, horizons: dict[str, float]) -> int:
+    def trim(self, horizons: dict[str, float], *, now: float | None = None) -> int:
         """Delete points older than each signal's declared horizon (seconds).
 
         Only signals present as keys in ``horizons`` are touched — a
         signal absent from the dict keeps every point it has. Never
         touches ``watermarks`` or ``meta``. Returns the total rows deleted.
         """
-        now = time.time()
+        now = time.time() if now is None else now
         deleted = 0
         with self._lock:
             for signal_id, horizon in horizons.items():

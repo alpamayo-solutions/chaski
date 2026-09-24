@@ -48,7 +48,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from math import isclose, isfinite, isnan
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from colca_data_contracts.payload import DataTag, Metric
 from colca_data_contracts.payload import Signal as SignalRecord
@@ -103,6 +103,7 @@ class Reading(NamedTuple):
     topic: Topic
     value: Any
     signal: SignalRecord
+    timestamp: float | None = None
 
 
 class Discovery(NamedTuple):
@@ -141,7 +142,7 @@ class Driver:
         it, when ``catalogue_requires_connection`` is False)."""
         raise NotImplementedError
 
-    async def read(self, targets: list[Target]) -> Iterable[tuple[Topic, Any, SignalRecord]]:
+    async def read(self, targets: list[Target]) -> Iterable[tuple[Topic, Any, SignalRecord] | Reading]:
         """One poll of ``targets``. A target a driver could not read is
         simply absent from the result; a lost source raises
         :class:`SourceDisconnectedError`."""
@@ -268,6 +269,7 @@ class ConnectorService(Service):
         outage_reminder: float = 300.0,
         summary_interval: float = 60.0,
         telemetry: Telemetry | None = None,
+        timestamp_source: Literal["acquisition", "source"] = "acquisition",
         **service_kwargs: Any,
     ) -> None:
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
@@ -275,6 +277,9 @@ class ConnectorService(Service):
             raise ValueError("max_pending must be positive")
         super().__init__(name, mount, metadata=metadata, max_queued_messages=int(max_pending), **service_kwargs)
         self.driver = driver
+        if timestamp_source not in ("acquisition", "source"):
+            raise ValueError("timestamp_source must be acquisition or source")
+        self.timestamp_source = timestamp_source
         self.interval = float(interval)
         self.heartbeat_interval = float(heartbeat_interval)
         self.max_pending = int(max_pending)
@@ -473,6 +478,9 @@ class ConnectorService(Service):
         # (the contract's timestamp is a number; a datetime would encode
         # to an ISO string the door refuses).
         loop_start_epoch = datetime.datetime.now(datetime.UTC).timestamp()
+        clock_status = self.clock.status()
+        step_target = await asyncio.to_thread(self.step.ready) if self.step is not None else None
+        sampling = step_target is not None if self.step is not None else clock_status.ready and clock_status.rate > 0
         try:
             if not self._discovered and self._now() >= self._next_discovery_retry:
                 await self._retry_discovery()
@@ -490,12 +498,12 @@ class ConnectorService(Service):
             heartbeat_targets = [t for t in targets if t.signal.data_tag == heartbeat_id]
             protocol_targets = [t for t in targets if t.signal.data_tag not in (heartbeat_id, is_connected_id)]
 
-            raw_batch: list[tuple[Topic, Any, SignalRecord]] = []
+            raw_batch: list[tuple[Topic, Any, SignalRecord] | Reading] = []
             # A lost source must not cost the heartbeat: the connector is
             # alive even when its source is not, and the heartbeat is what
             # says so. Re-raised after publishing, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
-            if protocol_targets:
+            if protocol_targets and sampling:
                 try:
                     raw_batch = list(await self.driver.read(protocol_targets))
                     # The authoritative health signal: the protocol
@@ -516,7 +524,9 @@ class ConnectorService(Service):
             self._publish_is_connected()
 
             batch: list[tuple[Topic, Metric]] = []
-            for topic, raw_value, signal in raw_batch:
+            for reading in raw_batch:
+                topic, raw_value, signal = reading[:3]
+                source_timestamp = reading[3] if len(reading) > 3 else None
                 value = raw_value
                 precision = signal.precision
                 if precision is not None and isinstance(value, (int, float)):
@@ -525,11 +535,25 @@ class ConnectorService(Service):
                 last = self._latest_by_topic.get(key)
                 if last is not None and is_equal(last.value, value, precision):
                     continue
-                metric = Metric(value=value, timestamp=loop_start_epoch, signal_id=signal.id)
+                timestamp = (
+                    loop_start_epoch
+                    if signal.data_tag == heartbeat_id
+                    else (step_target if self.step is not None else clock_status.factory_now)
+                )
+                if self.timestamp_source == "source" and source_timestamp is not None:
+                    if not isfinite(source_timestamp):
+                        raise ValueError("source timestamp must be finite")
+                    timestamp = source_timestamp
+                metric = Metric(value=value, timestamp=timestamp, signal_id=signal.id)
                 self._latest_by_topic[key] = metric
                 batch.append((topic, metric))
 
             self._publish_batch(batch)
+            if self.step is not None and step_target is not None and source_lost is None:
+                # Partial protocol reads cannot acknowledge an entire window.
+                received = {str(reading[0]) for reading in raw_batch}
+                if protocol_targets and all(str(target.topic) in received for target in protocol_targets):
+                    await asyncio.to_thread(self.step.complete, step_target)
             self._summary_polls += 1
             self._log_summary(len(targets))
 
@@ -560,7 +584,12 @@ class ConnectorService(Service):
             raise
 
         elapsed = time.perf_counter() - loop_start_perf
-        wait = self.interval - elapsed
+        cadence = (
+            0.01
+            if self.step is not None
+            else (self.interval / clock_status.rate if sampling else min(self.interval, 0.25))
+        )
+        wait = cadence - elapsed
         self.telemetry.poll_completed(elapsed, overrun=wait <= 0)
         if wait > 0:
             await self._sleep(wait)
@@ -721,6 +750,8 @@ class ConnectorService(Service):
                 self._summary_published += 1
                 self.telemetry.published(metric, node_id=self._node_id or "")
             except PublishRejected as exc:
+                if self.step is not None:
+                    raise
                 # Refused by the broker: retrying would fail the same way, so the
                 # record is dropped and the reason reported.
                 self.telemetry.publish_rejected(exc.reason_code)
@@ -731,6 +762,8 @@ class ConnectorService(Service):
                 self._buffer_pending(batch[index:])
                 raise MqttDisconnectedError(str(exc)) from exc
             except Exception as exc:
+                if self.step is not None:
+                    raise
                 self._log.error("Publish error to %s: %s", topic, exc)
 
     # -- outage reporting -------------------------------------------------

@@ -40,6 +40,7 @@ from typing import Any
 import ulid as ulid_lib
 import yaml
 
+from .clock import Clock
 from .service import LocalDoor, Service
 
 logger = logging.getLogger(__name__)
@@ -584,7 +585,9 @@ class Node:
 
     # -- publishing --------------------------------------------------------
 
-    def service(self, name: str, mount: str = "") -> Service:
+    def service(
+        self, name: str, mount: str = "", *, clock: Clock | None = None, step_dependencies: list[str] | None = None
+    ) -> Service:
         """A local Service on this node's own local door."""
         self._check_alive()
         if not self._ports:
@@ -594,6 +597,13 @@ class Node:
             http_port=self._ports["api_local"],
             mqtt_port=self._ports["mqtt_local"],
         )
-        svc = Service(name, mount, node=door, state_dir=self.data_dir / "services" / name)
+        svc = Service(
+            name,
+            mount,
+            node=door,
+            state_dir=self.data_dir / "services" / name,
+            clock=clock,
+            step_dependencies=step_dependencies,
+        )
         svc.start()
         return svc

@@ -702,7 +702,7 @@ def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
 # ─── handlers and ticks serialize on the producer's lock ─────────────────
 
 
-def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock():
+def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
     """A handler (through `make_handler`) and a tick (through `off_loop`) on the
     same producer never overlap. The producer overrides `__init__` without
     calling super(); the lock exists anyway."""
@@ -714,12 +714,14 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock():
         def __init__(self):
             self.active = 0
             self.max_active = 0
+            self.completed = 0
 
         def _critical_section(self):
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             time.sleep(0.1)
             self.active -= 1
+            self.completed += 1
 
         @on_metric("dummy_input")
         async def on_event(self, metric):
@@ -729,7 +731,7 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock():
         async def tick(self):
             self._critical_section()
 
-    inst = _LockedProducer()
+    inst = _LockedProducer().attach(runtime)
     handler = make_handler(inst.on_event)
     tick_job = off_loop(inst.tick)
     record = _metric_record({"signal_id": "s", "value": 1.0, "timestamp": 1.0}, ts=1000.0)
@@ -751,4 +753,60 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock():
     t1.join(timeout=5.0)
     t2.join(timeout=5.0)
 
+    assert not t1.is_alive() and not t2.is_alive()
+    assert inst.completed == 2, "both the metric handler and timer must execute"
     assert inst.max_active == 1, "handler and tick ran concurrently — the producer's lock did not serialize them"
+
+
+def test_real_time_health_input_does_not_stamp_outputs_in_real_time(runtime):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+
+    runtime.clock = Clock(wall=lambda: 10000)
+    runtime.clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 1000))
+    seen = []
+
+    class Health(Producer):
+        name = "real_health"
+        system_element_name = "SE-Event"
+        alive = SignalRangeInput("on_metric_signal", time_domain="real")
+
+        @on_metric("alive")
+        async def on_health(self, metric):
+            seen.append(self.now)
+
+    dispatch, _, _ = build_dispatch(runtime, [Health().attach(runtime)])
+    record = _metric_record({"signal_id": "sig-event", "timestamp": 10000, "value": True}, ts=10000000)
+    asyncio.run(dispatch["sig-event"][0](record))
+    assert seen == [1000]
+
+
+def test_buffer_trim_preserves_a_slow_factory_timer_and_uses_real_health_time(runtime):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+    from chaski.dataops.scheduling import timer_key
+
+    clock = Clock(wall=lambda: 10000)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 9990, 1000, 1000))
+
+    class Mixed(Producer):
+        name = "slow_timer"
+        system_element_name = "SE-Event"
+        values = SignalRangeInput("tick_only_signal", window=10)
+        health = SignalRangeInput("on_metric_signal", window=10, time_domain="real")
+
+        @every("10s")
+        async def tick(self):
+            pass
+
+    instance = Mixed().attach(runtime)
+    runtime.buffer.append("sig-tick", 1040, 1)
+    runtime.buffer.append("sig-tick", 1050, 2)
+    runtime.buffer.append("sig-event", 9980, 0)
+    runtime.buffer.append("sig-event", 9999, 1)
+    runtime.buffer.set_watermark(timer_key(instance, "tick", type(instance)._triggers[0][1]), 1060, "clock-v1")
+    trim_buffer(runtime.buffer, [instance], 10, clock)
+    assert runtime.buffer.earliest("sig-tick") == 1050
+    assert runtime.buffer.earliest("sig-event") == 9999

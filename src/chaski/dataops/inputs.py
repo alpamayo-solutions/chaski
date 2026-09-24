@@ -35,11 +35,12 @@ import copy
 import logging
 import time
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import pandas as pd
 
 from . import resolve
+from .base import runtime_now
 from .triggers import parse_duration
 
 if TYPE_CHECKING:
@@ -123,7 +124,12 @@ class SignalRangeInput(_PerInstance):
         signal_name: str,
         system_element_name: str | None = None,
         window: str | float = DEFAULT_WINDOW,
+        *,
+        time_domain: Literal["application", "real"] = "application",
     ) -> None:
+        if time_domain not in ("application", "real"):
+            raise ValueError("time_domain must be application or real")
+        self.time_domain = time_domain
         self.signal_name = signal_name
         self.system_element_name = system_element_name
         self.window_s = parse_duration(window)
@@ -223,20 +229,29 @@ class SignalRangeInput(_PerInstance):
         return self._runtime().buffer.earliest(self.signal_id)
 
     @property
+    def now(self) -> float:
+        """Time for this input: infrastructure health can opt into real time."""
+        runtime = self._runtime()
+        if self.time_domain == "real":
+            clock = getattr(runtime, "clock", None)
+            return clock.real_now() if clock is not None else time.time()
+        return runtime_now(runtime)
+
+    @property
     def latest_value(self) -> Any:
         """The value in force right now (``latest_value_before(now)``)."""
-        return self.latest_value_before(time.time())
+        return self.latest_value_before(self.now)
 
     @property
     def latest_timestamp(self) -> float | None:
         """The timestamp of :attr:`latest_value`, or ``None``."""
-        return self.latest_timestamp_before(time.time())
+        return self.latest_timestamp_before(self.now)
 
     def is_fresh(self, freshness_s: float, now: float | None = None) -> bool:
         """True iff the most recent point at/before ``now`` is at most
         ``freshness_s`` seconds old. Used by state-machine producers to
         gate decisions like "heartbeat is alive"."""
-        now = now if now is not None else time.time()
+        now = now if now is not None else self.now
         ts = self.latest_timestamp_before(now)
         if ts is None:
             return False

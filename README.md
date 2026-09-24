@@ -214,3 +214,48 @@ licensed under the [Functional Source License, Version 1.1, ALv2 Future
 License](LICENSE.md): use it for anything except a product or service that
 competes with it; every release becomes Apache 2.0 two years after it is
 published.
+
+### Optional application time
+
+`Clock()` uses host time without requiring NTP. `Clock(source="mqtt")` uses
+Colca's existing live `_TimeSync` beacon. Host/NTP and MQTT corrections are
+alternatives, never added together. `Clock.from_env()` reads
+`APPLICATION_TIME_SOURCE` (`local` by default), `FACTORY_CLOCK_TOPIC` (an exact
+`_ClockDefinition` topic), and `TIME_SYNC_MAX_AGE_S` (120 real seconds).
+
+Pass the clock to `Service`, `ConnectorService` or `DataOpsService`. A selected
+factory definition supplies the epoch, rate, pause and stop boundary. Missing
+or stale authority suspends application work; health, reconnects, credentials
+and network deadlines continue in real time. No OS clock is changed. Source
+readings can provide an optional timestamp with `Reading`; acquisition time
+remains the connector default.
+
+Periodic DataOps callbacks execute every due factory tick in order and persist
+their progress. Inputs normally use application time; declare
+`SignalRangeInput(..., time_domain="real")` for infrastructure heartbeat inputs.
+Output timestamps stay in application time when a real-time heartbeat triggers
+computation.
+
+For coordinated simulation, pass `step_dependencies=[...]` to each service.
+An empty list identifies a source worker; omitting the argument keeps normal
+continuous operation. Dependencies are exact `_ServiceDetails` topics or local
+service names such as `./temperature-source` (resolved from service records,
+independent of placement). The deployment helper `dependencies_from_env()` in
+`chaski.coordination` reads the optional JSON `FACTORY_STEP_DEPENDENCIES` list.
+
+The controller grants a bounded window with `ClockDefinition.stop_at`. A worker
+waits for `service.step.ready()`, completes the work, commits its effects, then
+calls `service.step.complete(boundary)`. Connectors wait for their sources,
+acquire and publish the boundary sample, then acknowledge it; DataOps drains
+upstream samples and due callbacks before acknowledging. Failed reads, publishes
+or processing cannot acknowledge a completed window. The controller must wait
+for **all explicitly required workers** before extending the boundary. This
+makes the requested rate a ceiling, with sample resolution determined by the
+window length. It does not make slow hardware run faster.
+
+Completion positions survive restarts. Callbacks must be idempotent because a
+crash between committing an effect and recording completion can replay it.
+Missing, inactive, stale or wrong-run dependency progress holds the window.
+`service.report_progress(processed_at)` is available for continuous workers;
+report committed work, never the target clock. Its liveness heartbeat uses real
+time and continues while a run is paused.

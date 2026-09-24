@@ -12,6 +12,7 @@ from typing import Any
 
 from colca_data_contracts.payload import DataTag
 
+from .clock import Clock, ClockNotReady, ClockStatus
 from .connector import (
     ConnectorService,
     Discovery,
@@ -26,6 +27,9 @@ from .node import Node
 from .service import LocalDoor, NotEnrolled, Service
 
 __all__ = [
+    "Clock",
+    "ClockNotReady",
+    "ClockStatus",
     "ConnectorService",
     "DataOpsService",
     "DataTag",

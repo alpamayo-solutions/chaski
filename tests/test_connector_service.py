@@ -307,6 +307,52 @@ def bind(node: FakeNode, svc: ConnectorService, source: str, *, path: str, signa
     return node.deliver_signal(path=path, signal_id=signal_id, data_tag=svc._catalogue.tag_id(source), **kw)
 
 
+def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock as ApplicationClock
+
+    real = Clock()
+    svc = started(node, driver, monkeypatch, clock=real)
+    svc.interval = 10
+    svc.clock = ApplicationClock(wall=real)
+    svc.clock.apply_definition(ClockDefinition("factory", "run", 1, 1000, 100, 100))
+    bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
+    bind(node, svc, HEARTBEAT_TAG_SOURCE, path="heartbeat", signal_id="heartbeat")
+    poll(svc)
+    assert len(driver.reads) == 1
+    assert 0 < svc.slept[-1] <= 0.1
+    assert next(m for _, m in node.metrics() if m.signal_id == "temp").timestamp == 100
+
+    svc.clock.apply_definition(ClockDefinition("factory", "run", 2, 1000, 100, 0))
+    real.now += 5
+    poll(svc)
+    assert len(driver.reads) == 1
+    heartbeats = [m for _, m in node.metrics() if m.signal_id == "heartbeat"]
+    assert len(heartbeats) == 2
+    assert all(m.timestamp > 1_000_000_000 for m in heartbeats)
+
+    svc.clock.apply_definition(ClockDefinition("factory", "run", 3, 1005, 100, 10))
+    real.now += 1
+    driver.values["Axis1/Temperature"] = 43
+    poll(svc)
+    assert len(driver.reads) == 2
+    assert [m.timestamp for _, m in node.metrics() if m.signal_id == "temp"] == [100, 110]
+    assert 0 < svc.slept[-1] <= 1
+
+
+def test_missing_clock_stops_sampling_without_stopping_health(node, driver, monkeypatch):
+    from chaski.clock import Clock as ApplicationClock
+
+    svc = started(node, driver, monkeypatch)
+    svc.clock = ApplicationClock(source="mqtt")
+    bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
+    bind(node, svc, HEARTBEAT_TAG_SOURCE, path="heartbeat", signal_id="heartbeat")
+    poll(svc)
+    assert driver.reads == []
+    assert [m.signal_id for _, m in node.metrics()] == ["heartbeat"]
+
+
 # ── the catalogue ──────────────────────────────────────────────────────
 
 

@@ -77,6 +77,51 @@ def _local_service(
     return svc, client
 
 
+def test_clock_progress_survives_loss_of_sync_and_broker(tmp_path, monkeypatch):
+    from chaski.clock import Clock
+
+    svc, client = _local_service(tmp_path, monkeypatch, clock=Clock(source="mqtt"))
+    assert svc.report_progress(1000)
+    details = client.published[-1][1]
+    progress = details.metadata["application_clock"]
+    assert progress["processed_at"] == 1000
+    assert progress["ready"] is False
+    assert progress["observed_at"] is None
+    assert progress["lag_s"] is None
+
+    def disconnected(*args, **kwargs):
+        raise ConnectionError("broker unavailable")
+
+    monkeypatch.setattr(client, "publish", disconnected)
+    svc._last_clock_report = 0
+    assert svc.report_progress(1000) is False
+    assert svc.metadata["application_clock"]["processed_at"] == 1000
+    with pytest.raises(ValueError, match="finite"):
+        svc.report_progress(float("nan"))
+    monkeypatch.undo()
+    svc.close()
+
+
+def test_progress_liveness_continues_while_factory_time_is_paused(tmp_path, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+
+    real = [10000.0]
+    clock = Clock(wall=lambda: real[0])
+    clock.apply_definition(ClockDefinition("factory", "run", 1, real[0], 1000, 0))
+    svc, client = _local_service(tmp_path, monkeypatch, clock=clock)
+    assert svc.report_progress(1000)
+    real[0] += 6
+    svc._last_clock_report = float("-inf")
+    assert svc._publish_progress()
+    progress = client.published[-1][1].metadata["application_clock"]
+    assert progress["processed_at"] == progress["factory_now"] == 1000
+    assert progress["observed_at"] == 10006
+    svc.close()
+    assert not svc._progress_thread.is_alive()
+
+
 def _external_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
