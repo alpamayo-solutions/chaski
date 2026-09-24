@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/alpamayo-solutions/chaski/compare/v0.10.0...v0.10.1) (2026-09-24)
+
+
+### Fixes
+
+* **clock:** require ordered sample completion before advancing windows ([#41](https://github.com/alpamayo-solutions/chaski/issues/41)) ([2d7819f](https://github.com/alpamayo-solutions/chaski/commit/2d7819f825b1c33f7c72df909362f1c89c75751c))
+
 ## [0.10.0](https://github.com/alpamayo-solutions/chaski/compare/v0.9.0...v0.10.0) (2026-09-24)
 
 
