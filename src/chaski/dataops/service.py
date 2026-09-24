@@ -935,6 +935,8 @@ class DataOpsService(Service):
                 try:
                     await instance.setup()
                 except Exception:
+                    if self.step is not None:
+                        raise
                     log.exception("Producer %s setup() failed — skipping", instance.name)
                     continue
                 instances.append(instance)
@@ -950,6 +952,8 @@ class DataOpsService(Service):
                 try:
                     await instance.on_ready()
                 except Exception:
+                    if self.step is not None:
+                        raise
                     log.exception("Producer %s on_ready() failed — its triggers are still wired", instance.name)
 
             # 5) Refuse windows longer than the broker's retention without a historian.

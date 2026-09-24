@@ -55,6 +55,8 @@ class StepGate:
         self.service, self.dependencies, self.path = service, frozenset(dependencies), path
         self._lock = threading.RLock()
         self._records: dict[str, dict] = {}
+        self._barriers: dict[str, dict] = {}
+        self._record_topics: dict[str, str] = {}
         self.completed_at: float | None = None
         self.run_id: str | None = None
         if path.exists():
@@ -66,14 +68,17 @@ class StepGate:
     def topics(self) -> set[str]:
         # Placement can change a local service's topic. Select local aliases by
         # the service name in its retained record, not by an invented mount.
-        return {
+        details = {
             f"{topic_prefix()}_ServiceDetails/{self.service.node_id}/#" if topic.startswith("./") else topic
             for topic in self.dependencies
         }
+        return details | {t.replace("/_ServiceDetails/", "/_ClockProgress/", 1) for t in details}
 
     def reconnect(self) -> None:
         with self._lock:
             self._records.clear()
+            self._barriers.clear()
+            self._record_topics.clear()
 
     def observe(self, message) -> None:
         topic, data = str(message.topic), message.payload
@@ -81,6 +86,14 @@ class StepGate:
             data = json.loads(data) if data else None
         elif is_dataclass(data) and not isinstance(data, type):
             data = asdict(data)
+        if "/_ClockProgress/" in topic:
+            details_topic = topic.replace("/_ClockProgress/", "/_ServiceDetails/", 1)
+            with self._lock:
+                if isinstance(data, dict):
+                    self._barriers[details_topic] = data
+                else:
+                    self._barriers.pop(details_topic, None)
+            return
         key = topic
         if key not in self.dependencies:
             if not isinstance(data, dict) or not topic.startswith(
@@ -93,13 +106,25 @@ class StepGate:
         with self._lock:
             if isinstance(data, dict):
                 self._records[key] = data
+                self._record_topics[key] = topic
             else:
                 self._records.pop(key, None)
 
     def records(self) -> dict[str, dict]:
         """Current upstream service records, copied for controller status views."""
         with self._lock:
-            return json.loads(json.dumps(self._records))
+            records = json.loads(json.dumps(self._records))
+            for key, row in records.items():
+                progress = (row.get("metadata") or {}).get("application_clock")
+                if not isinstance(progress, dict):
+                    continue
+                barrier = self._barriers.get(self._record_topics.get(key, ""), {})
+                done = barrier.get("processed_at")
+                if barrier.get("run_id") != progress.get("run_id") or not isinstance(done, (int, float)):
+                    progress["processed_at"] = None
+                elif isinstance(progress.get("processed_at"), (int, float)):
+                    progress["processed_at"] = min(done, progress["processed_at"])
+            return records
 
     def boundary(self) -> float | None:
         clock = self.service.clock
@@ -126,8 +151,7 @@ class StepGate:
         definition = clock.definition
         if definition is None:
             return None
-        with self._lock:
-            rows = dict(self._records)
+        rows = self.records()
         remaining = set(self.dependencies)
         now = clock.real_now()
         for topic, data in rows.items():

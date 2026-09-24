@@ -29,6 +29,14 @@ def test_completion_waits_for_exact_upstream_run_and_durable_commit(tmp_path):
     gate.observe(SimpleNamespace(topic=TOPIC, payload=payload))
     assert gate.ready() is None
     payload["metadata"]["application_clock"]["run_id"] = "run"
+    # The priority status lane may arrive before the sample lane.
+    assert gate.ready() is None
+    gate.observe(
+        SimpleNamespace(
+            topic=TOPIC.replace("/_ServiceDetails/", "/_ClockProgress/"),
+            payload={"run_id": "run", "processed_at": 1010},
+        )
+    )
     assert gate.ready() == 1010
     payload["is_active"] = False
     assert gate.ready() is None
