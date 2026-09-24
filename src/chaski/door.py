@@ -297,6 +297,9 @@ class Door:
     def publish(self, topic: str, payload: str) -> dict | None:
         """``POST /publish``: publish one record under this service's identity.
 
+        For a caller without an MQTT session. A :class:`chaski.Service` writes
+        over its session instead (``send``, ``retract``, ``command``).
+
         ``payload`` is a JSON string. It is embedded as a JSON value, not as a
         string, so the stored record matches what an MQTT publisher sends.
 
