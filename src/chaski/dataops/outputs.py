@@ -34,11 +34,9 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import httpx
-import ulid
 from colca_data_contracts import (
     AnnotationPayload,
     DataTag,
-    DataTags,
     Metric,
     derive_annotation_id,
 )
@@ -48,7 +46,7 @@ from . import resolve
 from .inputs import _PerInstance
 
 if TYPE_CHECKING:
-    from chaski.door import Door
+    from chaski.catalogue import Catalogue
 
 log = logging.getLogger("chaski.dataops.outputs")
 
@@ -69,14 +67,20 @@ def _catalogue_meta(output: SignalOutput) -> dict[str, Any]:
     """What a catalogue entry says about an output beyond its name and type.
 
     ``element`` is the node-local path the node places the signal under, so
-    one service can compute for several machines. Left out when the output
-    names none.
+    one service can compute for several machines. ``unit``,
+    ``semantic_type`` and ``description`` are applied to the signal the node
+    binds to the tag, and updated there when they change. Each is left out
+    when the output names none.
     """
     meta: dict[str, Any] = {}
     if output.description:
         meta["description"] = output.description
     if output.system_element_name:
         meta["element"] = output.system_element_name
+    if output.unit:
+        meta["unit"] = output.unit
+    if output.semantic_type:
+        meta["semantic_type"] = output.semantic_type
     return meta
 
 
@@ -87,13 +91,29 @@ class SignalOutput(_PerInstance):
     belongs under (``Roasting/drum-roaster-01``). It travels as
     ``meta.element`` and tells the node where to place the signal; it is not
     used to resolve anything here.
+
+    ``unit``, ``semantic_type`` (the name of a semantic tag the node knows,
+    such as ``availability``) and ``description`` travel in the catalogue
+    entry. The node applies them to the signal it binds to this output and
+    follows later changes: the producer owns its outputs' metadata.
     """
 
-    def __init__(self, signal_name: str, data_type: str, description: str = "", system_element_name: str | None = None):
+    def __init__(
+        self,
+        signal_name: str,
+        data_type: str,
+        description: str = "",
+        system_element_name: str | None = None,
+        *,
+        unit: str | None = None,
+        semantic_type: str | None = None,
+    ):
         self.signal_name = signal_name
         self.data_type = data_type
         self.description = description
         self.system_element_name = system_element_name
+        self.unit = unit
+        self.semantic_type = semantic_type
         self._source: str | None = None
         self._tag_id: str | None = None
         self._last_unbound_log_ts: float = 0.0
@@ -403,103 +423,42 @@ def declared_outputs(instance: Any) -> Iterable[tuple[str, SignalOutput]]:
             yield attr_name, getattr(instance, attr_name)
 
 
-def _read_previous_catalogue(door: Door, catalogue_topic: str) -> dict:
-    """This service's previously published ``DataTags`` payload from KV, or
-    ``{}``. It keeps tag ids and the republish guard across restarts."""
-    for entry in door.kv(""):
-        if entry.topic == catalogue_topic:
-            payload = entry.payload
-            return payload if isinstance(payload, dict) else {}
-    return {}
+def build_catalogue(instances: Iterable[Any], catalogue: Catalogue) -> dict[str, str]:
+    """Declare every ``SignalOutput`` on ``instances`` into the service's
+    catalogue and bind each output to its tag id.
 
+    ``catalogue`` is the one the service loaded from the node at start, so ids
+    are kept by ``source`` across restarts, new sources mint, and sources no
+    longer declared stay in the catalogue marked ``is_stale`` so a signal bound
+    to one stays bound. Publishing is the service's
+    (:meth:`chaski.DataOpsService.bind_outputs`).
 
-def build_catalogue(
-    instances: Iterable[Any],
-    door: Door,
-    *,
-    node_id: str,
-    mount: str,
-    service_name: str,
-    service_ulid: str,
-) -> dict[str, str]:
-    """Build this run's output ``DataTags`` catalogue, publish it if it changed,
-    and bind every declared output to its tag id.
-
-    Ids are kept by ``source`` from the previous catalogue, new sources mint,
-    and sources that disappeared stay marked ``is_stale`` so bound signals stay
-    bound. The previous catalogue is read from KV, and publishing is skipped
-    when ``(topic, connector, version)`` is unchanged.
-
-    Returns ``{source: tag_id}`` for every declared output, bound or not.
+    Returns ``{source: tag_id}`` for every declared output.
     """
-    mount_parts = tuple(p for p in mount.split("/") if p)
-    catalogue_topic = str(
-        Topic(
-            payload_type=DataTags,
-            node_id=node_id,
-            context=(*mount_parts, service_name),
-        )
-    )
-
-    previous_payload = _read_previous_catalogue(door, catalogue_topic)
-    previous = {t.get("source"): t for t in (previous_payload.get("data_tags") or []) if t.get("source")}
-
     declared = list(_iter_signal_outputs(instances))
-    seen_sources: set[str] = set()
-    tags: dict[str, DataTag] = {}
-    result: dict[str, str] = {}
-
-    for source, output_attr, _instance in declared:
-        seen_sources.add(source)
-        old = previous.get(source)
-        tag_id = old["id"] if old else str(ulid.new())
-        tags[tag_id] = DataTag(
-            id=tag_id,
-            name=output_attr.signal_name,
-            source=source,
-            # Only the producer writes a computed output; anyone may read it.
-            is_writable=False,
-            is_readable=True,
-            data_type=output_attr.data_type,
-            is_stale=False,
-            meta=_catalogue_meta(output_attr),
-        )
-        result[source] = tag_id
-
-    for source, old in previous.items():
-        if source in seen_sources:
-            continue
-        old_id = old["id"]
-        tags[old_id] = DataTag(
-            id=old_id,
-            name=old.get("name", ""),
-            source=source,
-            is_writable=old.get("is_writable", False),
-            is_readable=old.get("is_readable", True),
-            data_type=old.get("data_type"),
-            is_stale=True,
-            meta=old.get("meta") or {},
-        )
-
-    payload = DataTags(data_tags=list(tags.values()), connector=service_ulid)
-    new_state = (catalogue_topic, payload.connector, payload.version)
-    old_state = (
-        (catalogue_topic, previous_payload.get("connector"), previous_payload.get("version"))
-        if previous_payload
-        else None
+    catalogue.declare(
+        {
+            source: DataTag(
+                id="",
+                name=output_attr.signal_name,
+                source=source,
+                # Only the producer writes a computed output; anyone may read it.
+                is_writable=False,
+                is_readable=True,
+                data_type=output_attr.data_type,
+                is_stale=False,
+                meta=_catalogue_meta(output_attr),
+            )
+            for source, output_attr, _instance in declared
+        }
     )
-
-    if new_state != old_state:
-        door.publish(catalogue_topic, payload.encode())
-        log.info(
-            "Published output catalogue to %s: %d tag(s), revision %s", catalogue_topic, len(tags), payload.version[:12]
-        )
-    else:
-        log.debug("Output catalogue unchanged (%s), not republished", payload.version[:12])
-
+    result: dict[str, str] = {}
     for source, output_attr, _instance in declared:
-        output_attr.bind(source, result[source])
-
+        tag_id = catalogue.tag_id(source)
+        if tag_id is None:  # declare() keeps every declared source
+            raise RuntimeError(f"chaski: {source} is missing from the catalogue it was just declared into")
+        output_attr.bind(source, tag_id)
+        result[source] = tag_id
     return result
 
 

@@ -4,7 +4,8 @@ the node like any :class:`chaski.Service`.
 
 The MQTT side is the fake client from ``test_service_lifecycle.py``. The HTTP
 side is a fake door that also plays the node: when the service publishes its
-``_DataTags`` catalogue, it writes the bound ``_Signal`` as autobind would.
+``_DataTags`` catalogue (over MQTT), it writes the bound ``_Signal`` as
+autobind would.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patc
 import pytest
 from colca_data_contracts import container_resource_health_metrics
 from colca_data_contracts.local_service import LocalServiceIdentity
-from colca_data_contracts.payload import ServiceDetails
+from colca_data_contracts.payload import DataTags, ServiceDetails
 from dataops_fakes import run_async
 
 from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_constant, on_metric, on_signal
@@ -89,6 +90,10 @@ class _FakeClient:
 
     def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
+        if isinstance(payload, DataTags):
+            # The catalogue reaches the node over MQTT; the node's side of it
+            # lives on the fake door.
+            _FakeNodeDoor.instances[-1].publish(str(topic), payload.encode())
 
     def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         pass

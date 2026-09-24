@@ -12,6 +12,7 @@ import pytest
 from colca_data_contracts import derive_annotation_id
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry
 
+from chaski.catalogue import Catalogue
 from chaski.dataops import outputs
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
@@ -172,89 +173,115 @@ def test_an_unbound_output_keeps_looking():
 # ─── build_catalogue ────────────────────────────────────────────────────────
 
 
-def _catalogue_topic() -> str:
-    return "colca/v1/_DataTags/n-1/dataops"
+def _build(catalogue: Catalogue, producer) -> dict[str, str]:
+    return build_catalogue([producer], catalogue)
 
 
-def _build(door, producer):
-    return build_catalogue([producer], door, node_id=NODE_ID, mount="", service_name="dataops", service_ulid="svc-1")
+def _restarted(previous: Catalogue) -> Catalogue:
+    """A new run's catalogue, seeded from what the previous run published, as
+    Service.start() seeds it from the node."""
+    payload = previous.payload()
+    previous.record_published(previous.revision(payload))
+    catalogue = Catalogue(connector="svc-1")
+    catalogue.load_previous(json.loads(payload.encode()))
+    return catalogue
 
 
-def test_build_catalogue_mints_ids_and_publishes_when_none_retained():
-    door = FakeDoor()
-    producer = _producer("press", FakeRuntime(door, None), computed=SignalOutput("computed", "float"))
+def test_build_catalogue_mints_ids_and_binds_each_output():
+    catalogue = Catalogue(connector="svc-1")
+    producer = _producer("press", FakeRuntime(FakeDoor(), None), computed=SignalOutput("computed", "float"))
 
-    result = _build(door, producer)
+    result = _build(catalogue, producer)
 
-    assert len(door.published) == 1
-    topic, payload_json = door.published[0]
-    assert topic == _catalogue_topic()
-    payload = json.loads(payload_json)
-    assert len(payload["data_tags"]) == 1
-    assert payload["data_tags"][0]["source"] == "press.computed"
-    assert result == {"press.computed": payload["data_tags"][0]["id"]}
+    (tag,) = catalogue.data_tags()
+    assert tag.source == "press.computed"
+    assert result == {"press.computed": tag.id}
+    assert catalogue.dirty, "a new catalogue is due for publishing"
     # bind() actually ran, on the INSTANCE's copy:
     assert producer.computed.tag_id == result["press.computed"]
     with pytest.raises(RuntimeError):
         _ = type(producer).computed.tag_id
 
 
-def test_build_catalogue_reuses_ids_and_skips_republish_across_a_simulated_restart():
-    """Two independent builds with the same outputs, as after a restart, mint the
-    same tag id, so the second build publishes nothing."""
-    door1 = FakeDoor()
-    producer1 = _producer("press", FakeRuntime(door1, None), computed=SignalOutput("computed", "float"))
-    result1 = _build(door1, producer1)
-    assert len(door1.published) == 1
-    published_topic, published_json = door1.published[0]
+def test_build_catalogue_reuses_ids_and_is_not_due_across_a_restart():
+    """The same outputs after a restart keep their tag ids, and the unchanged
+    catalogue is not published again."""
+    run1 = Catalogue(connector="svc-1")
+    result1 = _build(
+        run1, _producer("press", FakeRuntime(FakeDoor(), None), computed=SignalOutput("computed", "float"))
+    )
 
-    # A restart: a new Door whose KV holds what run 1 published, and new
-    # producer instances.
-    door2 = FakeDoor([kv_entry(published_topic, json.loads(published_json))])
-    producer2 = _producer("press", FakeRuntime(door2, None), computed=SignalOutput("computed", "float"))
-    result2 = _build(door2, producer2)
+    run2 = _restarted(run1)
+    result2 = _build(
+        run2, _producer("press", FakeRuntime(FakeDoor(), None), computed=SignalOutput("computed", "float"))
+    )
 
     assert result2 == result1, "the same declared output must reuse the same tag id across a restart"
-    assert door2.published == [], "an unchanged catalogue must not be republished"
+    assert run2.revision() == run2.last_published_revision, "an unchanged catalogue must not be republished"
 
 
-def test_build_catalogue_republishes_when_declared_outputs_actually_change():
-    """Denominator for the skip-when-unchanged test above: prove the guard
-    can also say yes."""
-    door1 = FakeDoor()
-    producer1 = _producer("press", FakeRuntime(door1, None), computed=SignalOutput("computed", "float"))
-    _build(door1, producer1)
-    published_topic, published_json = door1.published[0]
+def test_build_catalogue_is_due_when_declared_outputs_actually_change():
+    """Denominator for the unchanged case above: the guard can also say yes."""
+    run1 = Catalogue(connector="svc-1")
+    _build(run1, _producer("press", FakeRuntime(FakeDoor(), None), computed=SignalOutput("computed", "float")))
 
-    door2 = FakeDoor([kv_entry(published_topic, json.loads(published_json))])
-    producer2 = _producer(
-        "press",
-        FakeRuntime(door2, None),
-        computed=SignalOutput("computed", "float"),
-        extra=SignalOutput("extra", "int"),  # a genuinely new declared output
+    run2 = _restarted(run1)
+    _build(
+        run2,
+        _producer(
+            "press",
+            FakeRuntime(FakeDoor(), None),
+            computed=SignalOutput("computed", "float"),
+            extra=SignalOutput("extra", "int"),  # a genuinely new declared output
+        ),
     )
-    _build(door2, producer2)
 
-    assert len(door2.published) == 1, "adding a declared output must republish the catalogue"
+    assert run2.revision() != run2.last_published_revision, "adding a declared output must republish the catalogue"
 
 
 def test_build_catalogue_carries_a_removed_source_forward_as_stale():
-    door1 = FakeDoor()
-    producer1 = _producer("press", FakeRuntime(door1, None), a=SignalOutput("a", "float"), b=SignalOutput("b", "float"))
-    result1 = _build(door1, producer1)
-    published_topic, published_json = door1.published[0]
+    run1 = Catalogue(connector="svc-1")
+    result1 = _build(
+        run1,
+        _producer("press", FakeRuntime(FakeDoor(), None), a=SignalOutput("a", "float"), b=SignalOutput("b", "float")),
+    )
 
     # Run 2 only declares "a" — "b" is gone.
-    door2 = FakeDoor([kv_entry(published_topic, json.loads(published_json))])
-    producer2 = _producer("press", FakeRuntime(door2, None), a=SignalOutput("a", "float"))
-    _build(door2, producer2)
+    run2 = _restarted(run1)
+    _build(run2, _producer("press", FakeRuntime(FakeDoor(), None), a=SignalOutput("a", "float")))
 
-    assert len(door2.published) == 1
-    tags = json.loads(door2.published[0][1])["data_tags"]
-    by_source = {t["source"]: t for t in tags}
-    assert by_source["press.a"]["is_stale"] is False
-    assert by_source["press.b"]["is_stale"] is True
-    assert by_source["press.b"]["id"] == result1["press.b"], "a stale tag keeps its old id"
+    by_source = {t.source: t for t in run2.data_tags()}
+    assert by_source["press.a"].is_stale is False
+    assert by_source["press.b"].is_stale is True
+    assert by_source["press.b"].id == result1["press.b"], "a stale tag keeps its old id"
+
+
+def test_an_outputs_unit_semantic_type_and_description_travel_in_its_catalogue_entry():
+    catalogue = Catalogue(connector="svc-1")
+    producer = _producer(
+        "oee",
+        FakeRuntime(FakeDoor(), None),
+        availability=SignalOutput(
+            "availability",
+            "float",
+            "Share of planned time running",
+            "line1/m3",
+            unit="%",
+            semantic_type="availability",
+        ),
+        plain=SignalOutput("plain", "float"),
+    )
+
+    _build(catalogue, producer)
+
+    by_source = {t.source: t for t in catalogue.data_tags()}
+    assert by_source["oee.availability"].meta == {
+        "description": "Share of planned time running",
+        "element": "line1/m3",
+        "unit": "%",
+        "semantic_type": "availability",
+    }
+    assert by_source["oee.plain"].meta == {}, "an output that states nothing adds nothing"
 
 
 # ─── AnnotationOutput ───────────────────────────────────────────────────────
