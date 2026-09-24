@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from abc import ABC
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from chaski.door import Door
@@ -31,8 +31,9 @@ log = logging.getLogger("chaski.dataops")
 @runtime_checkable
 class Runtime(Protocol):
     """What a producer's inputs, outputs and watermark need from whoever runs
-    it: the node's door, the local :class:`~chaski.dataops.Buffer`, and an
-    optional read-only :class:`~chaski.dataops.Historian`.
+    it: the node's door to read, ``send``/``retract``/``command`` to write
+    over MQTT, the local :class:`~chaski.dataops.Buffer`, and an optional read-only
+    :class:`~chaski.dataops.Historian`.
 
     :class:`~chaski.dataops.DataOpsService` is the usual runtime; a test can
     build one from a fake door and a temporary buffer.
@@ -40,6 +41,14 @@ class Runtime(Protocol):
 
     @property
     def door(self) -> Door: ...
+
+    def send(self, topic: str, payload: str, *, retain: bool = False) -> None: ...
+
+    def retract(self, topic: str) -> None: ...
+
+    def command(
+        self, contract: str, path: str, fields: dict[str, Any] | None = None, *, timeout: float = 30.0
+    ) -> dict[str, Any]: ...
 
     @property
     def buffer(self) -> Buffer: ...

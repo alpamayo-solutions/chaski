@@ -37,13 +37,13 @@ import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
-import pandas as pd
-
 from . import resolve
 from .base import runtime_now
 from .triggers import parse_duration
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from .base import Producer, Runtime
 
 log = logging.getLogger("chaski.dataops.inputs")
@@ -170,6 +170,8 @@ class SignalRangeInput(_PerInstance):
         buffer gives an empty frame, and a range reaching before the buffer's
         earliest point raises instead of returning an incomplete frame.
         """
+        import pandas as pd
+
         runtime = self._runtime()
         buffer = runtime.buffer
         historian = runtime.historian

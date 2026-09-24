@@ -5,7 +5,8 @@ with an enrolled key. ``ConnectorService`` is a ``Service`` that polls a source
 through a driver. ``Node`` runs an embedded colcad and hands out services on its
 local door. ``DataOpsService`` is a ``Service`` that runs producers
 (``chaski.dataops``); it is resolved lazily because it needs the
-``chaski[dataops]`` extra.
+``chaski[dataops]`` extra. ``CommandSender`` sends commands and waits for
+their ``_Ack`` on any franzmq session.
 """
 
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from colca_data_contracts.payload import DataTag
 
 from .clock import Clock, ClockNotReady, ClockStatus
+from .command import CommandSender
 from .connector import (
     ConnectorService,
     Discovery,
@@ -30,6 +32,7 @@ __all__ = [
     "Clock",
     "ClockNotReady",
     "ClockStatus",
+    "CommandSender",
     "ConnectorService",
     "DataOpsService",
     "DataTag",

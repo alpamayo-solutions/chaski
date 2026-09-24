@@ -65,6 +65,26 @@ what to enroll. `svc.wait_enrolled(timeout)` waits instead of raising.
 Every path a service publishes becomes a tag in its catalogue. Once the node
 binds a tag to a signal, the values appear in the tree.
 
+## Write records and send commands
+
+Everything a service writes goes over its MQTT session, at QoS 1 with the
+node's PUBACK awaited; HTTP is for reading.
+
+```python
+with chaski.Service("line-guard") as svc:
+    svc.send(f"colca/v1/_Finding/{svc.node_id}/line1/speed", json.dumps(finding), retain=True)
+    svc.retract(f"colca/v1/_Finding/{svc.node_id}/line1/speed")   # the tombstone
+
+    ack = svc.command("_CmdConfigure", "constant/upsert", {"constants": [...]})
+    if ack["result_code"] != 200:
+        raise RuntimeError(ack["message"])
+```
+
+`command()` subscribes to the command's `_Ack`, sends it with a
+`correlation_id` and an expiry, and returns the ack, or raises `TimeoutError`.
+A process with its own franzmq session uses `chaski.CommandSender` for the
+same.
+
 ## Read from the node
 
 ```python

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 def dependencies_from_env() -> list[str] | None:
     """Deployment seam: absent disables coordination, [] is a source worker."""
     value = os.environ.get("FACTORY_STEP_DEPENDENCIES")
-    if value is None:
+    if not value:
         return None
     result = json.loads(value)
     if not isinstance(result, list) or any(not isinstance(item, str) or not item for item in result):

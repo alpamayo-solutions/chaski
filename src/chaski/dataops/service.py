@@ -547,9 +547,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
 
         rows: list[tuple[float, str, Any]] = []
         for signal_id in mini_signal_ids:
-            df = buffer.window(signal_id, start, now)
-            for row in df.itertuples():
-                rows.append((cast(float, row.ts), signal_id, row.value))
+            rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
         rows.sort(key=lambda r: r[0])
 
         failures = 0
@@ -663,6 +661,7 @@ class DataOpsService(Service):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
+        self._step_loop_last = time.monotonic()
 
     # -- the run list ----------------------------------------------------
 
@@ -718,8 +717,8 @@ class DataOpsService(Service):
 
     @property
     def door(self) -> Door:
-        """The door every input resolves and every output publishes
-        through — the base class's own, open after :meth:`start`."""
+        """The door every input resolves through — the base class's own,
+        open after :meth:`start`. Outputs write with :meth:`send`."""
         return self._require_http("door")
 
     @property
@@ -884,6 +883,7 @@ class DataOpsService(Service):
             return None
         executor = commands.CommandExecutor(
             self.door,
+            self.send,
             self.stream(commands.STREAM, cursor=commands.CURSOR),
             handlers,
             cast(str, self._node_id),
@@ -983,6 +983,10 @@ class DataOpsService(Service):
 
             # 9) Start ingest in the background and keep retrying unresolved inputs.
             health_state.producers = len(instances)
+            health_state.last_drain_at = (
+                (lambda: self._step_loop_last) if self.step is not None else (lambda: ingest.last_drain_at)
+            )
+            health_state.stall_after_s = max(health.STALL_AFTER_MIN_S, 10 * self._poll_interval_s)
             ingest_task: asyncio.Task | None = None
             if self.step is not None:
                 ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
@@ -1106,6 +1110,7 @@ class DataOpsService(Service):
             except Exception:
                 log.exception("Coordinated window failed; leaving its progress unacknowledged")
                 await asyncio.sleep(1)
+            self._step_loop_last = time.monotonic()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=0.01)
 

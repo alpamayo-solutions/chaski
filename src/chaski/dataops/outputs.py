@@ -1,6 +1,6 @@
 """Output primitives for Producer classes.
 
-Both publish through the local door, never MQTT directly and never a database.
+Both publish over the runtime's MQTT session (``runtime.send``), never to a database.
 
 * ``SignalOutput``: one computed signal. The service catalogues every declared
   output as a ``DataTags`` entry, like a connector's source tags
@@ -187,7 +187,7 @@ class SignalOutput(_PerInstance):
             timestamp=runtime_now(self._runtime()) if timestamp is None else _epoch(timestamp),
             signal_id=signal_id,
         )
-        door.publish(topic, metric.encode())
+        self._runtime().send(topic, metric.encode())
         log.debug("SignalOutput[%s]: published %r @ %s on %s", self.signal_name, value, metric.timestamp, topic)
 
     def _log_unbound(self) -> None:
@@ -320,7 +320,7 @@ class AnnotationOutput(_PerInstance):
             system_element_id=system_element_id,
             related_annotation_ids=list(related_annotation_ids or []),
         )
-        runtime.door.publish(self._topic(annotation_id), payload.encode())
+        runtime.send(self._topic(annotation_id), payload.encode())
         runtime.buffer.record_emitted_annotation(source, annotation_id, ts_start)
         log.debug("AnnotationOutput[%s]: published %s @ %s..%s", self.annotation_name, annotation_id, ts_start, ts_end)
         return annotation_id
@@ -363,7 +363,7 @@ class AnnotationOutput(_PerInstance):
             source=source,
             deleted=True,
         )
-        runtime.door.publish(self._topic(annotation_id), payload.encode())
+        runtime.send(self._topic(annotation_id), payload.encode())
         log.debug("AnnotationOutput[%s]: deleted %s @ %s", self.annotation_name, annotation_id, ts_start)
         return annotation_id
 
@@ -386,7 +386,7 @@ class AnnotationOutput(_PerInstance):
                 source=source,
                 deleted=True,
             )
-            runtime.door.publish(self._topic(annotation_id), payload.encode())
+            runtime.send(self._topic(annotation_id), payload.encode())
         if pairs:
             log.info(
                 "AnnotationOutput[%s]: cleared %d annotation(s) in %s..%s",
