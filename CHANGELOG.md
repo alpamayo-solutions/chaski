@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.0](https://github.com/alpamayo-solutions/chaski/compare/v0.8.1...v0.9.0) (2026-09-24)
+
+
+### Features
+
+* write records and send commands over the MQTT session ([#35](https://github.com/alpamayo-solutions/chaski/issues/35)) ([74da8a0](https://github.com/alpamayo-solutions/chaski/commit/74da8a0c45a0ac68f5f184311bfaef1b9ef4446f))
+
+
+### Fixes
+
+* allow colca-data-contracts up to 0.11 ([#36](https://github.com/alpamayo-solutions/chaski/issues/36)) ([f7c2321](https://github.com/alpamayo-solutions/chaski/commit/f7c2321fbacbe540b5ee509c089a1de5ebd3613f))
+* **dataops:** the health door answers 503 when ingest stops finishing drains ([#37](https://github.com/alpamayo-solutions/chaski/issues/37)) ([767c1ae](https://github.com/alpamayo-solutions/chaski/commit/767c1aeb35bbf8f83e8141e6edbbf9f5f9ab1f38))
+
+
+### Performance
+
+* **dataops:** lazy pandas import and one KV read per watch burst ([#34](https://github.com/alpamayo-solutions/chaski/issues/34)) ([1bfec28](https://github.com/alpamayo-solutions/chaski/commit/1bfec284408baf11f88a49a9b1c2f6be072f777e))
+
 ## [0.8.1](https://github.com/alpamayo-solutions/chaski/compare/v0.8.0...v0.8.1) (2026-09-24)
 
 
