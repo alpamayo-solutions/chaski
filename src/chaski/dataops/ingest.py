@@ -91,6 +91,7 @@ class Ingest:
         self._previous_generation = previous_generation
         self._wake = asyncio.Event()
         self._window_started = time.monotonic()
+        self._last_drain_at = self._window_started
         self._window_records = 0
         self._window_drains = 0
 
@@ -118,6 +119,11 @@ class Ingest:
     @property
     def poll_interval_s(self) -> float:
         return self._poll_interval_s
+
+    @property
+    def last_drain_at(self) -> float:
+        """Monotonic time the last drain finished (or the loop was built)."""
+        return self._last_drain_at
 
     # ------------------------------------------------------------------ startup
 
@@ -251,6 +257,7 @@ class Ingest:
         shows.
         """
         now = time.monotonic() if now is None else now
+        self._last_drain_at = now
         self._window_records += processed
         self._window_drains += 1
         if now - self._window_started < self.ROLLUP_INTERVAL_S:

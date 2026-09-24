@@ -394,6 +394,26 @@ async def test_run_forever_survives_one_transient_transport_error_and_resumes_fe
 
 
 @run_async
+async def test_only_a_finished_drain_counts_as_progress(buffer):
+    """The health door reads this: retrying a transport error is not progress."""
+    door = FlakyDoor(fail_times=1_000_000)
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
+    built = ingest.last_drain_at
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ingest.run_forever(stop))
+    try:
+        await _poll_until(lambda: len(door.fetch_calls) >= 2, timeout=2.0)
+        assert ingest.last_drain_at == built
+        door._fail_remaining = 0
+        await _poll_until(lambda: ingest.last_drain_at > built, timeout=5.0)
+    finally:
+        stop.set()
+        ingest.wake()
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@run_async
 async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
     """Only httpx.HTTPError is retried; any other exception still ends the task."""
 
