@@ -518,9 +518,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
 
         rows: list[tuple[float, str, Any]] = []
         for signal_id in mini_signal_ids:
-            df = buffer.window(signal_id, start, now)
-            for row in df.itertuples():
-                rows.append((cast(float, row.ts), signal_id, row.value))
+            rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
         rows.sort(key=lambda r: r[0])
 
         failures = 0

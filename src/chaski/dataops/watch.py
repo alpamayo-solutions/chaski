@@ -22,17 +22,19 @@ by :func:`chaski.service.tolerate_undecodable`.
 
 Delivery happens on franzmq's own callback thread (:class:`franzmq.Client`
 runs a message's registered callbacks off the network thread already); each
-match is handed to the producer's event loop with ``call_soon_threadsafe``,
-run under the producer's lock and a pinned :func:`chaski.dataops.resolve.one_pass`
-snapshot — the same two guarantees
-:func:`chaski.dataops.service.make_handler` gives ``@on_metric``, so a handler
-that publishes several outputs costs one KV read, not one per output.
+match is handed to the producer's event loop with ``call_soon_threadsafe``
+and run under the producer's lock and a pinned KV snapshot, as
+:func:`chaski.dataops.service.make_handler` does for ``@on_metric``. Every
+message handed over before the loop gets to run them is one burst, and a burst
+shares one lazy :class:`chaski.dataops.resolve.Snapshot`: one ``/kv`` read for
+the burst when a handler resolves something, none when no handler does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -80,17 +82,18 @@ def start(
 
     Safe to call with two empty lists — nothing subscribes, so a service with
     no ``@on_constant``/``@on_signal`` producer opens no extra subscription.
-    ``door`` is read fresh (:func:`chaski.dataops.resolve.one_pass`) for every
-    dispatched message, not held onto otherwise.
+    ``door`` is read at most once per burst of messages, and only when a
+    handler resolves something.
     """
     if not constant_triggers and not signal_triggers:
         return 0
+    bursts = _Bursts(door, loop)
     count = 0
     for path_or_pattern, handler in constant_triggers:
-        _subscribe(client, Constant, node_id, path_or_pattern, handler, door, loop)
+        _subscribe(client, Constant, node_id, path_or_pattern, handler, bursts)
         count += 1
     for path_or_pattern, handler in signal_triggers:
-        _subscribe(client, Signal, node_id, path_or_pattern, handler, door, loop)
+        _subscribe(client, Signal, node_id, path_or_pattern, handler, bursts)
         count += 1
     log.info(
         "watch: %d @on_constant and %d @on_signal subscription(s) on node=%s",
@@ -107,34 +110,55 @@ def _subscribe(
     node_id: str,
     path_or_pattern: str,
     handler: Callable,
-    door: Any,
-    loop: asyncio.AbstractEventLoop,
+    bursts: _Bursts,
 ) -> None:
     topic = Topic(payload_type=payload_type, node_id=node_id, context=tuple(path_or_pattern.split("/")))
-    callback = _callback(handler, door, loop)
-    client.subscribe(topic, qos=_QOS, callback=callback)
+    client.subscribe(topic, qos=_QOS, callback=bursts.callback(handler))
     log.debug("watching %s for %s", topic, getattr(handler, "__qualname__", handler))
 
 
-def _callback(handler: Callable, door: Any, loop: asyncio.AbstractEventLoop) -> Callable[[Any], None]:
-    """franzmq calls this off the event loop (its own callback thread); hand
-    the dispatch back to the loop the way
-    :meth:`chaski.dataops.service.DataOpsService._on_input_metric` hands the
-    ingest wake-up back."""
+class _Bursts:
+    """Hands messages from franzmq's callback thread to the loop, in bursts.
 
-    def _on_message(message: Any) -> None:
-        record = message.payload  # already decoded; None is the tombstone
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_dispatch(handler, record, door)))
+    Messages queue up until the loop runs :meth:`_drain`; everything drained
+    together is dispatched under one lazy snapshot. Handlers still run as
+    separate tasks, as before.
+    """
 
-    return _on_message
+    def __init__(self, door: Any, loop: asyncio.AbstractEventLoop) -> None:
+        self._door = door
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._pending: list[tuple[Any, Any]] = []
+        self._tasks: set[asyncio.Future[None]] = set()  # held so a running dispatch is not collected
+
+    def callback(self, handler: Callable) -> Callable[[Any], None]:
+        def _on_message(message: Any) -> None:
+            record = message.payload  # already decoded; None is the tombstone
+            with self._lock:
+                first = not self._pending
+                self._pending.append((handler, record))
+            if first:
+                self._loop.call_soon_threadsafe(self._drain)
+
+        return _on_message
+
+    def _drain(self) -> None:
+        with self._lock:
+            burst, self._pending = self._pending, []
+        snapshot = resolve.Snapshot(self._door)
+        for handler, record in burst:
+            task = asyncio.ensure_future(_dispatch(handler, record, snapshot))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
 
 
-async def _dispatch(handler: Any, record: Any, door: Any) -> None:
+async def _dispatch(handler: Any, record: Any, snapshot: resolve.Snapshot) -> None:
     """``handler`` is a bound Producer method — typed ``Any`` because
     ``Callable`` carries no ``__self__``, which this needs for the
     producer's own lock and name."""
     producer = handler.__self__
-    with resolve.one_pass(door):
+    with resolve.lazy_pass(snapshot):
         try:
             with producer._lock:
                 await handler(record)

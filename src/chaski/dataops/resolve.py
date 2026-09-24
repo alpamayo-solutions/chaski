@@ -100,9 +100,34 @@ def _build_index(entries: list[Any]) -> _Index:
     return _Index(elements, annotation_types, signals, bindings, metric_topics, element_paths, signal_paths)
 
 
-_pinned_index: contextvars.ContextVar[_Index | None] = contextvars.ContextVar(
-    "colca_dataops_resolve_pinned_index", default=None
+class Snapshot:
+    """One KV read, taken on first use and then shared by every pass it is
+    entered in. A failed read is remembered: resolvers then read on their own,
+    as they would outside a pass."""
+
+    def __init__(self, door: Door) -> None:
+        self._door = door
+        self._index: _Index | None = None
+        self._failed = False
+
+    def index(self) -> _Index | None:
+        if self._index is None and not self._failed:
+            try:
+                self._index = _build_index(self._door.kv(""))
+            except Exception as exc:
+                self._failed = True
+                log.debug("could not pin a KV snapshot for this pass (%s); resolving one at a time", exc)
+        return self._index
+
+
+_pinned: contextvars.ContextVar[Snapshot | None] = contextvars.ContextVar(
+    "colca_dataops_resolve_pinned_snapshot", default=None
 )
+
+
+def _pinned_index() -> _Index | None:
+    pinned = _pinned.get()
+    return pinned.index() if pinned is not None else None
 
 
 @contextmanager
@@ -117,32 +142,38 @@ def one_pass(door: Door) -> Iterator[bool]:
     The pin lives in a ContextVar, so concurrent tasks neither see nor wait
     for it.
     """
-    if _pinned_index.get() is not None:
+    if _pinned_index() is not None:
         yield True
         return
-    try:
-        index = _build_index(door.kv(""))
-    except Exception as exc:
-        log.debug("could not pin a KV snapshot for this pass (%s); resolving one at a time", exc)
+    snapshot = Snapshot(door)
+    if snapshot.index() is None:
         yield False
         return
-    token = _pinned_index.set(index)
-    try:
+    with lazy_pass(snapshot):
         yield True
+
+
+@contextmanager
+def lazy_pass(snapshot: Snapshot) -> Iterator[None]:
+    """Like :func:`one_pass`, but the read happens only when a resolver first
+    needs it, and ``snapshot`` can be shared by several blocks."""
+    token = _pinned.set(snapshot)
+    try:
+        yield
     finally:
-        _pinned_index.reset(token)
+        _pinned.reset(token)
 
 
 def _snapshot(door: Door) -> _Index:
     """The pass's pinned index, or a fresh read when no pass is active."""
-    pinned = _pinned_index.get()
+    pinned = _pinned_index()
     return pinned if pinned is not None else _build_index(door.kv(""))
 
 
 def resolve_metric_topics(door: Door, signal_ids: list[str]) -> dict[str, str]:
     """``{signal_id: its _Metric topic}`` for the ids a snapshot knows. Outside
     a pass, only the ``_Signal`` records are read."""
-    pinned = _pinned_index.get()
+    pinned = _pinned_index()
     index = pinned if pinned is not None else _build_index(door.kv("", contract="_Signal"))
     known = index.metric_topic_by_signal_id
     return {sid: known[sid] for sid in signal_ids if sid in known}
