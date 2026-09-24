@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
@@ -54,6 +55,12 @@ class Runtime(Protocol):
 
     @property
     def historian(self) -> Historian | None: ...
+
+
+def runtime_now(runtime: Runtime) -> float:
+    """Application time; older/custom runtimes default to the host clock."""
+    clock = getattr(runtime, "clock", None)
+    return clock.now() if clock is not None else time.time()
 
 
 class Producer(ABC):
@@ -97,6 +104,11 @@ class Producer(ABC):
     # Set on every instance in __new__.
     _lock: threading.RLock
     _runtime: Runtime | None
+
+    @property
+    def now(self) -> float:
+        """Current application time, or the scheduled instant inside a timed callback."""
+        return runtime_now(self.runtime)
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)

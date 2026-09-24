@@ -484,3 +484,63 @@ async def test_on_signal_fires_on_binding_change_and_on_release(tmp_path: Path, 
     finally:
         stop.set()
         await asyncio.wait_for(task, timeout=10.0)
+
+
+@run_async
+async def test_startup_waits_for_factory_clock_and_stops_cleanly(tmp_path: Path, monkeypatch):
+    from chaski.clock import Clock
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    clock = Clock(definition_topic=f"colca/v1/_ClockDefinition/{NODE_ID}/factory")
+    service = DataOpsService("dataops", clock=clock, state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    started = []
+
+    class WaitingProducer(Producer):
+        name = "waiting-clock"
+
+        async def setup(self):
+            started.append(clock.now())
+
+    service.add(WaitingProducer)
+    stop = asyncio.Event()
+    task = asyncio.create_task(service.serve(stop))
+    await _poll_until(lambda: bool(_FakeNodeDoor.instances))
+    assert not task.done()
+    assert started == []
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert service._closed
+    assert started == []
+
+
+@run_async
+async def test_delayed_clock_runs_setup_once_in_factory_time(tmp_path: Path, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    clock = Clock(definition_topic=f"colca/v1/_ClockDefinition/{NODE_ID}/factory", wall=lambda: 10000)
+    service = DataOpsService("dataops", clock=clock, state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    started = []
+
+    class WaitingProducer(Producer):
+        name = "waiting-clock"
+
+        async def setup(self):
+            started.append(clock.now())
+
+    service.add(WaitingProducer)
+    stop = asyncio.Event()
+    task = asyncio.create_task(service.serve(stop))
+    try:
+        await _poll_until(lambda: bool(_FakeNodeDoor.instances))
+        assert started == []
+        clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 0))
+        await _poll_until(lambda: bool(started))
+        assert started == [1000]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 2)

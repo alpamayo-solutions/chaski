@@ -80,7 +80,9 @@ class Ingest:
         signal_ids: Iterable[str] | None = None,
         poll_interval_s: float = 1.0,
         previous_generation: str | None = None,
+        strict: bool = False,
     ) -> None:
+        self.strict = strict
         self._open_stream = open_stream
         self._buffer = buffer
         self._dispatch = dispatch or {}
@@ -164,6 +166,8 @@ class Ingest:
         page: Page = stream.fetch()
 
         if page.gap is not None:
+            if self.strict:
+                raise RuntimeError("input stream has a retention gap; refusing incomplete coordinated history")
             self._log_gap(page.gap)
 
         if page.records:
@@ -196,6 +200,8 @@ class Ingest:
             try:
                 await handler(record)
             except Exception:
+                if self.strict:
+                    raise
                 # The record is already in the buffer; a failing handler only
                 # misses this event.
                 log.exception(

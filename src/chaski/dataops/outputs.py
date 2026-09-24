@@ -43,6 +43,7 @@ from colca_data_contracts import (
 from franzmq import Topic
 
 from . import resolve
+from .base import runtime_now
 from .inputs import _PerInstance
 
 if TYPE_CHECKING:
@@ -181,7 +182,11 @@ class SignalOutput(_PerInstance):
         self._binding = binding
         topic, signal_id = binding
 
-        metric = Metric(value=value, timestamp=_epoch(timestamp), signal_id=signal_id)
+        metric = Metric(
+            value=value,
+            timestamp=runtime_now(self._runtime()) if timestamp is None else _epoch(timestamp),
+            signal_id=signal_id,
+        )
         self._runtime().send(topic, metric.encode())
         log.debug("SignalOutput[%s]: published %r @ %s on %s", self.signal_name, value, metric.timestamp, topic)
 

@@ -80,11 +80,12 @@ from chaski.door import Door, Record, Stream
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
-from .base import Producer, Runtime
+from .base import Producer, Runtime, runtime_now
 from .buffer import Buffer
 from .ingest import Ingest
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import bind_annotation_outputs, build_catalogue, declared_outputs
+from .scheduling import run_due, run_periodic, timer_key
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
@@ -344,7 +345,8 @@ def _resolve_dispatch(
 
             signal_id = resolved[spec.input_name]
             method = getattr(instance, method_name)
-            dispatch.setdefault(signal_id, []).append(make_handler(method))
+            domain = getattr(instance, spec.input_name).time_domain
+            dispatch.setdefault(signal_id, []).append(make_handler(method, time_domain=domain))
             log.info(
                 "Will dispatch %s.%s for signal_id=%s (input %s)",
                 instance.name,
@@ -387,7 +389,9 @@ async def reresolve_loop(
             return
 
 
-def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict[str, float]:
+def compute_trim_horizons(
+    instances: list[Producer], retention_s: float, *, time_domain: str | None = None
+) -> dict[str, float]:
     """Per-signal trim horizon: the larger of the signal's widest declared
     window and the broker's metrics retention.
 
@@ -398,6 +402,8 @@ def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict
     horizons: dict[str, float] = {}
     for instance in instances:
         for attr_name, input_attr in declared_inputs(instance):
+            if time_domain is not None and input_attr.time_domain != time_domain:
+                continue
             try:
                 signal_id = input_attr.signal_id
             except Exception as exc:
@@ -416,29 +422,52 @@ def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict
     return horizons
 
 
-def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -> None:
+def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float, clock=None) -> None:
     """Periodic job: drop buffered points older than each signal's horizon.
 
     Horizons are recomputed from the currently resolved inputs on every run,
     so a signal that resolves late is trimmed too; resolved ids are held in
     memory, so this needs no KV scan. A plain function, so APScheduler runs
     the sqlite work off the loop."""
-    horizons = compute_trim_horizons(instances, retention_s)
-    deleted = buffer.trim(horizons)
+    if clock is None:
+        deleted = buffer.trim(compute_trim_horizons(instances, retention_s))
+    else:
+        application_now = clock.now()
+        definition = getattr(clock, "definition", None)
+        if definition is not None:
+            # Keep the input window needed by the slowest timer, including a
+            # newly started timer. Requested speed must never prune its backlog.
+            start = definition.start_at if definition.start_at is not None else definition.factory_anchor
+            for instance in instances:
+                for method, spec in type(instance)._triggers:
+                    if isinstance(spec, (CronSpec, IntervalSpec)):
+                        progress = buffer.watermark(timer_key(instance, method, spec))
+                        application_now = min(application_now, progress if progress is not None else start)
+        deleted = buffer.trim(
+            compute_trim_horizons(instances, retention_s, time_domain="application"), now=application_now
+        )
+        real_now = clock.real_now() if hasattr(clock, "real_now") else time.time()
+        deleted += buffer.trim(compute_trim_horizons(instances, retention_s, time_domain="real"), now=real_now)
     if deleted:
         log.info("Buffer trim: deleted %d point(s) past their per-signal horizon", deleted)
     else:
         log.debug("Buffer trim: nothing past its per-signal horizon")
 
 
-def make_handler(method):
+def make_handler(method, *, time_domain="application"):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
     into a ``Metric``. Holds the producer's lock, like :func:`off_loop`."""
 
     async def _handler(record: Record) -> None:
         metric = decode_metric(record)
-        with method.__self__._lock:
+        clock = getattr(method.__self__.runtime, "clock", None)
+        instant = (
+            clock.at(float(metric.timestamp))
+            if clock is not None and time_domain == "application"
+            else contextlib.nullcontext()
+        )
+        with method.__self__._lock, instant:
             await method(metric)
 
     return _handler
@@ -504,7 +533,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
 
         mini_dispatch, mini_signal_ids, _ = build_dispatch(runtime, [instance])
         earliest = _earliest_across(buffer, mini_signal_ids)
-        now = time.time()
+        now = runtime_now(runtime)
         start = earliest if earliest is not None else now
 
         log.info(
@@ -632,6 +661,7 @@ class DataOpsService(Service):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
+        self._step_loop_last = time.monotonic()
 
     # -- the run list ----------------------------------------------------
 
@@ -878,153 +908,211 @@ class DataOpsService(Service):
         loop = asyncio.get_running_loop()
         self._loop = loop
 
-        producers = self.producers
-        if not producers:
-            log.warning("No producers added to %s — add() or discover() some before serve().", self.name)
-        else:
-            log.info("Running %d producer(s): %s", len(producers), [p.name for p in producers])
-
-        # 2) Instantiate + run setup() — best-effort (see module docstring).
-        instances: list[Producer] = []
-        for instance in self.instantiate():
-            try:
-                await instance.setup()
-            except Exception:
-                log.exception("Producer %s setup() failed — skipping", instance.name)
-                continue
-            instances.append(instance)
-        self.instances = instances
-
-        # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs.
-        self.bind_outputs(instances)
-
-        # 4) Outputs are bound and no trigger has fired yet: producers do
-        #    startup compute here instead of retrying publish() on the
-        #    RuntimeError it raises before binding.
-        for instance in instances:
-            try:
-                await instance.on_ready()
-            except Exception:
-                log.exception("Producer %s on_ready() failed — its triggers are still wired", instance.name)
-
-        # 5) Refuse windows longer than the broker's retention without a historian.
-        validate_windows(
-            instances,
-            retention_s=self.retention_s,
-            historian_configured=self._historian is not None,
-        )
-
-        # 6) The on_metric dispatch table and the declared input signal ids.
-        dispatch, signal_ids, unresolved = build_dispatch(self, instances)
-
-        # 7) Replay producers whose code changed.
-        await replay_changed_producers(self, instances)
-
-        # 8) Retire the previous generation's cursor (if any) and build the
-        #    ingest loop over this service's own consume lane.
-        ingest = Ingest(
-            self._open_ingest_stream,
-            self.buffer,
-            dispatch=dispatch,
-            signal_ids=signal_ids or None,
-            poll_interval_s=self._poll_interval_s,
-            # A lost buffer's generation cannot be recovered, so nothing knows
-            # the previous cursor yet and retiring it is a no-op.
-            previous_generation=None,
-        )
-        ingest.retire_previous_generation()
-        self._ingest = ingest
-
-        # 9) Start ingest in the background and keep retrying unresolved inputs.
-        health_state = health.HealthState(
-            producers=len(instances),
-            generation=self.buffer.generation,
-            last_drain_at=lambda: ingest.last_drain_at,
-            stall_after_s=max(health.STALL_AFTER_MIN_S, 10 * self._poll_interval_s),
-        )
-        ingest_task: asyncio.Task | None = None
-        if signal_ids:
-            ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
-            health_state.ingest_task = ingest_task
-            log.info("Ingest loop started: cursor=%s signal_ids=%d", ingest.cursor, len(signal_ids))
-        else:
-            log.warning("No producer declared a resolved input — ingest loop not started (nothing to fetch yet).")
-
-        def _ensure_ingest_running() -> None:
-            """Start the loop if nothing resolved at startup and something has now."""
-            nonlocal ingest_task
-            if ingest_task is None:
-                ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
-                health_state.ingest_task = ingest_task
-                log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
-
-        reresolve_task: asyncio.Task | None = None
-        if unresolved:
-            log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
-            reresolve_task = asyncio.ensure_future(
-                reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
-            )
-
-        # 10) Every @on_constant/@on_signal subscription, and the @on_command
-        #     executor with its wake-ups.
-        self._watch_constants_and_signals(instances)
-        self._commands = self._execute_commands(instances)
-        commands_task: asyncio.Task | None = None
-        if self._commands is not None:
-            commands_task = asyncio.ensure_future(self._commands.run_forever(stop))
-
-        # 11) Schedule cron/interval triggers (everything except @on_metric),
-        #     plus the service's own periodic buffer trim.
-        scheduler = AsyncIOScheduler()
-        for instance in instances:
-            schedule_periodic(scheduler, instance)
-        scheduler.add_job(
-            trim_buffer,
-            args=(self.buffer, instances, self.retention_s),
-            trigger=IntervalTrigger(seconds=self._trim_interval_s),
-            id=f"{self.name}.buffer-trim",
-            name=f"{self.name}.buffer-trim",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=60,
-        )
-        scheduler.start()
-        log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
-
-        # 12) The health door runs on this loop on purpose (see chaski.dataops.health).
-        health_server = await health.serve(health_state, port=self._health_port)
-
+        # The infrastructure stays live while a fresh deployment waits for its
+        # first timeline/beacon. Producer setup may read application time, so it
+        # must not run in a different clock domain or be skipped at startup.
+        health_state = health.HealthState(generation=self.buffer.generation)
+        health_server = None
         try:
-            await stop.wait()
-        finally:
-            log.info("Shutting down...")
-            scheduler.shutdown(wait=False)
-            if reresolve_task is not None:
-                # `stop` is already set, so the loop returns on its next wait;
-                # cancel covers the case where it is mid-KV-read.
-                reresolve_task.cancel()
-            if commands_task is not None:
+            health_server = await health.serve(health_state, port=self._health_port)
+            while not self.clock.status().ready:
                 try:
-                    await asyncio.wait_for(commands_task, timeout=10.0)
-                except Exception:
-                    log.exception("Command executor did not shut down cleanly")
-                self._commands = None
-            if ingest_task is not None:
-                ingest.wake()
+                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+                    return
+                except TimeoutError:
+                    pass
+            if stop.is_set():
+                return
+            producers = self.producers
+            if not producers:
+                log.warning("No producers added to %s — add() or discover() some before serve().", self.name)
+            else:
+                log.info("Running %d producer(s): %s", len(producers), [p.name for p in producers])
+
+            # 2) Instantiate + run setup() — best-effort (see module docstring).
+            instances: list[Producer] = []
+            for instance in self.instantiate():
                 try:
-                    await asyncio.wait_for(ingest_task, timeout=10.0)
+                    await instance.setup()
                 except Exception:
-                    log.exception("Ingest loop did not shut down cleanly")
+                    log.exception("Producer %s setup() failed — skipping", instance.name)
+                    continue
+                instances.append(instance)
+            self.instances = instances
+
+            # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs.
+            self.bind_outputs(instances)
+
+            # 4) Outputs are bound and no trigger has fired yet: producers do
+            #    startup compute here instead of retrying publish() on the
+            #    RuntimeError it raises before binding.
             for instance in instances:
                 try:
-                    await instance.teardown()
+                    await instance.on_ready()
                 except Exception:
-                    log.exception("Error during teardown of %s", instance.name)
-            health_server.close()
-            await health_server.wait_closed()
-            self._ingest = None
+                    log.exception("Producer %s on_ready() failed — its triggers are still wired", instance.name)
+
+            # 5) Refuse windows longer than the broker's retention without a historian.
+            validate_windows(
+                instances,
+                retention_s=self.retention_s,
+                historian_configured=self._historian is not None,
+            )
+
+            # 6) The on_metric dispatch table and the declared input signal ids.
+            dispatch, signal_ids, unresolved = build_dispatch(self, instances)
+
+            # 7) Replay producers whose code changed.
+            await replay_changed_producers(self, instances)
+
+            # 8) Retire the previous generation's cursor (if any) and build the
+            #    ingest loop over this service's own consume lane.
+            ingest = Ingest(
+                self._open_ingest_stream,
+                self.buffer,
+                dispatch=dispatch,
+                signal_ids=signal_ids or None,
+                poll_interval_s=self._poll_interval_s,
+                # A lost buffer's generation cannot be recovered, so nothing knows
+                # the previous cursor yet and retiring it is a no-op.
+                previous_generation=None,
+                strict=self.step is not None,
+            )
+            ingest.retire_previous_generation()
+            self._ingest = ingest
+
+            # 9) Start ingest in the background and keep retrying unresolved inputs.
+            health_state.producers = len(instances)
+            health_state.last_drain_at = (
+                (lambda: self._step_loop_last) if self.step is not None else (lambda: ingest.last_drain_at)
+            )
+            health_state.stall_after_s = max(health.STALL_AFTER_MIN_S, 10 * self._poll_interval_s)
+            ingest_task: asyncio.Task | None = None
+            if self.step is not None:
+                ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
+                health_state.ingest_task = ingest_task
+            elif signal_ids:
+                ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
+                health_state.ingest_task = ingest_task
+                log.info("Ingest loop started: cursor=%s signal_ids=%d", ingest.cursor, len(signal_ids))
+            else:
+                log.warning("No producer declared a resolved input — ingest loop not started (nothing to fetch yet).")
+
+            def _ensure_ingest_running() -> None:
+                """Start the loop if nothing resolved at startup and something has now."""
+                nonlocal ingest_task
+                if ingest_task is None:
+                    ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
+                    health_state.ingest_task = ingest_task
+                    log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
+
+            reresolve_task: asyncio.Task | None = None
+            if unresolved:
+                log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
+                reresolve_task = asyncio.ensure_future(
+                    reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
+                )
+
+            # 10) Every @on_constant/@on_signal subscription, and the @on_command
+            #     executor with its wake-ups.
+            self._watch_constants_and_signals(instances)
+            self._commands = self._execute_commands(instances)
+            commands_task: asyncio.Task | None = None
+            if self._commands is not None:
+                commands_task = asyncio.ensure_future(self._commands.run_forever(stop))
+
+            # 11) Schedule cron/interval triggers (everything except @on_metric),
+            #     plus the service's own periodic buffer trim.
+            scheduler = AsyncIOScheduler()
+            factory_tasks = []
+            for instance in instances:
+                if self.step is not None:
+                    continue
+                if self.clock.definition_topic:
+                    for method_name, spec in instance.__class__._triggers:
+                        if isinstance(spec, (CronSpec, IntervalSpec)):
+                            factory_tasks.append(
+                                asyncio.create_task(run_periodic(instance, method_name, spec, self.clock))
+                            )
+                else:
+                    schedule_periodic(scheduler, instance)
+            scheduler.add_job(
+                trim_buffer,
+                args=(self.buffer, instances, self.retention_s, self.clock),
+                trigger=IntervalTrigger(seconds=self._trim_interval_s),
+                id=f"{self.name}.buffer-trim",
+                name=f"{self.name}.buffer-trim",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=60,
+            )
+            scheduler.start()
+            log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
+
+            try:
+                await stop.wait()
+            finally:
+                log.info("Shutting down...")
+                scheduler.shutdown(wait=False)
+                for task in factory_tasks:
+                    task.cancel()
+                await asyncio.gather(*factory_tasks, return_exceptions=True)
+                if reresolve_task is not None:
+                    # `stop` is already set, so the loop returns on its next wait;
+                    # cancel covers the case where it is mid-KV-read.
+                    reresolve_task.cancel()
+                if commands_task is not None:
+                    try:
+                        await asyncio.wait_for(commands_task, timeout=10.0)
+                    except Exception:
+                        log.exception("Command executor did not shut down cleanly")
+                    self._commands = None
+                if ingest_task is not None:
+                    ingest.wake()
+                    try:
+                        await asyncio.wait_for(ingest_task, timeout=10.0)
+                    except Exception:
+                        log.exception("Ingest loop did not shut down cleanly")
+                for instance in instances:
+                    try:
+                        await instance.teardown()
+                    except Exception:
+                        log.exception("Error during teardown of %s", instance.name)
+                self._ingest = None
+
+        finally:
+            if health_server is not None:
+                health_server.close()
+                await health_server.wait_closed()
             self.close()
+
+    async def _run_steps(self, instances, ingest, stop):
+        if self.step is None:
+            return
+        while not stop.is_set():
+            try:
+                target = await asyncio.to_thread(self.step.ready)
+                if target is not None:
+                    dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, self, instances)
+                    if not unresolved:
+                        ingest.rebind(dispatch, signal_ids or None)
+                        # Previously sampled values stay in force before the
+                        # new sample at this boundary. Never run old timers
+                        # after ingesting the newer machine state.
+                        await run_due(instances, self.clock, target, inclusive=False)
+                        if signal_ids:
+                            while await ingest.run_once():
+                                if stop.is_set():
+                                    return
+                        await run_due(instances, self.clock, target, inclusive=True)
+                        await asyncio.to_thread(self.step.complete, target)
+            except Exception:
+                log.exception("Coordinated window failed; leaving its progress unacknowledged")
+                await asyncio.sleep(1)
+            self._step_loop_last = time.monotonic()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=0.01)
 
     def run(self) -> None:
         """Block: :meth:`serve` on a fresh event loop until SIGINT/SIGTERM."""

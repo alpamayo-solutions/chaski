@@ -49,6 +49,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import ssl
 import threading
@@ -57,7 +58,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 from urllib.parse import urlsplit
@@ -70,13 +71,16 @@ from colca_data_contracts.local_service import (
     resolve_local_identity,
 )
 from colca_data_contracts.payload import (
+    ClockDefinition,
     DataTags,
     HealthMetricDeclaration,
     Metric,
     ServiceDetails,
     ServiceType,
+    TimeSync,
 )
 from colca_data_contracts.payload import Signal as SignalRecord
+from colca_data_contracts.root import topic_prefix
 from colca_data_contracts.service_topics import service_context
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -85,7 +89,9 @@ from cryptography.x509.oid import NameOID
 from franzmq import Client, Topic
 
 from .catalogue import Catalogue, element_for
+from .clock import Clock, ClockNotReady
 from .command import CommandSender
+from .coordination import StepGate
 from .door import Door, KvEntry, Stream
 
 logger = logging.getLogger(__name__)
@@ -351,6 +357,8 @@ class Service:
         architecture_metadata: dict[str, Any] | None = None,
         health_metrics: Iterable[HealthMetricDeclaration] | None = None,
         max_queued_messages: int = 0,
+        clock: Clock | None = None,
+        step_dependencies: list[str] | None = None,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -376,6 +384,12 @@ class Service:
         identity on disk. See :meth:`start`.
         """
         self.name = name
+        self.clock = clock or Clock()
+        self._clock_subscriptions: set[str] = set()
+        self._last_clock_report = float("-inf")
+        self._processed_at: float | None = None
+        self._progress_stop = threading.Event()
+        self._progress_thread: threading.Thread | None = None
         self._max_queued_messages = max_queued_messages
         self._mount = mount
         self.display_name = display_name
@@ -386,6 +400,11 @@ class Service:
         self.architecture_metadata: dict[str, Any] = dict(architecture_metadata or {})
         self.health_metrics = list(health_metrics or [])
         self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
+        self.step = (
+            StepGate(self, step_dependencies, self._state_dir / "clock-progress.json")
+            if step_dependencies is not None
+            else None
+        )
         self._mqtt_port_override = mqtt_port
         self._api_port_override = api_port
 
@@ -617,6 +636,7 @@ class Service:
         if str(old_filter) != str(self._signal_filter):
             client.unsubscribe(old_filter)
         client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
+        self._subscribe_clock()
         if self._command_sender is not None:
             self._command_sender.resubscribe(client)
         with self._lock:
@@ -692,7 +712,51 @@ class Service:
         with self._lock:
             self._started_catalogue.load_previous(self._previous_catalogue())
         self._started_client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
+        self._subscribe_clock()
         self._publish_details(self._build_service_details(is_active=True, status="healthy"))
+
+    def _subscribe_clock(self) -> None:
+        client = self._started_client
+        for topic in self._clock_subscriptions:
+            client.unsubscribe(topic)
+        self._clock_subscriptions.clear()
+        self.clock.reconnect()
+        if self.clock.source == "mqtt":
+            topic = f"{topic_prefix()}_TimeSync/{self.node_id}"
+            client.subscribe(topic, qos=0, callback=self._on_time_sync)
+            self._clock_subscriptions.add(topic)
+        if self.clock.definition_topic:
+            client.subscribe(self.clock.definition_topic, qos=1, callback=self._on_clock_definition)
+            self._clock_subscriptions.add(self.clock.definition_topic)
+        if self.step is not None:
+            self.step.reconnect()
+            for topic in self.step.topics():
+                client.subscribe(topic, qos=1, callback=self.step.observe)
+                self._clock_subscriptions.add(topic)
+
+    def _on_time_sync(self, message: Any) -> None:
+        try:
+            payload = message.payload
+            if isinstance(payload, (bytes, str)):
+                payload = json.loads(payload)
+            now_ms = payload.now_ms if isinstance(payload, TimeSync) else payload["now_ms"]
+            self.clock.apply_time(now_ms, retained=bool(getattr(message, "retain", False)))
+        except (ValueError, KeyError, TypeError):
+            logger.warning("invalid hub time beacon", exc_info=True)
+
+    def _on_clock_definition(self, message: Any) -> None:
+        try:
+            payload = message.payload
+            if payload is None or payload == b"" or payload == "":
+                self.clock.remove_definition()
+                return
+            if isinstance(payload, (bytes, str)):
+                payload = json.loads(payload)
+            definition = payload if isinstance(payload, ClockDefinition) else ClockDefinition(**payload)
+            self.clock.apply_definition(definition)
+        except (ValueError, TypeError):
+            self.clock.remove_definition()
+            logger.warning("invalid factory clock definition; application time suspended", exc_info=True)
 
     @property
     def node_id(self) -> str | None:
@@ -776,6 +840,7 @@ class Service:
             raise RuntimeError("chaski.Service is closed")
         if self._client is None:
             raise RuntimeError("chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()")
+        timestamp = self.clock.now() if timestamp is None else _epoch(timestamp)
         with self._lock:
             tag_id, _changed = self._started_catalogue.ensure(path, value, unit)
             self._seen.add(path)
@@ -933,6 +998,64 @@ class Service:
 
     # -- health --------------------------------------------------------
 
+    def report_progress(self, processed_at: float, *, force: bool = False) -> bool:
+        """Report application progress at most once per real second.
+
+        This is control/health state, not a business or historian fact. A
+        simulation must report what it processed, not just its target clock.
+        Reporting is best effort: a broker outage must not abort completed work.
+        Returns whether the status was published. Business progress must already
+        be checkpointed by the caller before calling this method.
+        """
+        if (
+            isinstance(processed_at, bool)
+            or not isinstance(processed_at, (int, float))
+            or not math.isfinite(processed_at)
+        ):
+            raise ValueError("processed_at must be finite")
+        with self._lock:
+            if self._closed:
+                return False
+            if self._client is None:
+                raise RuntimeError("chaski.Service: call start() before report_progress()")
+            self._processed_at = processed_at
+            if self._progress_thread is None:
+                self._progress_thread = threading.Thread(
+                    target=self._progress_heartbeat, daemon=True, name=f"{self.name}-clock-health"
+                )
+                self._progress_thread.start()
+        return self._publish_progress(force=force)
+
+    def _progress_heartbeat(self) -> None:
+        # Real-time liveness continues while factory work is paused. The last
+        # checkpoint does not advance unless the worker reports actual work.
+        while not self._progress_stop.wait(5):
+            self._publish_progress()
+
+    def _publish_progress(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            if self._closed or self._processed_at is None or (not force and now - self._last_clock_report < 1):
+                return False
+            processed_at = self._processed_at
+            self._last_clock_report = now
+        status = asdict(self.clock.status())
+        status["processed_at"] = processed_at
+        try:
+            status["observed_at"] = self.clock.real_now()
+        except ClockNotReady:
+            status["observed_at"] = None
+        status["lag_s"] = max(0, status["factory_now"] - processed_at) if status["factory_now"] is not None else None
+        with self._lock:
+            self.metadata["application_clock"] = status
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+        try:
+            self._publish_details(details)
+        except Exception:
+            logger.warning("Could not publish application clock progress", exc_info=True)
+            return False
+        return True
+
     def status(self, ok: bool, detail: str = "") -> None:
         """Republish ``_ServiceDetails`` with ``architecture_metadata.status``
         healthy/unhealthy (+``detail``) — what a health view reads."""
@@ -1060,6 +1183,7 @@ class Service:
         if self._closed:
             return
         self._closed = True
+        self._stop_progress()
         with self._lock:
             client = self._client
             catalogue = None
@@ -1075,6 +1199,11 @@ class Service:
         if details is not None:
             self._publish_details(details)
         self._disconnect_client()
+
+    def _stop_progress(self) -> None:
+        self._progress_stop.set()
+        if self._progress_thread is not None:
+            self._progress_thread.join(timeout=10)
 
     def _seal_catalogue(self) -> None:
         """Under the lock, at close: the ``publish()`` path's end-of-run rule
@@ -1097,6 +1226,7 @@ class Service:
         if self._closed:
             raise RuntimeError("chaski.Service: cannot retire() a closed service")
         self._closed = True
+        self._stop_progress()
         with self._lock:
             client = self._client
         # Outside the lock — see _publish_outside_the_lock.
