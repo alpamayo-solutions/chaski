@@ -1050,6 +1050,13 @@ class Service:
             self.metadata["application_clock"] = status
             details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         try:
+            if self.step is not None and status.get("run_id"):
+                # This marker travels in-order behind samples. Colca drains
+                # priority events before forwarding it to an upstream node.
+                marker_topic = str(self._details_topic).replace("/_ServiceDetails/", "/_ClockProgress/", 1)
+                self.send(
+                    marker_topic, json.dumps({"run_id": status["run_id"], "processed_at": processed_at}), retain=True
+                )
             self._publish_details(details)
         except Exception:
             logger.warning("Could not publish application clock progress", exc_info=True)
