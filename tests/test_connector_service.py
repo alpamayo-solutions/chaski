@@ -85,6 +85,9 @@ class FakeNode:
         return out
 
     # -- the MQTT half --
+    def _handle_on_message(self, message) -> None:
+        pass
+
     def loop_start(self) -> None:
         if self.on_connect is not None:
             self.on_connect(self, None, None, _ReasonCode())

@@ -563,47 +563,6 @@ def _earliest_across(buffer: Buffer, signal_ids: Iterable[str]) -> float | None:
 # ─── MQTT dispatch ──────────────────────────────────────────────────────────
 
 
-def tolerate_undecodable(client) -> None:
-    """Make every subscription on ``client`` survive a message franzmq cannot
-    decode — the input wake's own need, and equally
-    :mod:`chaski.dataops.watch`'s: a ``_Constant``/``_Signal`` tombstone (an
-    empty retained payload — the documented "this record was retired"
-    convention) is exactly the kind of message franzmq's typed decode was not
-    written to expect.
-
-    franzmq decodes every inbound message on paho's network thread before
-    dispatching, and an undecodable one would kill that thread — every
-    subscription on this client, input wake and typed alike, since one client
-    thread serves them all. On a decode failure the raw, undecoded message
-    goes to the matching callbacks instead (their own decoding, if any, is
-    on them), with a warning naming the topic.
-
-    Idempotent: patches ``client._handle_on_message`` once per client, so the
-    input wake and :func:`chaski.dataops.watch.start` can both call this on the
-    same client without wrapping it twice.
-    """
-    from paho.mqtt.client import Client as PahoClient
-
-    typed_dispatch = client._handle_on_message
-    if getattr(typed_dispatch, "_tolerates_undecodable", False):
-        return
-    raw_dispatch = PahoClient._handle_on_message
-
-    def guarded(message):
-        try:
-            return typed_dispatch(message)
-        except Exception:
-            log.warning(
-                "undecodable message on %s — dispatching it undecoded instead",
-                getattr(message, "topic", "?"),
-                exc_info=True,
-            )
-            return raw_dispatch(client, message)
-
-    guarded._tolerates_undecodable = True  # type: ignore[attr-defined]  # the idempotence marker itself
-    client._handle_on_message = guarded
-
-
 # ─── the service ────────────────────────────────────────────────────────────
 
 
@@ -842,7 +801,6 @@ class DataOpsService(Service):
         self._wake_failures = 0
         if len(topics) < len(signal_ids):
             log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
-        tolerate_undecodable(client)
         for topic in sorted(topics - self._wake_topics):
             client.message_callback_add(topic, self._on_input_metric)
             client.subscribe(topic, qos=0)

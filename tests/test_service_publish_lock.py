@@ -45,6 +45,9 @@ class _NetworkThreadClient:
 
     # -- franzmq surface ------------------------------------------------
 
+    def _handle_on_message(self, message) -> None:
+        pass
+
     def loop_start(self) -> None:
         if self.on_connect is not None:
             self.on_connect(self, None, None, _FakeReasonCode())

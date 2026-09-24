@@ -18,7 +18,7 @@ tombstone case to the handler as ``None``, so this module does no decoding of
 its own — the crash a hand-rolled subscription like this used to risk (an
 unconditional ``json.loads`` on a tombstone's empty payload, killing the whole
 MQTT client) is guarded once, for every subscription this service makes,
-by :func:`chaski.dataops.service.tolerate_undecodable`.
+by :func:`chaski.service.tolerate_undecodable`.
 
 Delivery happens on franzmq's own callback thread (:class:`franzmq.Client`
 runs a message's registered callbacks off the network thread already); each
@@ -85,12 +85,6 @@ def start(
     """
     if not constant_triggers and not signal_triggers:
         return 0
-    # Imported here, not at module level: chaski.dataops.service imports this
-    # module to call start() from DataOpsService.serve(), so a top-level
-    # import back the other way would be circular.
-    from .service import tolerate_undecodable
-
-    tolerate_undecodable(client)
     count = 0
     for path_or_pattern, handler in constant_triggers:
         _subscribe(client, Constant, node_id, path_or_pattern, handler, door, loop)
