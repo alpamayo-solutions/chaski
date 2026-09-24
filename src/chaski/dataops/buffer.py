@@ -19,10 +19,12 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
 import ulid
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 log = logging.getLogger("chaski.dataops.buffer")
 
@@ -125,15 +127,23 @@ class Buffer:
         original Python type, decoded from JSON). Empty — but correctly
         columned — when nothing matches.
         """
+        # pandas costs a process ~60 MB, so it loads with the first frame.
+        import pandas as pd
+
+        rows = self.points(signal_id, start, end)
+        return pd.DataFrame(
+            {"ts": [ts for ts, _ in rows], "value": [value for _, value in rows]},
+            columns=["ts", "value"],
+        )
+
+    def points(self, signal_id: str, start: float, end: float) -> list[tuple[float, Any]]:
+        """``(ts, value)`` for ``signal_id`` with ``start <= ts < end``, ordered by ts."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT ts, value FROM points WHERE signal_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC",
                 (signal_id, start, end),
             ).fetchall()
-        return pd.DataFrame(
-            {"ts": [r[0] for r in rows], "value": [json.loads(r[1]) for r in rows]},
-            columns=["ts", "value"],
-        )
+        return [(ts, json.loads(value)) for ts, value in rows]
 
     def latest_before(self, signal_id: str, before: float) -> tuple[float, Any] | None:
         """Latest point for ``signal_id`` with ``ts <= before``, or ``None``."""
