@@ -274,6 +274,36 @@ def _connect_external_mqtt(
     return client
 
 
+def tolerate_undecodable(client: Any) -> None:
+    """Make ``client`` survive a message franzmq cannot decode.
+
+    franzmq decodes every inbound message on paho's network thread before
+    dispatching, and a failed decode kills that thread, and with it every
+    subscription on the client. Retained tombstones (empty payloads) and
+    commands whose optional fields franzmq's types require both fail that
+    decode. On a failure the raw message goes to the matching callbacks
+    instead, with a warning naming the topic. Idempotent.
+    """
+    typed_dispatch = client._handle_on_message
+    if getattr(typed_dispatch, "_tolerates_undecodable", False):
+        return
+    raw_dispatch = pahomqtt.Client._handle_on_message
+
+    def guarded(message: Any) -> Any:
+        try:
+            return typed_dispatch(message)
+        except Exception:
+            logger.warning(
+                "undecodable message on %s — dispatching it undecoded instead",
+                getattr(message, "topic", "?"),
+                exc_info=True,
+            )
+            return raw_dispatch(client, message)
+
+    guarded._tolerates_undecodable = True  # type: ignore[attr-defined]
+    client._handle_on_message = guarded
+
+
 def _revoke_external(
     node_url: str, ulid: str, token: str, *, api_port: int | None = None, timeout: float = 15.0
 ) -> None:
@@ -514,6 +544,9 @@ class Service:
         client = self._started_client
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
+        # before the loop: a persistent session delivers its queued messages
+        # right after CONNACK, ahead of any subscription made in this run
+        tolerate_undecodable(client)
         client.loop_start()
         if not self._connected_event.wait(connect_timeout):
             raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")

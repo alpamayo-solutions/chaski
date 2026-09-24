@@ -35,6 +35,9 @@ class _FakeClient:
         self._reason_code = reason_code or _FakeReasonCode()
         self.disconnected = False
 
+    def _handle_on_message(self, message) -> None:
+        pass
+
     def loop_start(self) -> None:
         if self.on_connect is not None:
             self.on_connect(self, None, None, self._reason_code)
@@ -315,3 +318,24 @@ def test_two_different_names_mint_different_identities(tmp_path):
     b = Service("mes-bridge", "site1/mes", node="https://edge1.example", state_dir=tmp_path / "b")
     assert a.ulid != b.ulid
     assert a.pubkey != b.pubkey
+
+
+def test_the_client_tolerates_undecodable_messages_before_its_loop_starts(tmp_path, monkeypatch):
+    # clean_start=False: the broker delivers the session's queued messages right
+    # after CONNACK, before this run subscribes anything
+    guarded: list[bool] = []
+
+    class _Client(_FakeClient):
+        def loop_start(self) -> None:
+            guarded.append(getattr(self._handle_on_message, "_tolerates_undecodable", False))
+            super().loop_start()
+
+    client = _Client()
+    identity = LocalServiceIdentity(
+        service_id="svc-ulid", service_name="svc1", node_id="n-edge1", system_element_id="el-1", mount="line1"
+    )
+    monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
+    monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))
+    monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
+    Service("svc1", "line1", state_dir=tmp_path).start()
+    assert guarded == [True]

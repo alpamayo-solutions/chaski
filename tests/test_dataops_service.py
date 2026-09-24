@@ -362,7 +362,7 @@ def test_an_input_topic_still_wakes_for_a_metric_franzmq_cannot_decode():
     import franzmq
     from paho.mqtt.client import MQTTMessage
 
-    from chaski.dataops.service import tolerate_undecodable
+    from chaski.service import tolerate_undecodable
 
     topic = "colca/v1/_Metric/n1/line1/temp"
     client = franzmq.Client(client_id="wake-test")
