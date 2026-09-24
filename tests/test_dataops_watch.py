@@ -237,6 +237,76 @@ async def test_dispatch_pins_one_kv_snapshot_per_message():
     assert instance.kv_calls_seen == [1]
 
 
+class Resolving(Producer):
+    """Resolves a signal on every setpoint, or not at all with ``resolves=False``."""
+
+    name = "resolving"
+    system_element_name = "SE-Resolving"
+
+    def __init__(self, *, resolves: bool = True) -> None:
+        super().__init__()
+        self.resolves = resolves
+        self.seen = 0
+
+    @on_constant("line1/operator/setpoint")
+    async def on_setpoint(self, constant) -> None:
+        from chaski.dataops import resolve as resolve_module
+
+        if self.resolves:
+            resolve_module.resolve_signal(self.runtime.door, "a")
+        self.seen += 1
+
+
+async def _burst(instance: Producer, door: FakeDoor, count: int, client_id: str) -> None:
+    constant_triggers, signal_triggers = watch.gather_triggers([instance])
+    client = franzmq.Client(client_id=client_id)
+    watch.start(client, NODE_ID, door, asyncio.get_running_loop(), constant_triggers, signal_triggers)
+    payload = Constant(id="c-5", name="setpoint", data_type=ConstantDataType.FLOAT64, value=1.0).encode()
+    # Delivered back to back, before the loop runs any of them: one burst.
+    for _ in range(count):
+        _deliver(client, f"colca/v1/_Constant/{NODE_ID}/line1/operator/setpoint", payload)
+    await asyncio.sleep(0.05)
+
+
+@run_async
+async def test_a_burst_reads_no_kv_when_no_handler_resolves():
+    door = FakeDoor()
+    instance = Resolving(resolves=False).attach(FakeRuntime(door, buffer=None))
+
+    await _burst(instance, door, 3, "watch-no-resolve")
+
+    assert instance.seen == 3
+    assert door.kv_calls == 0
+
+
+@run_async
+async def test_a_burst_shares_one_kv_read_across_its_messages():
+    door = FakeDoor()
+    instance = Resolving().attach(FakeRuntime(door, buffer=None))
+
+    await _burst(instance, door, 3, "watch-one-read")
+
+    assert instance.seen == 3
+    assert door.kv_calls == 1
+
+
+@run_async
+async def test_a_later_burst_reads_kv_again():
+    door = FakeDoor()
+    instance = Resolving().attach(FakeRuntime(door, buffer=None))
+    constant_triggers, signal_triggers = watch.gather_triggers([instance])
+    client = franzmq.Client(client_id="watch-two-bursts")
+    watch.start(client, NODE_ID, door, asyncio.get_running_loop(), constant_triggers, signal_triggers)
+    payload = Constant(id="c-6", name="setpoint", data_type=ConstantDataType.FLOAT64, value=1.0).encode()
+
+    for _ in range(2):
+        _deliver(client, f"colca/v1/_Constant/{NODE_ID}/line1/operator/setpoint", payload)
+        await asyncio.sleep(0.05)
+
+    assert instance.seen == 2
+    assert door.kv_calls == 2
+
+
 @run_async
 async def test_handler_exception_is_logged_and_does_not_stop_the_client(caplog):
     class Broken(Producer):
