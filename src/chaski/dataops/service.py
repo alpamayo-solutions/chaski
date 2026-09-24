@@ -937,7 +937,12 @@ class DataOpsService(Service):
         self._ingest = ingest
 
         # 9) Start ingest in the background and keep retrying unresolved inputs.
-        health_state = health.HealthState(producers=len(instances), generation=self.buffer.generation)
+        health_state = health.HealthState(
+            producers=len(instances),
+            generation=self.buffer.generation,
+            last_drain_at=lambda: ingest.last_drain_at,
+            stall_after_s=max(health.STALL_AFTER_MIN_S, 10 * self._poll_interval_s),
+        )
         ingest_task: asyncio.Task | None = None
         if signal_ids:
             ingest_task = asyncio.ensure_future(ingest.run_forever(stop))

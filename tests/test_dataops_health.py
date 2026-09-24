@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -82,5 +83,31 @@ async def test_a_dead_ingest_loop_turns_the_probe_503():
         assert status == 200, body
         assert body["ingest"] == "not-started"
     finally:
+        server.close()
+        await server.wait_closed()
+
+
+@run_async
+async def test_an_ingest_loop_that_stopped_draining_turns_the_probe_503():
+    """Alive is not enough: a loop stuck on a door that never answers, or
+    retrying the same error for ever, has stopped finishing drains."""
+    last_drain = [time.monotonic() - 301.0]
+    state = HealthState(last_drain_at=lambda: last_drain[0], stall_after_s=300.0)
+    state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
+    port = _free_port()
+    server = await serve(state, port=port)
+    try:
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 503, body
+        assert body["ok"] is False
+        assert body["ingest"] == "stalled"
+        assert body["since_drain_s"] >= 300
+
+        last_drain[0] = time.monotonic()  # it drained again
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 200, body
+        assert body["ingest"] == "running"
+    finally:
+        state.ingest_task.cancel()
         server.close()
         await server.wait_closed()

@@ -15,11 +15,15 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 log = logging.getLogger("chaski.dataops.health")
 
 PORT_DEFAULT = 8888
+#: No finished drain for this long, or ten poll intervals if longer, is a stall.
+#: Transport errors back off to at most 30 s, so a node restart stays under it.
+STALL_AFTER_MIN_S = 300.0
 
 
 @dataclass
@@ -27,34 +31,51 @@ class HealthState:
     """What the service knows about itself, set by ``run()``.
 
     An ingest task that died with an exception turns the answer into a 503,
-    because the service is up but doing nothing. An ingest that never started
-    (nothing resolved yet) is healthy: a fresh node waiting to be commissioned.
+    because the service is up but doing nothing. So does one that is alive but
+    has not finished a drain for ``stall_after_s``: a healthy loop drains at
+    least once per poll interval, even with nothing to read. An ingest that
+    never started (nothing resolved yet) is healthy: a fresh node waiting to be
+    commissioned.
     """
 
     started_at: float = field(default_factory=time.time)
     ingest_task: asyncio.Task | None = None
+    #: Monotonic time of the last finished drain, from the ingest loop.
+    last_drain_at: Callable[[], float] | None = None
+    stall_after_s: float = STALL_AFTER_MIN_S
     producers: int = 0
     generation: str = ""
 
-    def healthy(self) -> bool:
-        task = self.ingest_task
-        return task is None or not task.done()
-
-    def snapshot(self) -> dict:
+    def _ingest(self) -> str:
         task = self.ingest_task
         if task is None:
-            ingest = "not-started"
-        elif not task.done():
-            ingest = "running"
-        else:
-            ingest = "dead"
-        return {
-            "ok": self.healthy(),
+            return "not-started"
+        if task.done():
+            return "dead"
+        if self._since_drain() > self.stall_after_s:
+            return "stalled"
+        return "running"
+
+    def _since_drain(self) -> float:
+        if self.last_drain_at is None:
+            return 0.0
+        return time.monotonic() - self.last_drain_at()
+
+    def healthy(self) -> bool:
+        return self._ingest() in ("not-started", "running")
+
+    def snapshot(self) -> dict:
+        ingest = self._ingest()
+        body = {
+            "ok": ingest in ("not-started", "running"),
             "ingest": ingest,
             "producers": self.producers,
             "generation": self.generation,
             "uptime_s": round(time.time() - self.started_at, 1),
         }
+        if self.ingest_task is not None and self.last_drain_at is not None:
+            body["since_drain_s"] = round(self._since_drain(), 1)
+        return body
 
 
 async def serve(state: HealthState, port: int = PORT_DEFAULT) -> asyncio.AbstractServer:
