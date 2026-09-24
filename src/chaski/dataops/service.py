@@ -18,8 +18,9 @@ producer runtime.
   :class:`~chaski.dataops.inputs.Historian` as ``historian=``. The SDK ships
   no database driver.
 * **Outputs are catalogued**: :func:`~chaski.dataops.outputs.build_catalogue`
-  publishes a ``_DataTags`` record like a connector's; annotations are
-  ``_Annotation`` records.
+  declares them into the service's own catalogue, which is published as a
+  ``_DataTags`` record like a connector's; annotations are ``_Annotation``
+  records.
 * **A code change replays**: :func:`replay_changed_producers`, keyed by
   :func:`~chaski.dataops.codehash.compute_code_hash`.
 * **``_Constant``/``_Signal`` are watched, not ingested**:
@@ -787,20 +788,21 @@ class DataOpsService(Service):
         """Catalogue every declared ``SignalOutput`` and bind every
         ``AnnotationOutput`` on ``instances``. Returns the catalogue's
         ``{source: tag_id}``. Requires :meth:`start`."""
-        door = self.door
-        node_id, service_ulid = self._node_id, self._service_id
-        if node_id is None or service_ulid is None:
+        node_id = self._node_id
+        if node_id is None:
             raise RuntimeError("chaski.DataOpsService: call start() before bind_outputs()")
-        result = build_catalogue(
-            instances,
-            door,
-            node_id=node_id,
-            mount=self._mount,
-            service_name=self.name,
-            service_ulid=service_ulid,
-        )
+        with self._lock:
+            result = build_catalogue(instances, self._started_catalogue)
+            prepared = self._catalogue_to_publish()
+        # Outside the lock — see _publish_outside_the_lock.
+        if prepared is not None:
+            self._publish_catalogue(prepared)
         bind_annotation_outputs(instances, node_id=node_id, mount=self._mount)
         return result
+
+    def _seal_catalogue(self) -> None:
+        """The declared outputs decide what is stale (:func:`build_catalogue`);
+        a shutdown changes nothing, so the run's catalogue stays the node's."""
 
     def _open_ingest_stream(self, cursor: str, signal_ids: list[str] | None) -> Stream:
         self._wake_on_inputs(signal_ids or [])

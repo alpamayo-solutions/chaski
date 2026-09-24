@@ -115,6 +115,12 @@ class Doubled(Producer):
 DataOpsService("dataops", mount="site1").add(Doubled).run()
 ```
 
+An output can say what it is: `SignalOutput("availability", "float",
+"share of planned time running", unit="%", semantic_type="availability")`.
+The unit, semantic type (a semantic tag the node knows) and description travel
+in the output's catalogue entry; the node applies them to the signal it binds
+and follows later changes. An output keeps its tag id across restarts.
+
 Producers can also run on a schedule (`@every("30s")`, `@cron("0 6 * * 1-5")`)
 and read windows of buffered values (`self.temperature.fetch(start, end)`).
 When a producer's code changes, the service replays the window its inputs
