@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/alpamayo-solutions/chaski/compare/v0.8.0...v0.8.1) (2026-09-24)
+
+
+### Fixes
+
+* tolerate undecodable messages from the moment the client connects ([#31](https://github.com/alpamayo-solutions/chaski/issues/31)) ([5a05e27](https://github.com/alpamayo-solutions/chaski/commit/5a05e276d3bd61be9b79d7a78e1aa3262c28d52e))
+
 ## [0.8.0](https://github.com/alpamayo-solutions/chaski/compare/v0.7.0...v0.8.0) (2026-09-24)
 
 
