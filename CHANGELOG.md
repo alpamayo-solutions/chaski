@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/alpamayo-solutions/chaski/compare/v0.9.0...v0.10.0) (2026-09-24)
+
+
+### Features
+
+* **clock:** add optional application time and coordinated execution windows ([#39](https://github.com/alpamayo-solutions/chaski/issues/39)) ([821abfe](https://github.com/alpamayo-solutions/chaski/commit/821abfeee8c6ae084f998aa82cfeeae11e54c1d1))
+
 ## [0.9.0](https://github.com/alpamayo-solutions/chaski/compare/v0.8.1...v0.9.0) (2026-09-24)
 
 
