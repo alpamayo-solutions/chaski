@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/alpamayo-solutions/chaski/compare/v0.10.1...v0.10.2) (2026-09-24)
+
+
+### Fixes
+
+* **deps:** franzmq 0.6.5 decodes the node's commands and acks ([#43](https://github.com/alpamayo-solutions/chaski/issues/43)) ([be5a28c](https://github.com/alpamayo-solutions/chaski/commit/be5a28cd557443947344b6f08144fc6e1d1efd07))
+
 ## [0.10.1](https://github.com/alpamayo-solutions/chaski/compare/v0.10.0...v0.10.1) (2026-09-24)
 
 
