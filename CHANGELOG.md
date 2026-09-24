@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/alpamayo-solutions/chaski/compare/v0.7.0...v0.8.0) (2026-09-24)
+
+
+### Features
+
+* **dataops:** SignalOutput carries unit, semantic_type and description ([e6710fa](https://github.com/alpamayo-solutions/chaski/commit/e6710fa9e26d1174280d2ef40a5dc7be03e81a6a))
+
+
+### Fixes
+
+* **dataops:** keep output tag ids across restarts ([e6710fa](https://github.com/alpamayo-solutions/chaski/commit/e6710fa9e26d1174280d2ef40a5dc7be03e81a6a))
+
 ## [0.7.0](https://github.com/alpamayo-solutions/chaski/compare/v0.6.1...v0.7.0) (2026-09-23)
 
 
