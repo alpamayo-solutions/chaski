@@ -94,8 +94,7 @@ class CommandSender:
             client.subscribe(topic, qos=1)
 
     def _on_ack(self, _client: Any, _userdata: Any, message: Any) -> None:
-        """franzmq hands the ack decoded when its ``Ack`` type fits, and raw
-        when the ack carries more."""
+        """franzmq hands the ack decoded, or raw when it cannot decode it."""
         payload = message.payload
         if isinstance(payload, (bytes, bytearray)):
             try:
