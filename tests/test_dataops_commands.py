@@ -56,7 +56,7 @@ def record(path: str = SET_PRODUCT, *, contract: str = "_CmdParam", offset: int 
         origin_offset=offset,
         topic=f"colca/v1/{contract}/{NODE_ID}/{path}",
         payload=body,
-        ts=1000.0,
+        ts=time.time() * 1000,
         written_by="human-1",
         actor_id="human-1",
         actor_label="anna",
@@ -185,6 +185,42 @@ async def test_expired_command_is_answered_498_and_not_run():
     await ex.drain()
     assert producer.seen == []
     assert acks(door)[0][1]["result_code"] == 498
+
+
+@run_async
+async def test_a_deadline_beyond_the_lifetime_cap_is_refused_and_not_run():
+    ex, producer, door = executor(record(expires_at=(time.time() + 3600) * 1000))
+    await ex.drain()
+    assert producer.seen == []
+    ack = acks(door)[0][1]
+    assert ack["result_code"] == 400
+    assert "60 s after it arrived" in ack["message"]
+
+
+@run_async
+async def test_a_created_at_after_arrival_is_refused():
+    ex, producer, door = executor(record(created_at=(time.time() + 3600) * 1000))
+    await ex.drain()
+    assert producer.seen == []
+    assert acks(door)[0][1]["result_code"] == 400
+
+
+@run_async
+async def test_an_old_command_with_a_long_life_is_refused():
+    now = time.time()
+    ex, producer, door = executor(record(created_at=(now - 600) * 1000, expires_at=(now + 30) * 1000))
+    await ex.drain()
+    assert producer.seen == []
+    assert "after it was created" in acks(door)[0][1]["message"]
+
+
+@run_async
+async def test_a_command_within_the_cap_runs():
+    now = time.time()
+    ex, producer, door = executor(record(created_at=now * 1000, expires_at=(now + 15) * 1000))
+    await ex.drain()
+    assert len(producer.seen) == 1
+    assert acks(door)[0][1]["result_code"] == 200
 
 
 @run_async

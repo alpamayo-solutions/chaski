@@ -10,6 +10,10 @@ out before the command on the same session, so the broker holds it before
 the ack exists. The command carries ``correlation_id`` and ``expires_at``
 (unix milliseconds) at the top level, next to the verb's own fields, which
 is where the node reads them.
+
+Those timestamps are the sender's claim. A receiver checks them with
+:func:`lifetime_refusal` before it acts, so a command cannot wait an hour
+and then act.
 """
 
 from __future__ import annotations
@@ -22,6 +26,35 @@ from typing import Any
 
 import ulid as ulid_lib
 from colca_data_contracts import topic_prefix
+
+#: The longest a command may stay valid, from its arrival or its creation.
+MAX_LIFETIME_S = 60.0
+
+
+def _ms(raw: Any) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def lifetime_refusal(expires_at: Any, created_at: Any, received_ms: float) -> str | None:
+    """Why a command's own ``expires_at``/``created_at`` (unix ms) are refused,
+    or ``None``. ``received_ms`` is when the receiver got it: the node's
+    record time, or the clock when read straight off MQTT. An absent or
+    unusable timestamp is not a refusal."""
+    limit_ms = MAX_LIFETIME_S * 1000.0
+    deadline = _ms(expires_at)
+    created = _ms(created_at)
+    if deadline is not None and deadline - received_ms > limit_ms:
+        return f"refused: it would stay valid more than {MAX_LIFETIME_S:g} s after it arrived"
+    if created is not None and created - received_ms > limit_ms:
+        return "refused: its created_at is after it arrived"
+    if deadline is not None and created is not None and deadline - created > limit_ms:
+        return f"refused: it would stay valid more than {MAX_LIFETIME_S:g} s after it was created"
+    return None
 
 
 @dataclass

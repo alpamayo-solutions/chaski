@@ -202,8 +202,10 @@ The command is read from the node's `commands` stream through a durable
 cursor of the service's own, so `command.actor_id`/`actor_label` are the
 node's attestation, not the sender's claim; its MQTT topic only wakes the
 drain. An expired command (`expires_at`, unix ms) is answered `498` without
-running the handler, `CommandRejected` answers its own code, any other
-exception `500`. A page of commands is acked after it was handled, so a
+running the handler, and so is a deadline more than 60 s after the command
+arrived or was `created_at` (`400`): the sender's deadline is capped, not
+trusted. A receiver of its own checks the same rule with
+`chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`. A page of commands is acked after it was handled, so a
 restart can deliver a command twice: handlers must be idempotent.
 
 ## Run a node

@@ -22,6 +22,10 @@ with ``{correlation_id, result_code, message, performed_at}``:
 ======  =====================================================
 200     the handler returned; its string is the message
 4xx     the handler raised :class:`CommandRejected`
+400     the command asks to live longer than
+        :data:`chaski.command.MAX_LIFETIME_S`, counted
+        from its arrival at the node or from its ``created_at``, or says it
+        was created after it arrived; the handler is not run
 498     ``expires_at`` (unix ms) had passed; the handler is not run
 500     the handler raised anything else
 ======  =====================================================
@@ -49,6 +53,7 @@ from typing import Any
 import httpx
 from colca_data_contracts import topic_prefix
 
+from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream
 
 from . import resolve
@@ -60,6 +65,7 @@ log = logging.getLogger("chaski.dataops.commands")
 STREAM = "commands"
 CURSOR = "commands"
 ACK_OK = 200
+ACK_REFUSED = 400
 ACK_EXPIRED = 498
 ACK_FAILED = 500
 #: QoS 1: a lost wake would leave a command waiting for the next one.
@@ -302,7 +308,10 @@ class CommandExecutor:
             ts=record.ts,
             offset=record.offset,
         )
-        if expired(payload.get("expires_at"), time.time() * 1000.0):
+        refusal = lifetime_refusal(payload.get("expires_at"), payload.get("created_at"), record.ts)
+        if refusal is not None:
+            code, message = ACK_REFUSED, refusal
+        elif expired(payload.get("expires_at"), time.time() * 1000.0):
             code, message = ACK_EXPIRED, "expired before it was executed"
         else:
             code, message = await self._run(handler, command)
