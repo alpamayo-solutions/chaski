@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.8](https://github.com/alpamayo-solutions/chaski/compare/v0.10.7...v0.10.8) (2026-09-25)
+
+
+### Fixes
+
+* **service:** re-announce when its own record reads inactive ([#55](https://github.com/alpamayo-solutions/chaski/issues/55)) ([ad7e8f0](https://github.com/alpamayo-solutions/chaski/commit/ad7e8f0eafcf825d8eb54c7d550237ed416b2a54))
+
 ## [0.10.7](https://github.com/alpamayo-solutions/chaski/compare/v0.10.6...v0.10.7) (2026-09-25)
 
 
