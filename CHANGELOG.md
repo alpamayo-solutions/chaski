@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/alpamayo-solutions/chaski/compare/v0.10.3...v0.10.4) (2026-09-25)
+
+
+### Fixes
+
+* **dataops:** cap a command's lifetime on the receiving side ([#47](https://github.com/alpamayo-solutions/chaski/issues/47)) ([57eaf3c](https://github.com/alpamayo-solutions/chaski/commit/57eaf3c9a0a4a4deb6ea77e0fc35197cd788bda5))
+
 ## [0.10.3](https://github.com/alpamayo-solutions/chaski/compare/v0.10.2...v0.10.3) (2026-09-25)
 
 
