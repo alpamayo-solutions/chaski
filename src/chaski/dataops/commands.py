@@ -22,7 +22,8 @@ with ``{correlation_id, result_code, message, performed_at}``:
 ======  =====================================================
 200     the handler returned; its string is the message
 4xx     the handler raised :class:`CommandRejected`
-400     the command asks to live longer than ``MAX_LIFETIME_S``, counted
+400     the command asks to live longer than
+        :data:`chaski.command.MAX_LIFETIME_S`, counted
         from its arrival at the node or from its ``created_at``, or says it
         was created after it arrived; the handler is not run
 498     ``expires_at`` (unix ms) had passed; the handler is not run
@@ -52,6 +53,7 @@ from typing import Any
 import httpx
 from colca_data_contracts import topic_prefix
 
+from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream
 
 from . import resolve
@@ -66,9 +68,6 @@ ACK_OK = 200
 ACK_REFUSED = 400
 ACK_EXPIRED = 498
 ACK_FAILED = 500
-#: The longest a command may stay valid. The deadline is the sender's claim,
-#: so the receiver caps it: a command cannot wait an hour and then act.
-MAX_LIFETIME_S = 60.0
 #: QoS 1: a lost wake would leave a command waiting for the next one.
 _QOS = 1
 #: Wait before re-sending a refused SUBSCRIBE.
@@ -148,21 +147,6 @@ def expired(expires_at: Any, now_ms: float) -> bool:
         return float(expires_at) < now_ms
     except (TypeError, ValueError):
         return False
-
-
-def too_long_lived(expires_at: Any, created_at: Any, received_ms: float) -> str | None:
-    """Why a command's own timestamps (unix ms) are refused, or ``None``.
-    ``received_ms`` is the node's record time."""
-    limit_ms = MAX_LIFETIME_S * 1000.0
-    deadline = _deadline(expires_at)
-    created = _deadline(created_at)
-    if deadline is not None and deadline - received_ms > limit_ms:
-        return f"refused: it would stay valid more than {MAX_LIFETIME_S:g} s after it arrived"
-    if created is not None and created - received_ms > limit_ms:
-        return "refused: its created_at is after it arrived"
-    if deadline is not None and created is not None and deadline - created > limit_ms:
-        return f"refused: it would stay valid more than {MAX_LIFETIME_S:g} s after it was created"
-    return None
 
 
 def _deadline(raw: Any) -> float | None:
@@ -324,7 +308,7 @@ class CommandExecutor:
             ts=record.ts,
             offset=record.offset,
         )
-        refusal = too_long_lived(payload.get("expires_at"), payload.get("created_at"), record.ts)
+        refusal = lifetime_refusal(payload.get("expires_at"), payload.get("created_at"), record.ts)
         if refusal is not None:
             code, message = ACK_REFUSED, refusal
         elif expired(payload.get("expires_at"), time.time() * 1000.0):

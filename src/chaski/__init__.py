@@ -14,7 +14,7 @@ from typing import Any
 from colca_data_contracts.payload import DataTag
 
 from .clock import Clock, ClockNotReady, ClockStatus
-from .command import CommandSender
+from .command import CommandSender, lifetime_refusal
 from .connector import (
     ConnectorService,
     Discovery,
@@ -52,6 +52,7 @@ __all__ = [
     "Stream",
     "Target",
     "Telemetry",
+    "lifetime_refusal",
 ]
 
 
