@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/alpamayo-solutions/chaski/compare/v0.10.2...v0.10.3) (2026-09-25)
+
+
+### Fixes
+
+* **service:** an undecodable message is a warning again ([#45](https://github.com/alpamayo-solutions/chaski/issues/45)) ([4ae1bb7](https://github.com/alpamayo-solutions/chaski/commit/4ae1bb7be4663e034419224957fa2052dc3bae50))
+
 ## [0.10.2](https://github.com/alpamayo-solutions/chaski/compare/v0.10.1...v0.10.2) (2026-09-24)
 
 
