@@ -638,7 +638,33 @@ class Service:
         with self._lock:
             details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
+        client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
         self._placement_reannounced()
+
+    def _on_own_details(self, message: Any) -> None:
+        """This service's own retained ``_ServiceDetails``, on the network
+        thread. A last will from a replaced connection can land after the
+        reconnect announced, and nothing else would correct it: re-announce
+        once when the record reads inactive or deleted while this service is
+        up. Its own active echo is a no-op."""
+        payload = message.payload
+        if isinstance(payload, (bytes, str)) and payload:
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                payload = None
+        is_active = payload.get("is_active") if isinstance(payload, dict) else getattr(payload, "is_active", None)
+        if is_active is True:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            logger.warning("chaski.Service: %s read its own record as inactive; re-announcing", self.name)
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+            # Under the lock, which close() takes after setting _closed: its
+            # inactive record then always queues behind this one. No wait, so
+            # no PUBACK is awaited under the lock.
+            self._started_client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
 
     def _placement_reannounced(self) -> None:
         """Hook: a reconnect re-announced this service (catalogue may be due)."""
@@ -710,6 +736,8 @@ class Service:
         self._started_client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         self._subscribe_clock()
         self._publish_details(self._build_service_details(is_active=True, status="healthy"))
+        # after the announce, so the retained record it reads back is its own
+        self._started_client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
 
     def _subscribe_clock(self) -> None:
         client = self._started_client

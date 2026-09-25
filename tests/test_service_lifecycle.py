@@ -222,6 +222,71 @@ def test_local_start_sets_a_last_will_before_connect(tmp_path, monkeypatch):
     assert will_payload.is_active is False
 
 
+# -- own record read-back: a late will is corrected ------------------------
+
+_DETAILS_TOPIC = "colca/v1/_ServiceDetails/n-edge1/line1/svc1/_service"
+
+
+class _Message:
+    def __init__(self, payload) -> None:
+        self.topic = _DETAILS_TOPIC
+        self.payload = payload
+
+
+def _read_back(svc: Service, client: _FakeClient, *, is_active: bool, status: str = "healthy") -> None:
+    record = svc._build_service_details(is_active=is_active, status=status)
+    client.subscriptions[_DETAILS_TOPIC](_Message(record))
+
+
+def test_reading_back_its_own_active_record_does_not_republish(tmp_path, monkeypatch):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    before = len(client.published)
+    _read_back(svc, client, is_active=True)
+    assert len(client.published) == before
+
+
+def test_a_late_will_is_corrected_with_the_current_record_once(tmp_path, monkeypatch):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    svc.status(False, "source unreachable")
+    before = len(client.published)
+    _read_back(svc, client, is_active=False, status="unhealthy")
+    assert len(client.published) == before + 1
+    topic, latest = client.published[-1]
+    assert topic == _DETAILS_TOPIC
+    assert latest.is_active is True
+    assert latest.architecture_metadata == {"status": "unhealthy", "detail": "source unreachable"}
+    # the correction's own echo settles it
+    client.subscriptions[_DETAILS_TOPIC](_Message(latest))
+    assert len(client.published) == before + 1
+
+
+@pytest.mark.parametrize("payload", [None, b"", b'{"is_active": false}'])
+def test_a_deleted_or_undecoded_inactive_record_is_corrected(tmp_path, monkeypatch, payload):
+    _svc, client = _local_service(tmp_path, monkeypatch)
+    before = len(client.published)
+    client.subscriptions[_DETAILS_TOPIC](_Message(payload))
+    assert len(client.published) == before + 1
+    assert _details(client)[-1].is_active is True
+
+
+def test_its_own_close_is_not_contradicted(tmp_path, monkeypatch):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    svc.close()
+    before = len(client.published)
+    _read_back(svc, client, is_active=False)
+    assert len(client.published) == before
+    assert _details(client)[-1].is_active is False
+
+
+def test_a_reconnect_announces_before_reading_its_record_back(tmp_path, monkeypatch):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    order: list[str] = []
+    monkeypatch.setattr(client, "publish", lambda topic, *a, **k: order.append(f"pub {topic}"))
+    monkeypatch.setattr(client, "subscribe", lambda topic, *a, **k: order.append(f"sub {topic}"))
+    svc._on_connect(client, None, None, _FakeReasonCode())
+    assert order.index(f"pub {_DETAILS_TOPIC}") < order.index(f"sub {_DETAILS_TOPIC}")
+
+
 # -- NotEnrolled / enroll_hint / wait_enrolled -------------------------------
 
 
