@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.5](https://github.com/alpamayo-solutions/chaski/compare/v0.10.4...v0.10.5) (2026-09-25)
+
+
+### Fixes
+
+* **catalogue:** normalize retained boolean data types ([#19](https://github.com/alpamayo-solutions/chaski/issues/19)) ([124b703](https://github.com/alpamayo-solutions/chaski/commit/124b7035f66a5c5ea939b70822acf22a8f8efee0))
+* **deps:** allow compatible Colca 0.14 clock releases ([#50](https://github.com/alpamayo-solutions/chaski/issues/50)) ([08e9e61](https://github.com/alpamayo-solutions/chaski/commit/08e9e6118a67372083e00ddba241f9ee7281a045))
+
 ## [0.10.4](https://github.com/alpamayo-solutions/chaski/compare/v0.10.3...v0.10.4) (2026-09-25)
 
 
