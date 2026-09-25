@@ -292,10 +292,8 @@ def tolerate_undecodable(client: Any) -> None:
 
     franzmq decodes every inbound message on paho's network thread before
     dispatching, and a failed decode kills that thread, and with it every
-    subscription on the client. Retained tombstones (empty payloads) and
-    commands whose optional fields franzmq's types require both fail that
-    decode. On a failure the raw message goes to the matching callbacks
-    instead, with a warning naming the topic. Idempotent.
+    subscription on the client. On a failure the raw message goes to the
+    matching callbacks instead, with a warning naming the topic. Idempotent.
     """
     typed_dispatch = client._handle_on_message
     if getattr(typed_dispatch, "_tolerates_undecodable", False):
@@ -306,9 +304,7 @@ def tolerate_undecodable(client: Any) -> None:
         try:
             return typed_dispatch(message)
         except Exception as exc:
-            # One line: a configure ack (``state_writes``) lands here on every
-            # command, which is expected, not a fault.
-            logger.info(
+            logger.warning(
                 "undecodable message on %s (%s: %s) — dispatching it undecoded instead",
                 getattr(message, "topic", "?"),
                 type(exc).__name__,
