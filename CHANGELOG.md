@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.9](https://github.com/alpamayo-solutions/chaski/compare/v0.10.8...v0.10.9) (2026-09-26)
+
+
+### Fixes
+
+* **dataops:** run [@on](https://github.com/on)_metric handlers on the service's event loop ([#57](https://github.com/alpamayo-solutions/chaski/issues/57)) ([84bc429](https://github.com/alpamayo-solutions/chaski/commit/84bc42965f88919408c2ebf1483f979fd0254add))
+
 ## [0.10.8](https://github.com/alpamayo-solutions/chaski/compare/v0.10.7...v0.10.8) (2026-09-25)
 
 
