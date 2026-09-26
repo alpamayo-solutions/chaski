@@ -11,9 +11,9 @@ import httpx
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 
-from chaski.dataops import Command, CommandRejected, on_command, resolve
+from chaski.dataops import Command, CommandRejected, commands, on_command, resolve
 from chaski.dataops.base import Producer
-from chaski.dataops.commands import CommandExecutor, command_topics, gather, parse_topic
+from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
 from chaski.door import Page, Record, Stream
 
@@ -130,7 +130,7 @@ def test_command_topics_and_subscription():
             return 0, len(self.subscribed)
 
     client = Client()
-    assert ex.subscribe(client) == 2
+    assert ex.subscribe(client, asyncio.new_event_loop()) == 2
     assert client.subscribed == [
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct", 1),
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setRecipe", 1),
@@ -233,6 +233,50 @@ async def test_undeclared_commands_are_skipped_but_the_cursor_moves():
 
 
 @run_async
+async def test_commands_of_other_services_move_the_cursor_past_them():
+    """Load test round 2: `c/<service>/commands` stood 8 and 14 records behind,
+    up to 53 min, behind commands other services execute."""
+    ex, producer, door = executor()
+    door.queue(Page(records=[], next=15, start=1))
+    await ex.drain()
+    assert producer.seen == []
+    assert door.acked == [("commands", CURSOR, 14)]
+
+
+def test_the_stream_reads_only_the_declared_command_contracts():
+    door = FakeDoor()
+    producer = Selection().attach(FakeRuntime(door, buffer=None))
+    handlers = gather([producer])
+    Stream(door, "commands", CURSOR, contracts=commands.contracts(handlers)).fetch()
+    assert door.fetch_calls[-1]["contracts"] == ["_CmdParam"]
+
+
+@run_async
+async def test_the_stream_growing_wakes_a_drain():
+    """A command of another service rings no MQTT bell here; the stream's growth does."""
+    ex, _producer, door = executor()
+    hints = [asyncio.Event()]
+
+    def watch(streams, *, interval_ms=None):
+        assert streams == ["commands"]
+        door.queue(Page(records=[], next=8, start=1))
+        yield object()
+        hints[0].set()
+
+    door.watch = watch
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if ("commands", CURSOR, 7) in door.acked:
+            break
+    stop.set()
+    ex.wake()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert ("commands", CURSOR, 7) in door.acked
+
+
+@run_async
 async def test_a_command_without_correlation_id_runs_but_is_not_answered():
     ex, producer, door = executor(record(correlation_id=""))
     await ex.drain()
@@ -261,52 +305,6 @@ async def test_run_forever_drains_at_start_and_on_wake():
     assert [c.correlation_id for c in producer.seen] == ["corr-1", "corr-2"]
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
-
-
-@run_async
-async def test_an_idle_executor_reads_nothing_until_woken_and_keeps_a_wake_during_a_drain():
-    """No timer behind the wake. A wake that lands while a drain reads its
-    page leads to one more drain; the generation is taken before the read."""
-
-    class RingingDoor(FakeDoor):
-        executor: CommandExecutor | None = None
-
-        def fetch(self, stream, cursor, **kwargs):
-            page = super().fetch(stream, cursor, **kwargs)
-            if len(self.fetch_calls) == 1 and self.executor is not None:
-                self.executor.wake()  # a command arrived while the first page was read
-            return page
-
-    door = RingingDoor()
-    producer = Selection().attach(FakeRuntime(door, buffer=None))
-    ex = CommandExecutor(door, producer.runtime.send, Stream(door, "commands", CURSOR), gather([producer]), NODE_ID)
-    door.executor = ex
-    stop = asyncio.Event()
-    task = asyncio.ensure_future(ex.run_forever(stop))
-    for _ in range(50):
-        await asyncio.sleep(0.01)
-        if len(door.fetch_calls) >= 2:
-            break
-    await asyncio.sleep(0.3)
-    assert len(door.fetch_calls) == 2, "the drain at start, and one for the wake during it; nothing on a timer"
-    stop.set()
-    await asyncio.wait_for(task, timeout=1.0)
-
-
-def test_the_stream_is_read_by_the_topics_that_wake_it():
-    """Commands to other services are neither read nor left unread on this
-    cursor: the fetch carries the executor's own command topics."""
-    door = FakeDoor()
-    producer = Selection().attach(FakeRuntime(door, buffer=None))
-    topics = command_topics(gather([producer]), NODE_ID)
-    stream = Stream(door, "commands", CURSOR, topics=topics)
-    ex = CommandExecutor(door, producer.runtime.send, stream, gather([producer]), NODE_ID)
-    assert ex.command_topics() == topics
-    asyncio.run(ex.drain())
-    assert door.fetch_calls[0]["topics"] == [
-        f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct",
-        f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setRecipe",
-    ]
 
 
 @run_async

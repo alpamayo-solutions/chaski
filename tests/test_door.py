@@ -425,6 +425,26 @@ def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server
     assert empty.ack_offset is None
 
 
+def test_a_filtered_page_acks_everything_the_node_scanned(stub_server, door):
+    """A filtered fetch moves `next` past the records it skips. Acking only the
+    last returned record left the cursor behind every skipped one, counted as
+    unread by the node's lag and age gauges although nothing was waiting."""
+    _, handler_cls = stub_server
+    handler_cls.responses["/fetch"] = [
+        (200, {"records": [_rec(41)], "next": 90, "from": 30}),
+        (200, {"records": [], "next": 120, "from": 90}),
+        (200, {"records": [], "next": 120, "from": 120}),
+    ]
+
+    matched = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+    skipped_only = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+    at_head = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+
+    assert matched.ack_offset == 89
+    assert skipped_only.ack_offset == 119
+    assert at_head.ack_offset is None
+
+
 def test_self_info_returns_raw_dict(stub_server, door):
     _, handler_cls = stub_server
     handler_cls.responses["/self"] = (
@@ -460,6 +480,28 @@ def test_publish_returns_the_ack_of_a_command_the_node_executes_itself(stub_serv
 
     assert body is not None
     assert body["command"] == ack
+
+
+def test_publish_batch_sends_every_record_and_returns_one_result_each(stub_server, door):
+    _, handler_cls = stub_server
+    results = [{"stream": "metrics", "offset": 7}, {"error": "level-4 is not this node"}]
+    handler_cls.responses["/publish/batch"] = (200, {"accepted": 1, "results": results})
+
+    out = door.publish_batch(
+        [
+            ("colca/v1/_Metric/n-1/line1/a", json.dumps({"signal_id": "s1", "value": 1})),
+            ("colca/v1/_Metric/n-2/line1/b", json.dumps({"signal_id": "s2", "value": 2})),
+        ]
+    )
+
+    assert out == results
+    req = _last_request(handler_cls)
+    assert req["path"] == "/publish/batch"
+    assert req["body"]["records"][0] == {
+        "topic": "colca/v1/_Metric/n-1/line1/a",
+        "payload": {"signal_id": "s1", "value": 1},
+    }
+    assert len(req["body"]["records"]) == 2
 
 
 def test_publish_raises_on_http_error(stub_server, door):

@@ -14,9 +14,14 @@ record's ``actor_id``/``actor_label``/``actor_kind`` to the handler.
 **MQTT only rings the bell.** Each declared command topic is subscribed at
 QoS 1; a message wakes a drain of the stream and is not read itself. The
 executor drains once at startup, once per wake and once after the broker link
-comes back. There is no timed poll. The stream is read with the same topics
-as a filter (colca 0.19+), so commands to other services neither cost a read
-nor count as unread on this cursor.
+comes back. There is no timed poll.
+
+**The stream rings it too.** The ``commands`` stream carries every command at
+the node, and the cursor must pass the ones this service does not execute, or
+it stands behind them, counted as unread, until the next command of its own
+comes. The executor follows the stream's growth over ``GET /watch``
+(:meth:`CommandExecutor.watch`) and reads only its declared contracts; the
+cursor is acked to the end of what the node scanned (:attr:`Page.ack_offset`).
 
 **Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
 with ``{correlation_id, result_code, message, performed_at}``:
@@ -46,6 +51,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -56,7 +63,6 @@ from colca_data_contracts import topic_prefix
 
 from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream
-from chaski.doorbell import Doorbell
 
 from . import resolve
 from .base import Producer
@@ -75,6 +81,14 @@ ACK_BUSY = 503
 _QOS = 1
 #: Upper bound on the retry backoff after the door failed.
 _ERROR_BACKOFF_MAX_S = 30.0
+#: How far apart the node sends stream-growth hints at most; what grows in
+#: between is one hint.
+WATCH_INTERVAL_MS = 1000
+
+
+def contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
+    """The command contracts ``handlers`` execute: what the executor's stream reads."""
+    return sorted({contract for contract, _path in handlers})
 
 
 @dataclass(frozen=True)
@@ -134,12 +148,6 @@ def declared_routes(producer_classes: Iterable[type[Producer]]) -> list[tuple[st
     return sorted(routes)
 
 
-def command_topics(handlers: Iterable[tuple[str, str]], node_id: str) -> list[str]:
-    """The topic of every ``(contract, path)`` command at ``node_id``: what
-    the executor subscribes to as a wake-up and reads the stream by."""
-    return sorted(f"{topic_prefix()}{contract}/{node_id}/{path}" for contract, path in handlers)
-
-
 def parse_topic(topic: str) -> tuple[str, str] | None:
     """``(contract, path)`` of ``<root>/v1/<contract>/<owner>/<path...>``,
     or ``None`` for anything shorter."""
@@ -183,23 +191,23 @@ class CommandExecutor:
         self._stream = stream
         self._handlers = handlers
         self._node_id = node_id
-        self._bell = Doorbell()
+        self._wake = asyncio.Event()
 
     # -- topics -------------------------------------------------------------
 
     def command_topics(self) -> list[str]:
-        return command_topics(self._handlers, self._node_id)
+        return sorted(f"{topic_prefix()}{contract}/{self._node_id}/{path}" for contract, path in self._handlers)
 
     def ack_topic(self, path: str) -> str:
         return f"{topic_prefix()}_Ack/{self._node_id}/{path}"
 
-    def subscribe(self, client: Any) -> int:
+    def subscribe(self, client: Any, loop: asyncio.AbstractEventLoop) -> int:
         """Subscribe every declared command topic as a wake-up. The payload
         is not decoded: the stream record is what gets executed. A refused
         SUBACK is retried by the service's :class:`chaski.subscriptions.Subscriptions`."""
 
         def _ring(_client: Any, _userdata: Any, _message: Any) -> None:
-            self.wake()
+            loop.call_soon_threadsafe(self.wake)
 
         topics = self.command_topics()
         for topic in topics:
@@ -209,19 +217,58 @@ class CommandExecutor:
         return len(topics)
 
     def wake(self) -> None:
-        """New commands may be waiting. Safe from any thread."""
-        self._bell.ring()
+        """New commands may be waiting. From another thread, call it through
+        ``loop.call_soon_threadsafe``."""
+        self._wake.set()
 
     # -- loop -----------------------------------------------------------------
 
-    async def run_forever(self, stop: asyncio.Event) -> None:
-        """Drain now, then once per wake, until ``stop``. The wake generation
-        is taken before each drain, so a wake during a drain leads to one more.
-        A door failure is retried with backoff; the unacked page is read
-        again."""
-        errors = 0
+    def watch(self, loop: asyncio.AbstractEventLoop, stop: threading.Event) -> None:
+        """Wake a drain whenever the ``commands`` stream grows, until ``stop``.
+        Blocking, for a thread. A lost connection is opened again after a
+        backoff with jitter; the first hint of a new one names the stream, so a
+        command sent meanwhile is drained then."""
+        backoff = 0.5
         while not stop.is_set():
-            seen = self._bell.generation
+            try:
+                for _hint in self._door.watch([STREAM], interval_ms=WATCH_INTERVAL_MS):
+                    backoff = 0.5
+                    loop.call_soon_threadsafe(self.wake)
+                    if stop.is_set():
+                        return
+            except Exception as exc:
+                log.debug("commands: stream watch ended (%s), reconnecting in %.1fs", exc, backoff)
+            if stop.wait(backoff * random.uniform(1.0, 1.5)):  # noqa: S311 - jitter  # nosec B311
+                return
+            backoff = min(2 * backoff, _ERROR_BACKOFF_MAX_S)
+
+    async def run_forever(self, stop: asyncio.Event) -> None:
+        """Drain now, then once per wake, until ``stop``. A door failure is
+        retried with backoff; the unacked page is read again."""
+        watching = threading.Event()
+        threading.Thread(
+            target=self.watch, args=(asyncio.get_running_loop(), watching), name="commands-watch", daemon=True
+        ).start()
+        try:
+            await self._serve(stop)
+        finally:
+            watching.set()
+
+    async def _serve(self, stop: asyncio.Event) -> None:
+        errors = 0
+        self._wake.set()
+        while not stop.is_set():
+            wake_task = asyncio.ensure_future(self._wake.wait())
+            stop_task = asyncio.ensure_future(stop.wait())
+            try:
+                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (wake_task, stop_task):
+                    if not task.done():
+                        task.cancel()
+            if stop.is_set():
+                return
+            self._wake.clear()
             try:
                 await self.drain()
                 errors = 0
@@ -231,15 +278,7 @@ class CommandExecutor:
                 log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", errors, exc, backoff)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=backoff)
-                continue
-            wake_task = asyncio.ensure_future(self._bell.after(seen))
-            stop_task = asyncio.ensure_future(stop.wait())
-            try:
-                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                for task in (wake_task, stop_task):
-                    if not task.done():
-                        task.cancel()
+                self._wake.set()
 
     async def drain(self) -> int:
         """Handle every command up to the head of the stream, acking page by

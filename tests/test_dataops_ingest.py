@@ -229,6 +229,19 @@ async def test_gap_only_page_acks_the_gap_bound_to_clear_it(door, buffer, caplog
 
 
 @run_async
+async def test_a_page_of_other_signals_moves_the_cursor_past_them(door, buffer):
+    """Load test round 2: a filtered ingest cursor stood up to 5,000 records and
+    65 s behind the stream while its service was caught up."""
+    door.queue(Page(records=[], next=5001, start=1))
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+
+    processed = await ingest.run_once()
+
+    assert processed == 0
+    assert door.acked == [("metrics", ingest.cursor, 5000)]
+
+
+@run_async
 async def test_empty_page_with_no_gap_does_not_ack(door, buffer):
     door.queue(Page(records=[], next=1))
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])

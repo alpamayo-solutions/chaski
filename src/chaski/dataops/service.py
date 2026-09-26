@@ -1044,15 +1044,14 @@ class DataOpsService(Service):
         if not handlers:
             return None
         node_id = cast(str, self._node_id)
-        topics = commands.command_topics(handlers, node_id)
         executor = commands.CommandExecutor(
             self.door,
             self.send,
-            self.stream(commands.STREAM, cursor=commands.CURSOR, topics=topics),
+            self.stream(commands.STREAM, cursor=commands.CURSOR, contracts=commands.contracts(handlers)),
             handlers,
             node_id,
         )
-        executor.subscribe(self._started_client)
+        executor.subscribe(self._started_client, cast(asyncio.AbstractEventLoop, self._loop))
         return executor
 
     def _broker_state_changed(self, connected: bool) -> None:
@@ -1067,9 +1066,9 @@ class DataOpsService(Service):
                 loop.call_soon_threadsafe(self._seed_index)
         if connected and index is None:
             self._resolution_changed()
-        executor, ingest = self._commands, self._ingest
-        if connected and executor is not None:
-            executor.wake()
+        loop, executor, ingest = self._loop, self._commands, self._ingest
+        if connected and loop is not None and executor is not None:
+            loop.call_soon_threadsafe(executor.wake)
         if connected and ingest is not None:
             # Wakes published while the link was down reached nobody.
             ingest.wake()

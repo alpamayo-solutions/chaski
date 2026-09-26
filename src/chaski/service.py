@@ -1114,6 +1114,7 @@ class Service:
         cursor: str | None = None,
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
+        contracts: Iterable[str] | None = None,
         topics: Iterable[str] | None = None,
     ) -> Stream:
         """A named, durable cursor over the node's stream ``name``
@@ -1124,10 +1125,10 @@ class Service:
         to the stream's name. Pass another name to follow a stream twice or to
         start fresh (``svc.stream("metrics", cursor="ingest-02")``), and retire
         the old one with ``Stream.retire()``. ``max`` bounds one page.
-        ``signal_ids`` filters the ``metrics`` stream at the door, ``topics``
-        (MQTT filters) any stream: pass the topics that wake the consumer, so
-        the node counts only those records as unread on its cursor. Requires
-        :meth:`start`.
+        ``signal_ids`` filters the ``metrics`` stream at the door; ``contracts``
+        (colca 0.18+) and ``topics`` (MQTT filters, colca 0.19+) any stream.
+        Pass what wakes the consumer, so the node counts only those records as
+        unread on its cursor. Requires :meth:`start`.
         """
         door = self._require_http("stream")
         return Stream(
@@ -1136,6 +1137,7 @@ class Service:
             self.cursor_prefix + (cursor or name),
             max=max,
             signal_ids=signal_ids,
+            contracts=contracts,
             topics=topics,
         )
 
