@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/alpamayo-solutions/chaski/compare/v0.11.0...v0.11.1) (2026-09-26)
+
+
+### Performance
+
+* **dataops:** paced ingest, read-ahead when behind, one buffer commit per page ([#65](https://github.com/alpamayo-solutions/chaski/issues/65)) ([29c1707](https://github.com/alpamayo-solutions/chaski/commit/29c170775f163753f7248b5008999e610e08c5b0))
+
 ## [0.11.0](https://github.com/alpamayo-solutions/chaski/compare/v0.10.11...v0.11.0) (2026-09-26)
 
 
