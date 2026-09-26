@@ -44,7 +44,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -70,8 +69,6 @@ ACK_EXPIRED = 498
 ACK_FAILED = 500
 #: QoS 1: a lost wake would leave a command waiting for the next one.
 _QOS = 1
-#: Wait before re-sending a refused SUBSCRIBE.
-_SUBSCRIBE_RETRY_S = 1.0
 #: Upper bound on the retry backoff after the door failed.
 _ERROR_BACKOFF_MAX_S = 30.0
 
@@ -120,15 +117,6 @@ def gather(instances: Iterable[Producer]) -> dict[tuple[str, str], Callable]:
                 raise ValueError(f"{spec.contract} {spec.path} is declared by two @on_command handlers")
             handlers[key] = getattr(instance, method_name)
     return handlers
-
-
-def _refused(code: Any) -> bool:
-    """A SUBACK reason code at or above 0x80 refuses the subscription."""
-    value = getattr(code, "value", code)
-    try:
-        return int(value) >= 0x80
-    except (TypeError, ValueError):
-        return bool(getattr(code, "is_failure", False))
 
 
 def parse_topic(topic: str) -> tuple[str, str] | None:
@@ -186,46 +174,16 @@ class CommandExecutor:
 
     def subscribe(self, client: Any, loop: asyncio.AbstractEventLoop) -> int:
         """Subscribe every declared command topic as a wake-up. The payload
-        is not decoded: the stream record is what gets executed.
-
-        A refused SUBACK is retried: the broker answers "packet identifier in
-        use" to a SUBSCRIBE whose id matches one of its own in-flight QoS 1
-        deliveries (mochi shares one id space for both directions), which
-        happens while a fresh session receives its retained records. Without
-        the retry the command would only run at the next drain."""
+        is not decoded: the stream record is what gets executed. A refused
+        SUBACK is retried by the service's :class:`chaski.subscriptions.Subscriptions`."""
 
         def _ring(_client: Any, _userdata: Any, _message: Any) -> None:
             loop.call_soon_threadsafe(self.wake)
 
-        pending: dict[int, str] = {}
-        lock = threading.Lock()
-
-        def _send(topic: str) -> None:
-            _rc, mid = client.subscribe(topic, qos=_QOS)
-            if mid is not None:
-                with lock:
-                    pending[mid] = topic
-
-        original = getattr(client, "on_subscribe", None)
-
-        def _on_subscribe(c: Any, userdata: Any, mid: int, reason_codes: Any, properties: Any = None) -> None:
-            with lock:
-                topic = pending.pop(mid, None)
-            if topic is not None and any(_refused(code) for code in reason_codes or ()):
-                log.warning(
-                    "commands: subscription to %s refused (%s) — retrying",
-                    topic,
-                    ", ".join(str(code) for code in reason_codes),
-                )
-                loop.call_soon_threadsafe(loop.call_later, _SUBSCRIBE_RETRY_S, _send, topic)
-            if original is not None:
-                original(c, userdata, mid, reason_codes, properties)
-
-        client.on_subscribe = _on_subscribe
         topics = self.command_topics()
         for topic in topics:
             client.message_callback_add(topic, _ring)
-            _send(topic)
+            client.subscribe(topic, qos=_QOS)
         log.info("commands: executing %d command(s) on node=%s", len(topics), self._node_id)
         return len(topics)
 

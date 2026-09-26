@@ -186,7 +186,6 @@ def test_a_command_sender_works_on_any_session():
     sender = CommandSender(client, NODE)
 
     ack = sender.command("_CmdConfigure", "signal/autobind", {"connector": "c"}, timeout=5)
-    sender.resubscribe(client)
 
     assert ack["result_code"] == 200
-    assert [t for _k, t, _p, _r in client.of("subscribe")] == [f"colca/v1/_Ack/{NODE}/signal/autobind"] * 2
+    assert [t for _k, t, _p, _r in client.of("subscribe")] == [f"colca/v1/_Ack/{NODE}/signal/autobind"]

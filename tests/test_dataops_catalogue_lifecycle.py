@@ -61,6 +61,9 @@ class _Client:
     def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         pass
 
+    def unsubscribe(self, topic) -> None:
+        pass
+
     def is_connected(self) -> bool:
         return True
 

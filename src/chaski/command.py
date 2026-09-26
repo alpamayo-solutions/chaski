@@ -118,14 +118,6 @@ class CommandSender:
             with self._lock:
                 self._waiters.pop(correlation_id, None)
 
-    def resubscribe(self, client: Any) -> None:
-        """Subscribe every ack topic again, after a reconnect that lost the
-        session. Nothing here waits, so it may run on the network thread."""
-        with self._lock:
-            topics = sorted(self._topics)
-        for topic in topics:
-            client.subscribe(topic, qos=1)
-
     def _on_ack(self, _client: Any, _userdata: Any, message: Any) -> None:
         """franzmq hands the ack decoded, or raw when it cannot decode it."""
         payload = message.payload

@@ -51,6 +51,9 @@ class _FakeClient:
     def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
+    def unsubscribe(self, topic) -> None:
+        pass
+
     def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True) -> None:
         self.published.append((str(topic), payload))
 
@@ -285,6 +288,28 @@ def test_a_reconnect_announces_before_reading_its_record_back(tmp_path, monkeypa
     monkeypatch.setattr(client, "subscribe", lambda topic, *a, **k: order.append(f"sub {topic}"))
     svc._on_connect(client, None, None, _FakeReasonCode())
     assert order.index(f"pub {_DETAILS_TOPIC}") < order.index(f"sub {_DETAILS_TOPIC}")
+
+
+class _Flags:
+    def __init__(self, session_present: bool) -> None:
+        self.session_present = session_present
+
+
+@pytest.mark.parametrize("session_present", [False, True])
+def test_a_reconnect_subscribes_everything_again_unless_the_broker_kept_the_session(
+    tmp_path, monkeypatch, session_present
+):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    command = "colca/v1/_CmdParam/n-edge1/line1/operator/setProduct"
+    client.subscribe(command, qos=1)  # what a dataops command executor subscribes
+    held = set(client.subscriptions)
+    again: list[str] = []
+    monkeypatch.setattr(client, "subscribe", lambda topic, *a, **k: again.append(str(topic)))
+
+    svc._on_connect(client, None, _Flags(session_present), _FakeReasonCode())
+
+    assert command in held
+    assert set(again) == (set() if session_present else held)
 
 
 # -- NotEnrolled / enroll_hint / wait_enrolled -------------------------------

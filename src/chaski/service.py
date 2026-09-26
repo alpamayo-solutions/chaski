@@ -93,6 +93,7 @@ from .clock import Clock, ClockNotReady
 from .command import CommandSender
 from .coordination import StepGate
 from .door import Door, KvEntry, Stream
+from .subscriptions import Subscriptions
 
 logger = logging.getLogger(__name__)
 
@@ -310,10 +311,54 @@ def tolerate_undecodable(client: Any) -> None:
                 type(exc).__name__,
                 exc,
             )
-            return raw_dispatch(client, message)
+            try:
+                return raw_dispatch(client, message)
+            except Exception:
+                logger.exception("message on %s dropped: its callback failed", getattr(message, "topic", "?"))
+                return None
 
     guarded._tolerates_undecodable = True  # type: ignore[attr-defined]
     client._handle_on_message = guarded
+
+
+def guard_network_thread(client: Any, name: str) -> None:
+    """Keep ``client``'s network thread alive, or end the process with it.
+
+    paho lets an exception from parsing an inbound packet escape its network
+    thread, which then ends without a disconnect: the client still looks
+    connected, but nothing is read or sent again. A packet that does not parse
+    means the stream is misframed, so the connection is dropped instead and
+    paho reconnects. If the thread dies anyway, the process exits non-zero so
+    its supervisor restarts it. Call before ``loop_start``. Idempotent.
+    """
+    handle = getattr(client, "_packet_handle", None)
+    if handle is None or getattr(handle, "_guarded", False):
+        return  # no paho network loop to guard, or guarded already
+
+    def guarded_handle() -> Any:
+        try:
+            return handle()
+        except Exception:
+            logger.exception(
+                "chaski.Service: %s received an MQTT packet it cannot parse (command 0x%02x) — reconnecting",
+                name,
+                client._in_packet.get("command", 0),
+            )
+            return pahomqtt.MQTTErrorCode.MQTT_ERR_PROTOCOL
+
+    guarded_handle._guarded = True  # type: ignore[attr-defined]
+    client._packet_handle = guarded_handle
+
+    thread_main = client._thread_main
+
+    def guarded_main() -> None:
+        try:
+            thread_main()
+        except BaseException:
+            logger.critical("chaski.Service: the MQTT network thread of %s died — exiting", name, exc_info=True)
+            os._exit(70)
+
+    client._thread_main = guarded_main
 
 
 def _revoke_external(
@@ -382,6 +427,7 @@ class Service:
         self.name = name
         self.clock = clock or Clock()
         self._clock_subscriptions: set[str] = set()
+        self._subscriptions: Subscriptions | None = None
         self._last_clock_report = float("-inf")
         self._processed_at: float | None = None
         self._progress_stop = threading.Event()
@@ -573,6 +619,8 @@ class Service:
         # before the loop: a persistent session delivers its queued messages
         # right after CONNACK, ahead of any subscription made in this run
         tolerate_undecodable(client)
+        guard_network_thread(client, self.name)
+        self._subscriptions = Subscriptions(client)
         client.loop_start()
         if not self._connected_event.wait(connect_timeout):
             raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")
@@ -584,20 +632,32 @@ class Service:
             raise RuntimeError(f"chaski.Service: broker refused CONNECT ({reason_code})")
         self._connected = True
 
-    def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any = None) -> None:
+    def _on_connect(self, client: Any, _userdata: Any, flags: Any, reason_code: Any, _properties: Any = None) -> None:
         """paho's CONNACK callback, on its network thread. The first one lets
         :meth:`start` finish on the caller's thread (:meth:`_after_connect`);
         later ones are reconnects, possibly after a re-placement, and
-        re-announce (:meth:`_reannounce`). Nothing here may wait for a PUBACK."""
+        re-announce (:meth:`_reannounce`). A reconnect to a node that lost the
+        session subscribes everything again first. Nothing here may wait for
+        a PUBACK."""
         if not self._connected_event.is_set():
             self._connect_outcome = reason_code
             self._connected_event.set()
             return
         if getattr(reason_code, "is_failure", False):
+            logger.warning("chaski.Service: %s reconnect refused by the broker (%s)", self.name, reason_code)
             return
+        fresh = not getattr(flags, "session_present", False)
+        if fresh and self._subscriptions is not None:
+            # _reannounce renews its own record's subscription after the announce
+            restored = self._subscriptions.restore(later=[str(self._details_topic)])
+            logger.info(
+                "chaski.Service: %s reconnected on a new session; %d subscription(s) restored", self.name, restored
+            )
+        else:
+            logger.info("chaski.Service: %s reconnected; the broker kept the session", self.name)
         self._broker_state_changed(True)
         try:
-            self._reannounce(client)
+            self._reannounce(client, fresh)
         except Exception:
             logger.exception("chaski.Service: re-announcing %s after a reconnect failed", self.name)
 
@@ -608,11 +668,12 @@ class Service:
     def _broker_state_changed(self, connected: bool) -> None:
         """Hook: the broker link came up (True) or went down (False)."""
 
-    def _reannounce(self, client: Any) -> None:
+    def _reannounce(self, client: Any, fresh: bool) -> None:
         """On a reconnect, on the network thread: re-subscribe at the current
         placement, republish ``_ServiceDetails``, and if the position moved,
         republish the catalogue at the new topic. Publishes here do not wait."""
         old_filter = self._signal_filter
+        old_details = self._details_topic
         old_topic = str(self._catalogue_topic)
         if not self._external:
             door = self._local_door()
@@ -631,14 +692,16 @@ class Service:
                     catalogue.dirty = True
         if str(old_filter) != str(self._signal_filter):
             client.unsubscribe(old_filter)
-        client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
+            client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         self._subscribe_clock()
-        if self._command_sender is not None:
-            self._command_sender.resubscribe(client)
         with self._lock:
             details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
-        client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
+        if str(old_details) != str(self._details_topic):
+            client.unsubscribe(old_details)
+            client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
+        elif fresh and self._subscriptions is not None:
+            self._subscriptions.renew(str(self._details_topic))
         self._placement_reannounced()
 
     def _on_own_details(self, message: Any) -> None:
