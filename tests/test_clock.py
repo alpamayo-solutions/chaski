@@ -215,3 +215,30 @@ def test_retained_definition_cannot_be_mutated_by_caller():
     clock.definition.previous.rate = 900
     time.advance(2)
     assert clock.now() == 1200
+
+
+def test_a_scheduled_time_holds_for_its_task_and_not_for_a_task_it_starts():
+    async def read(clock):
+        return clock.now()
+
+    async def run():
+        clock = Time().clock()
+        clock.apply_definition(definition(rate=1))
+        live = clock.now()
+        with clock.at(5.0):
+            assert clock.now() == 5.0
+            started = asyncio.ensure_future(read(clock))
+        assert await started == live
+
+    asyncio.run(run())
+
+
+def test_a_scheduled_time_set_outside_a_loop_holds_inside_the_callback_it_runs():
+    clock = Time().clock()
+    clock.apply_definition(definition(rate=1))
+
+    async def callback():
+        return clock.now()
+
+    with clock.at(7.0):
+        assert asyncio.run(callback()) == 7.0

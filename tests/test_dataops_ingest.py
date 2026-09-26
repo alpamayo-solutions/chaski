@@ -97,6 +97,31 @@ async def test_records_processed_in_order_and_acked_only_after(door, buffer):
 
 
 @run_async
+async def test_handlers_run_on_the_services_loop_and_what_they_schedule_outlives_the_page(door, buffer):
+    loop = asyncio.get_running_loop()
+    seen: list[str] = []
+    scheduled: list[asyncio.Future] = []
+
+    async def handler(record):
+        assert asyncio.get_running_loop() is loop
+        seen.append("handled")
+
+        async def later():
+            await asyncio.sleep(0.01)
+            seen.append("later")
+
+        scheduled.append(asyncio.ensure_future(later()))
+
+    door.queue(Page(records=[_record(1, "sig-1", 1.0, 10.0)], next=2))
+    ingest = _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"])
+
+    await ingest.run_once()
+    await asyncio.sleep(0.05)
+
+    assert seen == ["handled", "later"]
+
+
+@run_async
 async def test_fetch_carries_service_signal_id_filter_inside_the_service_namespace(door, buffer):
     door.queue(Page(records=[], next=1))
     ingest = _ingest(door, buffer, signal_ids=["sig-1", "sig-2"])

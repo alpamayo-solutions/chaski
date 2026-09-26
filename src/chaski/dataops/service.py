@@ -190,7 +190,8 @@ def off_loop(method):
     loop; ``max_instances=1`` keeps a slow tick from overlapping itself.
 
     The tick holds the producer's lock, because the producer's ``@on_metric``
-    handlers run on another thread (see :func:`make_handler`).
+    and ``@on_constant`` handlers run on the event loop meanwhile (see
+    :func:`make_handler`).
     """
 
     @functools.wraps(method)
