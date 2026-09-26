@@ -360,8 +360,10 @@ async def _poll_until(predicate, timeout: float = 2.0, interval: float = 0.01) -
 
 
 @run_async
-async def test_wake_triggers_an_immediate_fetch_without_waiting_for_poll_interval(door, buffer):
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=60.0)
+async def test_an_idle_ingest_reads_nothing_until_woken(door, buffer):
+    """No timer: after the drain at start the loop waits for a wake, however
+    long, and a wake starts the next drain at once."""
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
 
     def calls() -> int:
         return len(door.fetch_calls)
@@ -369,19 +371,67 @@ async def test_wake_triggers_an_immediate_fetch_without_waiting_for_poll_interva
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
     try:
-        # the loop fetches immediately on entry, before ever sleeping
-        await _poll_until(lambda: calls() >= 1)
-        first_count = calls()
+        await _poll_until(lambda: calls() >= 1)  # the drain at start
+        await asyncio.sleep(0.3)
+        assert calls() == 1, "an idle ingest must not fetch on a timer"
 
         ingest.wake()
-
-        # with a 60s poll interval, a second fetch within 2s can only be the
-        # doorbell short-circuiting the sleep, not the timeout firing
-        await _poll_until(lambda: calls() >= first_count + 1)
+        await _poll_until(lambda: calls() == 2)
+        await asyncio.sleep(0.2)
+        assert calls() == 2
     finally:
         stop.set()
-        ingest.wake()
         await asyncio.wait_for(task, timeout=2.0)
+
+
+@run_async
+async def test_a_wake_during_a_drain_is_not_lost(buffer):
+    """The generation is taken before the fetch: a wake that lands while the
+    page is read leads to one more drain, although the page came back empty."""
+
+    class RingingDoor(FakeDoor):
+        ingest: Ingest | None = None
+
+        def fetch(self, stream, cursor, *, max=1000, signal_ids=None, **_):
+            page = super().fetch(stream, cursor, max=max, signal_ids=signal_ids)
+            if len(self.fetch_calls) == 1 and self.ingest is not None:
+                self.ingest.wake()  # a record arrived while this page was read
+            return page
+
+    door = RingingDoor()
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+    door.ingest = ingest
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ingest.run_forever(stop))
+    try:
+        await _poll_until(lambda: len(door.fetch_calls) >= 2)
+        await asyncio.sleep(0.2)
+        assert len(door.fetch_calls) == 2, "one wake, one more drain"
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@run_async
+async def test_a_page_of_skipped_records_is_acked_and_read_on(door, buffer):
+    """An empty page whose read moved on (the filter skipped every record)
+    is acked past them, so they do not wait on the cursor, and the next page
+    is read at once instead of taking the empty one for the head."""
+    door.queue(Page(records=[], next=41, start=1))
+    door.queue(Page(records=[_record(41, "sig-1", 1.0, 10.0)], next=42, start=41))
+    door.queue(Page(records=[], next=42, start=42))
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ingest.run_forever(stop))
+    try:
+        await _poll_until(lambda: len(door.fetch_calls) >= 3)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+    assert [offset for _s, _c, offset in door.acked] == [40, 41]
+    assert len(buffer.window("sig-1", 0.0, 100.0)) == 1
 
 
 # ------------------------------------------------------------------ transient transport-error recovery
@@ -405,11 +455,12 @@ class FlakyDoor(FakeDoor):
 
 
 @run_async
-async def test_run_forever_survives_one_transient_transport_error_and_resumes_fetching(buffer):
+async def test_run_forever_survives_one_transient_transport_error_and_resumes_fetching(buffer, monkeypatch):
     """A transient transport error does not end the loop; it retries and
     fetches again."""
+    monkeypatch.setattr(Ingest, "ERROR_BACKOFF_S", 0.02)
     door = FlakyDoor(fail_times=1)
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
 
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
@@ -425,10 +476,11 @@ async def test_run_forever_survives_one_transient_transport_error_and_resumes_fe
 
 
 @run_async
-async def test_only_a_finished_drain_counts_as_progress(buffer):
-    """The health door reads this: retrying a transport error is not progress."""
+async def test_only_a_finished_drain_counts_as_progress(buffer, monkeypatch):
+    """Retrying a transport error is not progress."""
+    monkeypatch.setattr(Ingest, "ERROR_BACKOFF_S", 0.02)
     door = FlakyDoor(fail_times=1_000_000)
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
     built = ingest.last_drain_at
 
     stop = asyncio.Event()
@@ -452,7 +504,7 @@ async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
         def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
             raise RuntimeError("not a transport error")
 
-    ingest = _ingest(BrokenDoor(), buffer, signal_ids=["sig-1"], poll_interval_s=0.02)
+    ingest = _ingest(BrokenDoor(), buffer, signal_ids=["sig-1"])
 
     with pytest.raises(RuntimeError, match="not a transport error"):
         await asyncio.wait_for(ingest.run_forever(asyncio.Event()), timeout=2.0)
@@ -460,7 +512,7 @@ async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
 
 def test_error_backoff_grows_with_consecutive_attempts_and_is_bounded(door, buffer):
     """The backoff grows with each attempt, with jitter, up to a bound."""
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=1.0)
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
 
     first = ingest._error_backoff_s(1)
     second = ingest._error_backoff_s(2)

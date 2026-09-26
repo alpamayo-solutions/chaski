@@ -851,9 +851,15 @@ def test_a_reconnect_re_resolves_placement_and_republishes_at_the_new_position(n
 
     svc._on_connect(node, None, None, _ReasonCode())  # the reconnect
 
-    assert node.unsubscribed == [f"colca/v1/_Signal/{NODE}/#", f"colca/v1/_ServiceDetails/{NODE}/{NAME}/_service"]
+    assert node.unsubscribed == [
+        f"colca/v1/_Signal/{NODE}/#",
+        f"colca/v1/_ServiceDetails/{NODE}/{NAME}/_service",
+        f"colca/v1/_Finding/{NODE}/{NAME}/cursor_lag",
+    ]
     assert f"colca/v1/_Signal/{NODE}/line1/press3/#" in node.subscriptions
     assert f"colca/v1/_ServiceDetails/{NODE}/line1/press3/{NAME}/_service" in node.subscriptions
+    # The node's cursor_lag finding follows the service to its new position.
+    assert f"colca/v1/_Finding/{NODE}/line1/press3/{NAME}/cursor_lag" in node.subscriptions
     assert next(t for t, p in reversed(node.published) if isinstance(p, ServiceDetails)) == (
         f"colca/v1/_ServiceDetails/{NODE}/line1/press3/{NAME}/_service"
     )

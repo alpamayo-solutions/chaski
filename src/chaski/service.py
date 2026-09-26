@@ -495,6 +495,10 @@ class Service:
         self._last_status = "healthy"
         self._last_detail = ""
         self._command_sender: CommandSender | None = None
+        # The node's cursor_lag finding about this service: its topic, and the
+        # summary while it stands (see cursor_lag).
+        self._lag_topic: str | None = None
+        self._cursor_lag = ""
 
         if isinstance(node, LocalDoor):
             self._external = False
@@ -711,6 +715,7 @@ class Service:
             client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
         elif fresh and self._subscriptions is not None:
             self._subscriptions.renew(str(self._details_topic))
+        self._subscribe_cursor_lag()
         self._placement_reannounced()
 
     def _on_own_details(self, message: Any) -> None:
@@ -810,6 +815,54 @@ class Service:
         self._publish_details(self._build_service_details(is_active=True, status="healthy"))
         # after the announce, so the retained record it reads back is its own
         self._started_client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
+        self._subscribe_cursor_lag()
+
+    @property
+    def cursor_lag(self) -> str:
+        """The summary of the node's ``cursor_lag`` finding about this service,
+        ``""`` while there is none.
+
+        The node (colca 0.19+) watches every cursor: when a record this
+        service reads has waited unread longer than the node's threshold, it
+        writes the finding next to the service's own record, and retires it
+        once the cursor caught up. Nothing here reads on a timer, so this is
+        how a lost wake or a stuck loop shows; a health check fails on it.
+        """
+        return self._cursor_lag
+
+    def _lag_topic_now(self) -> str:
+        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/cursor_lag"
+
+    def _subscribe_cursor_lag(self) -> None:
+        """Follow the node's cursor_lag finding at the current placement."""
+        client = self._started_client
+        topic = self._lag_topic_now()
+        if topic == self._lag_topic:
+            return
+        if self._lag_topic is not None:
+            client.unsubscribe(self._lag_topic)
+            self._cursor_lag = ""
+        self._lag_topic = topic
+        client.subscribe(topic, qos=1, callback=self._on_cursor_lag)
+
+    def _on_cursor_lag(self, message: Any) -> None:
+        payload = message.payload
+        if isinstance(payload, (bytes, str)):
+            try:
+                payload = json.loads(payload) if payload else None
+            except ValueError:
+                payload = {}
+        if payload is None:
+            summary = ""
+        else:
+            raw = payload.get("summary") if isinstance(payload, dict) else getattr(payload, "summary", None)
+            summary = raw if isinstance(raw, str) and raw else "records wait unread on this service's cursor"
+        if summary != self._cursor_lag:
+            if summary:
+                logger.warning("chaski.Service: %s: the node reports %s", self.name, summary)
+            else:
+                logger.info("chaski.Service: %s: the node reports its cursors caught up", self.name)
+        self._cursor_lag = summary
 
     def _subscribe_clock(self) -> None:
         client = self._started_client
@@ -1062,6 +1115,7 @@ class Service:
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
         contracts: Iterable[str] | None = None,
+        topics: Iterable[str] | None = None,
     ) -> Stream:
         """A named, durable cursor over the node's stream ``name``
         (``metrics``, ``annotations``, ``alarms``, ...) — see
@@ -1071,8 +1125,10 @@ class Service:
         to the stream's name. Pass another name to follow a stream twice or to
         start fresh (``svc.stream("metrics", cursor="ingest-02")``), and retire
         the old one with ``Stream.retire()``. ``max`` bounds one page.
-        ``signal_ids`` filters the ``metrics`` stream at the door, ``contracts``
-        any stream (colca 0.18+). Requires :meth:`start`.
+        ``signal_ids`` filters the ``metrics`` stream at the door; ``contracts``
+        (colca 0.18+) and ``topics`` (MQTT filters, colca 0.19+) any stream.
+        Pass what wakes the consumer, so the node counts only those records as
+        unread on its cursor. Requires :meth:`start`.
         """
         door = self._require_http("stream")
         return Stream(
@@ -1082,6 +1138,7 @@ class Service:
             max=max,
             signal_ids=signal_ids,
             contracts=contracts,
+            topics=topics,
         )
 
     def pending(self) -> list[tuple[str, str]]:

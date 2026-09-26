@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 
+from chaski.doorbell import Doorbell
+
 log = logging.getLogger("chaski.door")
 
 
@@ -201,6 +203,7 @@ class Door:
         max: int = 1000,
         signal_ids: list[str] | None = None,
         contracts: Iterable[str] | None = None,
+        topics: Iterable[str] | None = None,
         from_offset: int | None = None,
     ) -> Page:
         """``GET /fetch`` — read FORWARD from ``cursor``'s stored position.
@@ -209,7 +212,9 @@ class Door:
         sent as repeated ``signal_id`` query params and is valid only when
         ``stream == "metrics"`` (the door rejects it otherwise).
         ``contracts`` keeps only records of those contracts (colca 0.18+);
-        ``next`` still moves past the others. ``from_offset`` reads ahead of
+        ``next`` still moves past the others. ``topics`` keeps records whose
+        topic matches one of the MQTT filters (colca 0.19+; older nodes ignore
+        it and return every record). ``from_offset`` reads ahead of
         the cursor, never behind it (colca 0.18.2+; older nodes ignore it and
         leave :attr:`Page.start` unset).
         """
@@ -224,6 +229,8 @@ class Door:
             params.append(("signal_id", signal_id))
         for contract in contracts or []:
             params.append(("contract", contract))
+        for topic in topics or []:
+            params.append(("topic", topic))
         resp = self._client.get("/fetch", params=params)
         resp.raise_for_status()
         body = resp.json()
@@ -377,6 +384,19 @@ class Door:
         body = resp.json()
         return body if isinstance(body, dict) else None
 
+    def publish_batch(self, records: Iterable[tuple[str, str]]) -> list[dict]:
+        """``POST /publish/batch`` (colca 0.19+): many ``(topic, payload)``
+        records in one request, at most 5000. Each is judged as
+        :meth:`publish` would be, and the admitted ones are written with one
+        append per stream. Returns one result per record, in order:
+        ``{"stream", "offset"}`` or ``{"error"}``; a refused record does not
+        stop the others. ``payload`` is a JSON string, as for :meth:`publish`.
+        Commands are refused in a batch."""
+        body = {"records": [{"topic": topic, "payload": json.loads(payload)} for topic, payload in records]}
+        resp = self._client.post("/publish/batch", json=body)
+        resp.raise_for_status()
+        return list(resp.json()["results"])
+
     def retire(self, topic: str) -> None:
         """``POST /publish`` with NO payload — the tombstone.
 
@@ -403,8 +423,8 @@ class Stream:
     idempotent. Iteration stops at the first empty page.
 
     :meth:`ack` commits before the page boundary if needed. :meth:`follow`
-    repeats the drain, sleeping ``poll_interval`` after an empty page. A pruned
-    range (``Page.gap``) is logged as a warning.
+    repeats the drain whenever a :class:`chaski.Doorbell` rings; nothing is
+    read on a timer. A pruned range (``Page.gap``) is logged as a warning.
     """
 
     def __init__(
@@ -416,6 +436,7 @@ class Stream:
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
         contracts: Iterable[str] | None = None,
+        topics: Iterable[str] | None = None,
     ) -> None:
         self._door = door
         self.name = name
@@ -423,6 +444,7 @@ class Stream:
         self._max = max
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
         self._contracts = sorted(contracts) if contracts is not None else None
+        self._topics = list(topics) if topics is not None else None
 
     @property
     def page_size(self) -> int:
@@ -435,6 +457,8 @@ class Stream:
         scope: dict[str, Any] = {"signal_ids": self._signal_ids}
         if self._contracts is not None:
             scope["contracts"] = self._contracts
+        if self._topics is not None:
+            scope["topics"] = self._topics
         if from_offset is not None:
             scope["from_offset"] = from_offset
         return self._door.fetch(self.name, self.cursor, max=self._max, **scope)
@@ -477,14 +501,16 @@ class Stream:
                 return
             self._door.ack(self.name, self.cursor, ack_offset)
 
-    def follow(self, *, poll_interval: float = 1.0, stop: threading.Event | None = None) -> Iterator[Record]:
-        """:meth:`drain` forever — after an empty page, sleep ``poll_interval``
-        (waking early when ``stop`` is set) and drain again. Ends when
-        ``stop`` is set."""
-        # A plain sleep between drains; a consumer with its own wake-up calls
-        # drain() itself.
+    def follow(self, bell: Doorbell, *, stop: threading.Event | None = None) -> Iterator[Record]:
+        """:meth:`drain` now, then again after every ring of ``bell``, until
+        ``stop`` is set. Nothing is read on a timer: ring the bell from the
+        MQTT subscription to the topics this stream reads and on every
+        reconnect. The generation is taken before each drain, so a ring during
+        a drain is not lost. To end it, set ``stop`` and ring."""
         stop = stop or threading.Event()
         while not stop.is_set():
+            seen = bell.generation
             yield from self.drain()
-            if stop.wait(poll_interval):
+            if stop.is_set():
                 return
+            bell.wait_after(seen)

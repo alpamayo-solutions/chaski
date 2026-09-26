@@ -169,9 +169,10 @@ def test_unresolvable_input_is_skipped_not_raised(runtime):
 
 
 @run_async
-async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(runtime):
+async def test_a_late_commissioned_signal_reaches_dispatch_on_the_change_not_on_a_timer(runtime):
     """A signal commissioned after the producer started reaches dispatch
-    without a restart.
+    without a restart, when the change arrives, and nothing is resolved while
+    nothing changes.
     """
     import chaski.dataops.service as service_module
 
@@ -184,60 +185,63 @@ async def test_a_late_commissioned_signal_reaches_dispatch_without_a_restart(run
 
     ingest = _Ingest()
     stop = asyncio.Event()
+    changed = asyncio.Event()
     started: list[str] = []
     calls = {"n": 0}
 
-    # First pass resolves nothing (the signals do not exist yet); the second
-    # resolves — exactly what applying a plant model looks like from here.
     def fake_build(runtime, instances):
         calls["n"] += 1
-        if calls["n"] == 1:
-            return {}, [], 1
         return {"sig-late": ["handler"]}, ["sig-late"], 0
 
     with patch.object(service_module, "build_dispatch", fake_build):
-        await service_module.reresolve_loop(
-            runtime,
-            [],
-            ingest,
-            stop,
-            lambda: started.append("ingest"),
-            interval_s=0.01,
+        task = asyncio.ensure_future(
+            service_module.follow_index(
+                runtime, [], ingest, stop, lambda: started.append("ingest"), changed, ((), ()), settle_s=0.01
+            )
         )
+        await asyncio.sleep(0.2)
+        assert calls["n"] == 0, "nothing changed, nothing is resolved"
+        changed.set()  # the _Signal record of the commissioned input arrived
+        for _ in range(100):
+            if ingest.bound:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
 
     assert ingest.bound == [({"sig-late": ["handler"]}, ["sig-late"])]
     assert started == ["ingest"], "the loop must start if nothing resolved at startup"
 
 
 @run_async
-async def test_the_retry_stops_once_everything_resolves(runtime):
-    """The retry loop stops reading KV once everything resolved."""
-    import chaski.dataops.service as service_module
+async def test_without_a_live_index_a_signal_record_or_a_reconnect_resolves_again(tmp_path):
+    """A placed or external service has no live index: every _Signal record
+    under it, and every reconnect, asks for another resolution pass. A
+    reconnect also drains the ingest and the commands."""
+    from chaski.dataops import DataOpsService
 
-    class _Ingest:
-        def rebind(self, dispatch, signal_ids):
-            pass
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", live_index=False)
+    svc._loop = asyncio.get_running_loop()
+    svc._index_changed = asyncio.Event()
 
-    calls = {"n": 0}
+    svc._resolution_changed()
+    await asyncio.sleep(0)
+    assert svc._index_changed.is_set()
 
-    def fake_build(runtime, instances):
-        calls["n"] += 1
-        return {"s": ["h"]}, ["s"], 0
+    class _Woken:
+        def __init__(self) -> None:
+            self.wakes = 0
 
-    with patch.object(service_module, "build_dispatch", fake_build):
-        await asyncio.wait_for(
-            service_module.reresolve_loop(
-                runtime,
-                [],
-                _Ingest(),
-                asyncio.Event(),
-                lambda: None,
-                interval_s=0.01,
-            ),
-            timeout=2,
-        )
+        def wake(self) -> None:
+            self.wakes += 1
 
-    assert calls["n"] == 1
+    ingest, executor = _Woken(), _Woken()
+    svc._ingest, svc._commands = ingest, executor  # type: ignore[assignment]
+    svc._index_changed.clear()
+    svc._broker_state_changed(True)
+    await asyncio.sleep(0)
+    assert svc._index_changed.is_set(), "a reconnect may have missed a change"
+    assert (ingest.wakes, executor.wakes) == (1, 1), "what arrived while the link was down is drained"
 
 
 # ─── trim horizons and the periodic trim ─────────────────────────────────

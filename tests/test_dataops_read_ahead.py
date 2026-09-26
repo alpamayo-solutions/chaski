@@ -105,7 +105,7 @@ def _ingest(door, tmp_path, handler=None, *, page: int = 5, **kwargs) -> tuple[I
     def open_stream(cursor, signal_ids):
         return Stream(door, "metrics", "c/dataops/" + cursor, max=page, signal_ids=signal_ids)
 
-    ingest = Ingest(open_stream, buffer, dispatch=dispatch, signal_ids=["sig-1"], poll_interval_s=0.02, **kwargs)
+    ingest = Ingest(open_stream, buffer, dispatch=dispatch, signal_ids=["sig-1"], **kwargs)
     return ingest, buffer
 
 
@@ -284,13 +284,22 @@ class GrowingDoor(CursorDoor):
 @run_async
 async def test_partial_pages_are_fetched_at_most_once_per_interval(tmp_path):
     """A live stream at 200 records/s, read with 1000-record pages: every page
-    is partial, so fetches are spaced by the interval and pages grow instead."""
+    is partial, so fetches are spaced by the interval and pages grow instead.
+    Every record rings the bell, as its MQTT message would."""
     door = GrowingDoor()
     ingest, buffer = _ingest(door, tmp_path, page=1000, min_fetch_interval_s=0.1)
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
+
+    async def mqtt() -> None:
+        while not stop.is_set():
+            ingest.wake()
+            await asyncio.sleep(0.005)
+
+    bell = asyncio.ensure_future(mqtt())
     await asyncio.sleep(1.0)
     stop.set()
+    await bell
     ingest.wake()
     await asyncio.wait_for(task, timeout=5.0)
     buffer.close()

@@ -77,10 +77,12 @@ class FakeDoor:
     def queue(self, page: Page) -> None:
         self._pages.append(page)
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None, contracts=None, from_offset=None):
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None, contracts=None, topics=None, from_offset=None):
         call = {"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids}
         if contracts is not None:
             call["contracts"] = contracts
+        if topics is not None:
+            call["topics"] = topics
         if from_offset is not None:
             call["from_offset"] = from_offset
         self.fetch_calls.append(call)

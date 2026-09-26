@@ -25,6 +25,7 @@ from .connector import (
     Telemetry,
 )
 from .door import Door, Gap, KvEntry, Page, Record, Stream
+from .doorbell import Doorbell
 from .node import Node
 from .service import LocalDoor, NotEnrolled, Service
 
@@ -38,6 +39,7 @@ __all__ = [
     "DataTag",
     "Discovery",
     "Door",
+    "Doorbell",
     "Driver",
     "Gap",
     "KvEntry",
