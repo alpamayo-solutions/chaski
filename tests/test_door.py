@@ -425,6 +425,26 @@ def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server
     assert empty.ack_offset is None
 
 
+def test_a_filtered_page_acks_everything_the_node_scanned(stub_server, door):
+    """A filtered fetch moves `next` past the records it skips. Acking only the
+    last returned record left the cursor behind every skipped one, counted as
+    unread by the node's lag and age gauges although nothing was waiting."""
+    _, handler_cls = stub_server
+    handler_cls.responses["/fetch"] = [
+        (200, {"records": [_rec(41)], "next": 90, "from": 30}),
+        (200, {"records": [], "next": 120, "from": 90}),
+        (200, {"records": [], "next": 120, "from": 120}),
+    ]
+
+    matched = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+    skipped_only = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+    at_head = door.fetch("metrics", "c/svc/x", signal_ids=["sig-1"])
+
+    assert matched.ack_offset == 89
+    assert skipped_only.ack_offset == 119
+    assert at_head.ack_offset is None
+
+
 def test_self_info_returns_raw_dict(stub_server, door):
     _, handler_cls = stub_server
     handler_cls.responses["/self"] = (

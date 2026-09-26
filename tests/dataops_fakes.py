@@ -77,11 +77,20 @@ class FakeDoor:
     def queue(self, page: Page) -> None:
         self._pages.append(page)
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
-        self.fetch_calls.append({"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids})
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None, contracts=None, from_offset=None):
+        call = {"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids}
+        if contracts is not None:
+            call["contracts"] = contracts
+        if from_offset is not None:
+            call["from_offset"] = from_offset
+        self.fetch_calls.append(call)
         if self._pages:
             return self._pages.pop(0)
         return Page(records=[], next=1)
+
+    def watch(self, streams, *, interval_ms=None):
+        """No hints: the connection ends at once (tests ring by hand)."""
+        return iter(())
 
     def ack(self, stream, cursor, offset) -> bool:
         self.acked.append((stream, cursor, offset))

@@ -97,12 +97,18 @@ class Page:
     def ack_offset(self) -> int | None:
         """The offset to ack once every record of this page is processed.
 
-        The last record's offset; the gap's bound when no record survived the
-        low-water mark, so the same gap is not reported again; ``None`` for an
-        empty page.
+        The last offset the node scanned for the page (``next - 1``): a
+        filtered fetch (``signal_ids``, ``contracts``) moves ``next`` past the
+        records it skips, and acking only the last returned record left the
+        cursor behind every skipped one, where its lag and age count them as
+        unread. The gap's bound when nothing was scanned past it; ``None`` when
+        the page moved nothing (an empty page from a node that does not report
+        ``start``, or one whose ``next`` is where it started).
         """
         if self.records:
-            return self.records[-1].offset
+            return max(self.records[-1].offset, self.next - 1)
+        if self.start is not None and self.next > self.start:
+            return self.next - 1 if self.gap is None else max(self.gap.to_offset, self.next - 1)
         if self.gap is not None:
             return self.gap.to_offset
         return None
@@ -409,12 +415,14 @@ class Stream:
         *,
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
+        contracts: Iterable[str] | None = None,
     ) -> None:
         self._door = door
         self.name = name
         self.cursor = cursor
         self._max = max
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
+        self._contracts = sorted(contracts) if contracts is not None else None
 
     @property
     def page_size(self) -> int:
@@ -424,11 +432,12 @@ class Stream:
     def fetch(self, *, from_offset: int | None = None) -> Page:
         """One page from the cursor's stored position, or from ``from_offset``
         when that lies ahead of it. Never moves the cursor."""
-        if from_offset is None:
-            return self._door.fetch(self.name, self.cursor, max=self._max, signal_ids=self._signal_ids)
-        return self._door.fetch(
-            self.name, self.cursor, max=self._max, signal_ids=self._signal_ids, from_offset=from_offset
-        )
+        scope: dict[str, Any] = {"signal_ids": self._signal_ids}
+        if self._contracts is not None:
+            scope["contracts"] = self._contracts
+        if from_offset is not None:
+            scope["from_offset"] = from_offset
+        return self._door.fetch(self.name, self.cursor, max=self._max, **scope)
 
     def ack(self, upto: Record | int) -> bool:
         """Ack ``upto`` (a record, or its offset) as the last PROCESSED

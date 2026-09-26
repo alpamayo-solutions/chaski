@@ -1060,7 +1060,7 @@ class DataOpsService(Service):
         executor = commands.CommandExecutor(
             self.door,
             self.send,
-            self.stream(commands.STREAM, cursor=commands.CURSOR),
+            self.stream(commands.STREAM, cursor=commands.CURSOR, contracts=commands.contracts(handlers)),
             handlers,
             cast(str, self._node_id),
         )
