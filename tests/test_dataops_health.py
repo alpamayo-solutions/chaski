@@ -111,3 +111,21 @@ async def test_an_ingest_loop_that_stopped_draining_turns_the_probe_503():
         state.ingest_task.cancel()
         server.close()
         await server.wait_closed()
+
+
+def test_a_broker_link_down_past_the_grace_period_fails_the_probe(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("chaski.dataops.health.time.monotonic", lambda: now[0])
+    connected = [False]
+    state = HealthState(broker_connected=lambda: connected[0], broker_grace_s=60.0)
+
+    assert state.healthy() and state.snapshot()["broker"] == "reconnecting"
+    now[0] += 59
+    assert state.healthy()
+    now[0] += 2
+    assert not state.healthy() and state.snapshot()["broker"] == "down"
+
+    connected[0] = True
+    assert state.healthy() and state.snapshot()["broker"] == "connected"
+    connected[0] = False
+    assert state.healthy(), "a new outage starts its own grace period"

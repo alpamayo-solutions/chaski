@@ -912,7 +912,7 @@ class DataOpsService(Service):
         # The infrastructure stays live while a fresh deployment waits for its
         # first timeline/beacon. Producer setup may read application time, so it
         # must not run in a different clock domain or be skipped at startup.
-        health_state = health.HealthState(generation=self.buffer.generation)
+        health_state = health.HealthState(generation=self.buffer.generation, broker_connected=self.is_broker_connected)
         health_server = None
         try:
             health_server = await health.serve(health_state, port=self._health_port)
