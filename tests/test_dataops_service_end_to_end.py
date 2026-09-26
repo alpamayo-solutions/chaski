@@ -24,7 +24,16 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from dataops_fakes import run_async
 from paho.mqtt.client import topic_matches_sub
 
-from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_constant, on_metric, on_signal
+from chaski.dataops import (
+    DataOpsService,
+    Producer,
+    SignalOutput,
+    SignalRangeInput,
+    on_command,
+    on_constant,
+    on_metric,
+    on_signal,
+)
 from chaski.door import KvEntry, Page, Record
 from chaski.service import Service
 
@@ -361,6 +370,48 @@ async def test_an_input_commissioned_later_is_followed_over_mqtt_without_reading
     assert door.fetches[0][2] == ["sig-in"]
     # The seed was the only read of the index contracts; no 15 s retry either.
     assert door.index_reads == 1
+
+
+def test_a_dataops_service_announces_its_commands_in_details_and_will(tmp_path: Path, monkeypatch):
+    """Every ``@on_command`` is announced in ``_ServiceDetails.commands``, in
+    the last will too, so the node can answer a command nobody executes."""
+
+    class Operator(Producer):
+        name = "operator"
+        system_element_name = "oven"
+
+        @on_command("line1/operator/setDensity")
+        @on_command("line1/operator/setSandoff")
+        async def set_value(self, command) -> str:
+            return "set"
+
+    client = _FakeClient()
+    wills: list[tuple[object, ServiceDetails]] = []
+
+    def _connect_local_mqtt(name, **kwargs):
+        wills.append(kwargs["will"])
+        return client, kwargs["identity"]
+
+    monkeypatch.setattr("chaski.service.connect_local_mqtt", _connect_local_mqtt)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc.add(Operator)
+    svc.start()
+    try:
+        announced = [
+            {"contract": "_CmdParam", "path": "line1/operator/setDensity"},
+            {"contract": "_CmdParam", "path": "line1/operator/setSandoff"},
+        ]
+        details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
+        assert json.loads(details[0].encode())["commands"] == announced
+        _topic, will = wills[0]
+        assert json.loads(will.encode())["commands"] == announced
+
+        # A plain Service announces through the API; a change republishes.
+        svc.announce_commands([("_CmdOperate", "line1/bqc/+")])
+        latest = [p for _t, p in client.published if isinstance(p, ServiceDetails)][-1]
+        assert json.loads(latest.encode())["commands"] == [{"contract": "_CmdOperate", "path": "line1/bqc/+"}]
+    finally:
+        svc.close()
 
 
 def test_a_dataops_service_registers_byte_identical_to_a_bare_service(tmp_path: Path, monkeypatch):

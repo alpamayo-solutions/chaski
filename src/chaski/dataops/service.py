@@ -819,7 +819,12 @@ class DataOpsService(Service):
 
     def start(self, *, connect_timeout: float = 10.0) -> DataOpsService:
         """The base class's :meth:`~chaski.Service.start`, then open the
-        buffer. Idempotent."""
+        buffer. Idempotent. Every ``@on_command`` of the added producers is
+        announced (:meth:`~chaski.Service.announce_commands`) before the
+        service connects, so its last will carries them too."""
+        declared = commands.declared_routes(self._producers.values())
+        if declared:
+            self.announce_commands([*self._announced_commands, *declared])
         super().start(connect_timeout=connect_timeout)
         if self._local_buffer is None:
             self._data_dir.mkdir(parents=True, exist_ok=True)
