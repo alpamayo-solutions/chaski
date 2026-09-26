@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.0](https://github.com/alpamayo-solutions/chaski/compare/v0.10.11...v0.11.0) (2026-09-26)
+
+
+### Features
+
+* announce the commands a service executes in _ServiceDetails ([bbb50b2](https://github.com/alpamayo-solutions/chaski/commit/bbb50b26871924827b6de57a29dac9f023ae2493))
+* **dataops:** a live resolution index instead of a KV read per burst ([bbb50b2](https://github.com/alpamayo-solutions/chaski/commit/bbb50b26871924827b6de57a29dac9f023ae2493))
+* **door:** watch stream hints, fetch by contract, kv by depth ([bbb50b2](https://github.com/alpamayo-solutions/chaski/commit/bbb50b26871924827b6de57a29dac9f023ae2493))
+
 ## [0.10.11](https://github.com/alpamayo-solutions/chaski/compare/v0.10.10...v0.10.11) (2026-09-26)
 
 
