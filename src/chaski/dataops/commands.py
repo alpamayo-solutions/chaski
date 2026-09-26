@@ -236,9 +236,9 @@ class CommandExecutor:
                     loop.call_soon_threadsafe(self.wake)
                     if stop.is_set():
                         return
-            except Exception as exc:  # noqa: BLE001 - reconnected below
+            except Exception as exc:
                 log.debug("commands: stream watch ended (%s), reconnecting in %.1fs", exc, backoff)
-            if stop.wait(backoff * random.uniform(1.0, 1.5)):
+            if stop.wait(backoff * random.uniform(1.0, 1.5)):  # noqa: S311 - jitter  # nosec B311
                 return
             backoff = min(2 * backoff, _ERROR_BACKOFF_MAX_S)
 

@@ -11,9 +11,8 @@ import httpx
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 
-from chaski.dataops import Command, CommandRejected, on_command, resolve
+from chaski.dataops import Command, CommandRejected, commands, on_command, resolve
 from chaski.dataops.base import Producer
-from chaski.dataops import commands
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
 from chaski.door import Page, Record, Stream
