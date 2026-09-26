@@ -400,6 +400,7 @@ class Service:
         max_queued_messages: int = 0,
         clock: Clock | None = None,
         step_dependencies: list[str] | None = None,
+        commands: Iterable[tuple[str, str]] | None = None,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -421,6 +422,13 @@ class Service:
         service's health (``_ServiceDetails.health_metrics``); a container
         passes ``colca_data_contracts.container_resource_health_metrics()``.
 
+        ``commands`` are the ``(contract, node-local path)`` pairs this service
+        executes, announced in ``_ServiceDetails.commands`` so the node can
+        answer a command nobody executes with a 404 ``_Ack``. A path may use
+        ``+`` for one segment and a trailing ``#``. A
+        :class:`~chaski.dataops.DataOpsService` announces its ``@on_command``
+        handlers itself. See :meth:`announce_commands`.
+
         Construction does not dial the node; it only loads or mints an external
         identity on disk. See :meth:`start`.
         """
@@ -441,6 +449,7 @@ class Service:
         self.metadata: dict[str, Any] = dict(metadata or {})
         self.architecture_metadata: dict[str, Any] = dict(architecture_metadata or {})
         self.health_metrics = list(health_metrics or [])
+        self._announced_commands: list[tuple[str, str]] = sorted(set(commands or []))
         self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
         self.step = (
             StepGate(self, step_dependencies, self._state_dir / "clock-progress.json")
@@ -1238,6 +1247,24 @@ class Service:
 
     # -- ServiceDetails --------------------------------------------------
 
+    def announce_commands(self, commands: Iterable[tuple[str, str]]) -> None:
+        """Announce the ``(contract, node-local path)`` commands this service
+        executes, replacing what it announced before, and republish
+        ``_ServiceDetails`` when started. Announce before :meth:`start` where
+        possible: the last will is built at connect and carries what was
+        announced then, so a crashed service keeps its commands."""
+        routes = sorted(set(commands))
+        with self._lock:
+            changed = routes != self._announced_commands
+            self._announced_commands = routes
+            details = (
+                self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+                if changed and self._client is not None and self._node_id is not None
+                else None
+            )
+        if details is not None:
+            self._publish_details(details)
+
     def _build_service_details(self, *, is_active: bool, status: str, detail: str = "") -> ServiceDetails:
         metadata: dict[str, Any] = dict(self.metadata)
         if self.version:
@@ -1249,7 +1276,7 @@ class Service:
             architecture_metadata.pop("detail", None)
         if self._service_id is None or self._node_id is None:
             raise RuntimeError("chaski.Service: call start() first")
-        return ServiceDetails(
+        details = ServiceDetails(
             id=self._service_id,
             name=self.name,
             service_type=ServiceType.CONNECTOR,
@@ -1263,6 +1290,13 @@ class Service:
             architecture_metadata=architecture_metadata,
             health_metrics=list(self.health_metrics),
         )
+        if self._announced_commands:
+            # colca-data-contracts before 0.18 has no field for it; the record
+            # carries it all the same.
+            details.__dict__["commands"] = [
+                {"contract": contract, "path": path} for contract, path in self._announced_commands
+            ]
+        return details
 
     def _publish_details(self, details: ServiceDetails) -> None:
         """OUTSIDE the lock — see _publish_outside_the_lock."""

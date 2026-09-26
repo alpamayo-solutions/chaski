@@ -493,3 +493,53 @@ def test_retire_raises_on_http_error(stub_server, door):
 
     with pytest.raises(httpx.HTTPStatusError):
         door.retire("colca/v1/_AlarmState/n-1/line1/press1/threshold")
+
+
+# ─── /watch, /fetch?contract=, /kv?depth= ────────────────────────────────
+
+
+def _mocked(handler) -> Door:
+    door = Door("http://colca", service="projector")
+    door._client = httpx.Client(
+        base_url="http://colca", headers={"X-Colca-Service": "projector"}, transport=httpx.MockTransport(handler)
+    )
+    return door
+
+
+def test_watch_yields_hints_and_skips_heartbeats():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        lines = [
+            '{"streams":["entities","annotations"],"next":{"entities":4,"annotations":9}}',
+            '{"streams":[]}',
+            '{"streams":["annotations"],"next":{"annotations":10}}',
+        ]
+        return httpx.Response(200, text="\n".join(lines) + "\n", headers={"Content-Type": "application/x-ndjson"})
+
+    hints = list(_mocked(handler).watch(["entities", "annotations"], interval_ms=250))
+
+    assert [h.streams for h in hints] == [["entities", "annotations"], ["annotations"]]
+    assert hints[1].next == {"annotations": 10}
+    assert seen[0].url.params.get_list("stream") == ["entities", "annotations"]
+    assert seen[0].url.params["interval_ms"] == "250"
+    assert seen[0].headers["X-Colca-Service"] == "projector"
+
+
+def test_fetch_and_kv_send_contract_and_depth():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/fetch":
+            return httpx.Response(200, json={"records": [], "next": 7})
+        return httpx.Response(200, json={"entries": [], "next": ""})
+
+    door = _mocked(handler)
+    assert door.fetch("commands", "c/projector/x", contracts=["_CmdAcknowledge"]).next == 7
+    assert door.kv("plant/", contract="_SystemElement", depth=1) == []
+
+    assert seen[0].url.params.get_list("contract") == ["_CmdAcknowledge"]
+    assert seen[1].url.params["depth"] == "1"
+    assert seen[1].url.params.get_list("contract") == ["_SystemElement"]

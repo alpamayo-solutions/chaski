@@ -20,9 +20,20 @@ import pytest
 from colca_data_contracts import container_resource_health_metrics
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import ServiceDetails
+from colca_data_contracts.payload import Signal as SignalRecord
 from dataops_fakes import run_async
+from paho.mqtt.client import topic_matches_sub
 
-from chaski.dataops import DataOpsService, Producer, SignalOutput, SignalRangeInput, on_constant, on_metric, on_signal
+from chaski.dataops import (
+    DataOpsService,
+    Producer,
+    SignalOutput,
+    SignalRangeInput,
+    on_command,
+    on_constant,
+    on_metric,
+    on_signal,
+)
 from chaski.door import KvEntry, Page, Record
 from chaski.service import Service
 
@@ -37,8 +48,9 @@ class _FakeMessage:
     """What franzmq hands a ``client.subscribe(..., callback=)`` callback: a
     decoded payload (``None`` for a tombstone), never raw bytes."""
 
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: object, topic: str = "") -> None:
         self.payload = payload
+        self.topic = topic
 
 
 class _FakeClient:
@@ -47,7 +59,10 @@ class _FakeClient:
     enough of ``subscribe(..., callback=)`` for ``chaski.dataops.watch`` to
     register and fire a typed callback without a real MQTT broker."""
 
+    current: ClassVar[_FakeClient | None] = None
+
     def __init__(self) -> None:
+        type(self).current = self
         self.published: list[tuple[str, object]] = []
         self.subscriptions: list[str] = []
         self.callbacks: dict[str, object] = {}
@@ -74,7 +89,14 @@ class _FakeClient:
         """Simulate a retained/live delivery on ``topic`` to whatever was
         subscribed there with a typed callback (``chaski.dataops.watch``'s
         own subscription style) — ``payload=None`` is a tombstone."""
-        self.typed_callbacks[topic](_FakeMessage(payload))
+        self.typed_callbacks[topic](_FakeMessage(payload, topic))
+
+    def deliver_retained(self, topic: str, payload: object) -> None:
+        """What the node does after a retained write: hand it to every
+        subscription whose filter matches."""
+        for sub, callback in list(self.typed_callbacks.items()):
+            if topic_matches_sub(sub, topic):
+                callback(_FakeMessage(payload, topic))
 
     def message_callback_add(self, sub: str, callback) -> None:
         self.callbacks[sub] = callback
@@ -105,6 +127,8 @@ class _FakeNodeDoor:
     input record, once, from a real cursor table."""
 
     instances: ClassVar[list[_FakeNodeDoor]] = []
+    #: Start with the input `_Signal` held back, for a test to commission later.
+    start_uncommissioned: ClassVar[bool] = False
 
     def __init__(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None) -> None:
         self.service = service
@@ -133,6 +157,8 @@ class _FakeNodeDoor:
             ),
         ]
         self.cursors: dict[str, int] = {}
+        self.index_reads = 0
+        self.uncommissioned = [self.entries.pop()] if self.start_uncommissioned else []
         self.acks: list[tuple[str, str, int]] = []
         self.fetches: list[tuple[str, str, list[str] | None]] = []
         type(self).instances.append(self)
@@ -141,6 +167,8 @@ class _FakeNodeDoor:
         pass
 
     def kv(self, prefix="", *, contract=None):
+        if contract is not None and "_Signal" in contract:
+            self.index_reads += 1
         return list(self.entries)
 
     def receive(self, topic: str, payload: str) -> None:
@@ -149,16 +177,20 @@ class _FakeNodeDoor:
         if "/_DataTags/" in topic:
             # The node's part of the commissioning act: bind the catalogue.
             for tag in body["data_tags"]:
+                signal_topic = f"colca/v1/_Signal/{NODE_ID}/oven/{tag['name']}"
+                signal = {"id": "sig-out", "name": tag["name"], "data_tag": tag["id"], "is_published": True}
                 self.entries.append(
                     KvEntry(
                         path=f"oven/{tag['name']}",
                         node_id=NODE_ID,
-                        topic=f"colca/v1/_Signal/{NODE_ID}/oven/{tag['name']}",
-                        payload={"id": "sig-out", "name": tag["name"], "data_tag": tag["id"], "is_published": True},
+                        topic=signal_topic,
+                        payload=signal,
                         ts=0.0,
                         offset=2,
                     )
                 )
+                if _FakeClient.current is not None:
+                    _FakeClient.current.deliver_retained(signal_topic, SignalRecord(**signal))
 
     def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
         self.fetches.append((stream, cursor, signal_ids))
@@ -308,6 +340,78 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
     details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
     assert details[0].name == "dataops" and details[0].service_type.value == "connector"
     assert details[-1].is_active is False
+
+
+@run_async
+async def test_an_input_commissioned_later_is_followed_over_mqtt_without_reading_kv(tmp_path: Path, monkeypatch):
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    monkeypatch.setattr(_FakeNodeDoor, "start_uncommissioned", True)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc.add(Doubler)
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: _FakeNodeDoor.instances and _FakeNodeDoor.instances[0].index_reads == 1)
+        door = _FakeNodeDoor.instances[0]
+        await asyncio.sleep(0.3)
+        assert door.fetches == [], "nothing to fetch before the input is commissioned"
+
+        (signal,) = door.uncommissioned
+        door.entries.insert(0, signal)
+        client.deliver_retained(signal.topic, SignalRecord(id="sig-in", name="temperature"))
+        await _poll_until(lambda: door.metrics(), timeout=5.0)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    assert door.metrics()[0][1]["value"] == 43.0
+    assert door.fetches[0][2] == ["sig-in"]
+    # The seed was the only read of the index contracts; no 15 s retry either.
+    assert door.index_reads == 1
+
+
+def test_a_dataops_service_announces_its_commands_in_details_and_will(tmp_path: Path, monkeypatch):
+    """Every ``@on_command`` is announced in ``_ServiceDetails.commands``, in
+    the last will too, so the node can answer a command nobody executes."""
+
+    class Operator(Producer):
+        name = "operator"
+        system_element_name = "oven"
+
+        @on_command("line1/operator/setDensity")
+        @on_command("line1/operator/setSandoff")
+        async def set_value(self, command) -> str:
+            return "set"
+
+    client = _FakeClient()
+    wills: list[tuple[object, ServiceDetails]] = []
+
+    def _connect_local_mqtt(name, **kwargs):
+        wills.append(kwargs["will"])
+        return client, kwargs["identity"]
+
+    monkeypatch.setattr("chaski.service.connect_local_mqtt", _connect_local_mqtt)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc.add(Operator)
+    svc.start()
+    try:
+        announced = [
+            {"contract": "_CmdParam", "path": "line1/operator/setDensity"},
+            {"contract": "_CmdParam", "path": "line1/operator/setSandoff"},
+        ]
+        details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
+        assert json.loads(details[0].encode())["commands"] == announced
+        _topic, will = wills[0]
+        assert json.loads(will.encode())["commands"] == announced
+
+        # A plain Service announces through the API; a change republishes.
+        svc.announce_commands([("_CmdOperate", "line1/bqc/+")])
+        latest = [p for _t, p in client.published if isinstance(p, ServiceDetails)][-1]
+        assert json.loads(latest.encode())["commands"] == [{"contract": "_CmdOperate", "path": "line1/bqc/+"}]
+    finally:
+        svc.close()
 
 
 def test_a_dataops_service_registers_byte_identical_to_a_bare_service(tmp_path: Path, monkeypatch):

@@ -216,6 +216,12 @@ class AnnotationOutput(_PerInstance):
         self._source: str | None = None
         self._node_id: str | None = None
         self._topic_prefix: tuple[str, ...] | None = None
+        self._type_id: str | None = None
+
+    def forget(self) -> None:
+        """Drop the resolved type id so the next write resolves it again.
+        Called on every resolution pass, like :meth:`SignalOutput.forget`."""
+        self._type_id = None
 
     # ─── binding (set once by bind_annotation_outputs) ─────────────────
 
@@ -239,13 +245,17 @@ class AnnotationOutput(_PerInstance):
 
     @property
     def type_id(self) -> str:
-        """This annotation type's ULID, resolved from KV on every call. Raises
-        if no ``_AnnotationType`` named ``self.annotation_name`` exists; types
-        are definitions and are not created here.
+        """This annotation type's ULID, resolved once and then kept until the
+        next resolution pass (:meth:`forget`). Raises if no
+        ``_AnnotationType`` named ``self.annotation_name`` exists; types are
+        definitions and are not created here, and a miss is not kept.
         """
+        if self._type_id is not None:
+            return self._type_id
         type_id = resolve.resolve_annotation_type(self._runtime().door, self.annotation_name)
         if type_id is None:
             raise LookupError(f"AnnotationType not found: {self.annotation_name!r}")
+        self._type_id = type_id
         return type_id
 
     def _topic(self, annotation_id: str) -> str:
@@ -419,12 +429,22 @@ def _iter_signal_outputs(instances: Iterable[Any]) -> Iterable[tuple[str, Signal
 
 def declared_outputs(instance: Any) -> Iterable[tuple[str, SignalOutput]]:
     """``(attr_name, bound_output)`` for every ``SignalOutput`` declared on
+    ``instance``'s class."""
+    cls = type(instance)
+    for attr_name in dir(cls):
+        class_attr = getattr(cls, attr_name, None)
+        if isinstance(class_attr, SignalOutput):
+            yield attr_name, getattr(instance, attr_name)
+
+
+def resolved_outputs(instance: Any) -> Iterable[tuple[str, SignalOutput | AnnotationOutput]]:
+    """Every ``SignalOutput`` and ``AnnotationOutput`` declared on
     ``instance``'s class — what a resolution pass forgets alongside the
     inputs."""
     cls = type(instance)
     for attr_name in dir(cls):
         class_attr = getattr(cls, attr_name, None)
-        if isinstance(class_attr, SignalOutput):
+        if isinstance(class_attr, (SignalOutput, AnnotationOutput)):
             yield attr_name, getattr(instance, attr_name)
 
 

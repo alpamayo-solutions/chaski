@@ -25,7 +25,7 @@ class FakeDoor:
         self.entries = entries
         self.calls = 0
 
-    def kv(self, prefix: str) -> list[KvEntry]:
+    def kv(self, prefix: str, *, contract=None) -> list[KvEntry]:
         self.calls += 1
         return list(self.entries)
 
@@ -159,7 +159,7 @@ def test_a_pass_that_cannot_read_is_not_fatal():
     """
 
     class RefusingDoor(FakeDoor):
-        def kv(self, prefix):
+        def kv(self, prefix, *, contract=None):
             self.calls += 1
             raise RuntimeError("429 Too Many Requests")
 

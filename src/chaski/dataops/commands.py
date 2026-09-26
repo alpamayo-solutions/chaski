@@ -120,6 +120,17 @@ def gather(instances: Iterable[Producer]) -> dict[tuple[str, str], Callable]:
     return handlers
 
 
+def declared_routes(producer_classes: Iterable[type[Producer]]) -> list[tuple[str, str]]:
+    """``(contract, path)`` of every ``@on_command`` the producer classes
+    declare: what their service announces it executes."""
+    routes: set[tuple[str, str]] = set()
+    for cls in producer_classes:
+        for _method_name, spec in cls._triggers:
+            if isinstance(spec, OnCommandSpec):
+                routes.add((spec.contract, spec.path))
+    return sorted(routes)
+
+
 def parse_topic(topic: str) -> tuple[str, str] | None:
     """``(contract, path)`` of ``<root>/v1/<contract>/<owner>/<path...>``,
     or ``None`` for anything shorter."""

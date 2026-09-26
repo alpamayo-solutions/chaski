@@ -35,7 +35,7 @@ import copy
 import logging
 import time
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 from . import resolve
 from .base import runtime_now
@@ -109,10 +109,13 @@ def _find_attr_name(owner: type, descriptor: Any) -> str:
 
 
 class SignalRangeInput(_PerInstance):
-    """Read one signal's buffered values, resolved by name and optional element.
+    """Read one signal's buffered values, resolved by name and optional
+    element, or by its node-local path.
 
     Pass ``system_element_name`` when the same signal name exists on several
-    elements.
+    elements. ``path`` (``SignalRangeInput(path="Plant/Line1/M2/speed")``)
+    names the ``_Signal`` at that position instead and needs neither; the
+    input's ``signal_name`` is then the path, for logs.
 
     ``window`` is how far back the input reaches, in seconds or as ``"24h"``,
     ``"7d"``. It sizes the buffer horizon, and :func:`validate_windows` refuses
@@ -121,16 +124,26 @@ class SignalRangeInput(_PerInstance):
 
     def __init__(
         self,
-        signal_name: str,
+        signal_name: str | None = None,
         system_element_name: str | None = None,
         window: str | float = DEFAULT_WINDOW,
         *,
+        path: str | None = None,
         time_domain: Literal["application", "real"] = "application",
     ) -> None:
         if time_domain not in ("application", "real"):
             raise ValueError("time_domain must be application or real")
+        if path is not None:
+            if signal_name is not None or system_element_name is not None:
+                raise ValueError("SignalRangeInput takes a path, or a signal name with an optional element, not both")
+            path = path.strip("/")
+            if not path:
+                raise ValueError("SignalRangeInput: path must not be empty")
+        elif not signal_name:
+            raise ValueError("SignalRangeInput needs a signal name or a path")
         self.time_domain = time_domain
-        self.signal_name = signal_name
+        self.path = path
+        self.signal_name = path if path is not None else signal_name
         self.system_element_name = system_element_name
         self.window_s = parse_duration(window)
         self._resolved_id: str | None = None
@@ -147,16 +160,21 @@ class SignalRangeInput(_PerInstance):
     def signal_id(self) -> str:
         """This input's Signal ULID, resolved once per resolution pass.
 
-        It is read for every record, and resolving is a rate-limited KV scan,
-        so it is not resolved again until :meth:`forget`.
+        It is read for every record, and without a live index resolving is a
+        rate-limited KV scan, so it is not resolved again until :meth:`forget`.
         """
         if self._resolved_id is not None:
             return self._resolved_id
         door = self._runtime().door
-        sid = resolve.resolve_signal(door, self.signal_name, self.system_element_name)
-        if sid is None:
-            scope = f" on SE={self.system_element_name!r}" if self.system_element_name else ""
-            raise LookupError(f"Signal not found: {self.signal_name!r}{scope}")
+        if self.path is not None:
+            sid = resolve.resolve_signal_path(door, self.path)
+            if sid is None:
+                raise LookupError(f"Signal not found at path {self.path!r}")
+        else:
+            sid = resolve.resolve_signal(door, cast(str, self.signal_name), self.system_element_name)
+            if sid is None:
+                scope = f" on SE={self.system_element_name!r}" if self.system_element_name else ""
+                raise LookupError(f"Signal not found: {self.signal_name!r}{scope}")
         self._resolved_id = sid
         return sid
 
