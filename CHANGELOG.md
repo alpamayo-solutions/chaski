@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.11](https://github.com/alpamayo-solutions/chaski/compare/v0.10.10...v0.10.11) (2026-09-26)
+
+
+### Fixes
+
+* **dataops:** no full KV read per command; a busy node answers 503 ([#61](https://github.com/alpamayo-solutions/chaski/issues/61)) ([d17c965](https://github.com/alpamayo-solutions/chaski/commit/d17c96594f88f3dcea501a3658724341153a5464))
+
 ## [0.10.10](https://github.com/alpamayo-solutions/chaski/compare/v0.10.9...v0.10.10) (2026-09-26)
 
 
