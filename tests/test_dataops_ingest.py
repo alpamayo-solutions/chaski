@@ -347,31 +347,24 @@ async def _poll_until(predicate, timeout: float = 2.0, interval: float = 0.01) -
 
 
 @run_async
-async def test_wake_triggers_an_immediate_run_once_without_waiting_for_poll_interval(door, buffer):
-    calls = 0
+async def test_wake_triggers_an_immediate_fetch_without_waiting_for_poll_interval(door, buffer):
     ingest = _ingest(door, buffer, signal_ids=["sig-1"], poll_interval_s=60.0)
 
-    original_run_once = ingest.run_once
-
-    async def _spy():
-        nonlocal calls
-        calls += 1
-        return await original_run_once()
-
-    ingest.run_once = _spy
+    def calls() -> int:
+        return len(door.fetch_calls)
 
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
     try:
-        # the loop calls run_once immediately on entry, before ever sleeping
-        await _poll_until(lambda: calls >= 1)
-        first_count = calls
+        # the loop fetches immediately on entry, before ever sleeping
+        await _poll_until(lambda: calls() >= 1)
+        first_count = calls()
 
         ingest.wake()
 
-        # with a 60s poll interval, a second call within 2s can only be the
+        # with a 60s poll interval, a second fetch within 2s can only be the
         # doorbell short-circuiting the sleep, not the timeout firing
-        await _poll_until(lambda: calls >= first_count + 1)
+        await _poll_until(lambda: calls() >= first_count + 1)
     finally:
         stop.set()
         ingest.wake()

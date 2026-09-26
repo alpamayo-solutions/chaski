@@ -84,12 +84,14 @@ class Page:
     ``records`` are in stream order. ``next`` is the offset to fetch from
     next time — fetch itself never moves the cursor, only ``ack`` does.
     ``gap`` is set only when the cursor's position has fallen below the
-    stream's low-water mark.
+    stream's low-water mark. ``start`` is the offset the page was read from;
+    nodes before colca 0.18.2 do not report it and cannot read ahead.
     """
 
     records: list[Record]
     next: int
     gap: Gap | None = None
+    start: int | None = None
 
     @property
     def ack_offset(self) -> int | None:
@@ -193,6 +195,7 @@ class Door:
         max: int = 1000,
         signal_ids: list[str] | None = None,
         contracts: Iterable[str] | None = None,
+        from_offset: int | None = None,
     ) -> Page:
         """``GET /fetch`` — read FORWARD from ``cursor``'s stored position.
 
@@ -200,13 +203,17 @@ class Door:
         sent as repeated ``signal_id`` query params and is valid only when
         ``stream == "metrics"`` (the door rejects it otherwise).
         ``contracts`` keeps only records of those contracts (colca 0.18+);
-        ``next`` still moves past the others.
+        ``next`` still moves past the others. ``from_offset`` reads ahead of
+        the cursor, never behind it (colca 0.18.2+; older nodes ignore it and
+        leave :attr:`Page.start` unset).
         """
         params: list[tuple[str, str | int | float | bool | None]] = [
             ("stream", stream),
             ("cursor", cursor),
             ("max", str(max)),
         ]
+        if from_offset is not None:
+            params.append(("from", str(from_offset)))
         for signal_id in signal_ids or []:
             params.append(("signal_id", signal_id))
         for contract in contracts or []:
@@ -242,7 +249,7 @@ class Door:
                 approx=g.get("approx", False),
             )
 
-        return Page(records=records, next=body["next"], gap=gap)
+        return Page(records=records, next=body["next"], gap=gap, start=body.get("from"))
 
     def kv(
         self,
@@ -409,9 +416,19 @@ class Stream:
         self._max = max
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
 
-    def fetch(self) -> Page:
-        """One page from the cursor's stored position. Never moves the cursor."""
-        return self._door.fetch(self.name, self.cursor, max=self._max, signal_ids=self._signal_ids)
+    @property
+    def page_size(self) -> int:
+        """The most records one :meth:`fetch` asks for."""
+        return self._max
+
+    def fetch(self, *, from_offset: int | None = None) -> Page:
+        """One page from the cursor's stored position, or from ``from_offset``
+        when that lies ahead of it. Never moves the cursor."""
+        if from_offset is None:
+            return self._door.fetch(self.name, self.cursor, max=self._max, signal_ids=self._signal_ids)
+        return self._door.fetch(
+            self.name, self.cursor, max=self._max, signal_ids=self._signal_ids, from_offset=from_offset
+        )
 
     def ack(self, upto: Record | int) -> bool:
         """Ack ``upto`` (a record, or its offset) as the last PROCESSED
