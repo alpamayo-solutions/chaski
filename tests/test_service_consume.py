@@ -6,6 +6,7 @@ keeps cursor positions like colcad: ``/fetch`` reads from the position and only
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -322,20 +323,39 @@ def test_stream_passes_signal_ids_through_to_the_metrics_fetch(tmp_path, monkeyp
     assert fetches[0] == ("fetch", "metrics", "c/erp-bridge/metrics", 10, ["sig-1", "sig-2"])
 
 
-def test_follow_drains_until_stopped(tmp_path, monkeypatch, fake_door):
+def test_follow_drains_at_start_then_only_when_the_bell_rings(tmp_path, monkeypatch, fake_door):
     import threading
+
+    from chaski import Doorbell
 
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
     door.streams["annotations"] = [_record(1)]
     stop = threading.Event()
+    bell = Doorbell()
     seen: list[int] = []
-    for record in svc.stream("annotations").follow(poll_interval=0.01, stop=stop):
-        seen.append(record.offset)
+    fetches = lambda: len([c for c in door.calls if c[0] == "fetch"])  # noqa: E731
+
+    def later() -> None:
+        # Idle after the first drain: a record that arrives is read only once
+        # the bell rings, and never on a timer.
+        deadline = time.monotonic() + 2
+        while fetches() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         door.streams["annotations"].append(_record(2))
+        time.sleep(0.2)
+        idle_fetches.append(fetches())
+        bell.ring()
+
+    idle_fetches: list[int] = []
+    threading.Thread(target=later, daemon=True).start()
+    for record in svc.stream("annotations").follow(bell, stop=stop):
+        seen.append(record.offset)
         if len(seen) == 2:
             stop.set()
+            bell.ring()
     assert seen == [1, 2]
+    assert idle_fetches == [2], "no fetch between the drain at start and the ring"
 
 
 # -- kv(): a bounded snapshot -------------------------------------------------

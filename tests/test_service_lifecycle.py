@@ -474,3 +474,19 @@ def test_the_client_tolerates_undecodable_messages_before_its_loop_starts(tmp_pa
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
     Service("svc1", "line1", state_dir=tmp_path).start()
     assert guarded == [True]
+
+
+def test_the_service_follows_the_nodes_cursor_lag_finding_about_itself(tmp_path, monkeypatch):
+    """The node writes a cursor_lag finding next to the service's own record
+    while records it reads wait unread; the service holds the summary for its
+    health check, and a tombstone clears it."""
+    svc, client = _local_service(tmp_path, monkeypatch)
+    topic = "colca/v1/_Finding/n-edge1/line1/svc1/cursor_lag"
+    assert topic in client.subscriptions
+    assert svc.cursor_lag == ""
+
+    client.subscriptions[topic](_Message({"reason": "cursor_lag", "summary": "svc1 has records waiting 75 s"}))
+    assert svc.cursor_lag == "svc1 has records waiting 75 s"
+
+    client.subscriptions[topic](_Message(None))
+    assert svc.cursor_lag == ""

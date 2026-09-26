@@ -34,8 +34,13 @@ the pruned range, and processing continues.
 
 **MQTT only wakes it.** A message on one of the service's input topics calls
 :meth:`Ingest.wake` (through
-:meth:`chaski.dataops.service.DataOpsService._wake_on_inputs`), which cuts
-the poll sleep short; the message itself is not read.
+:meth:`chaski.dataops.service.DataOpsService._wake_on_inputs`); the message
+itself is not read. So does every reconnect of the broker link. Nothing is
+read on a timer: the loop drains at start, then waits for the next wake. It
+takes the wake generation before each drain, so a wake that arrives while it
+drains leads to one more drain instead of being lost. A consumer that stops
+reading anyway is caught by the node's cursor watchdog, which the health door
+reports (:mod:`chaski.dataops.health`).
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ from typing import Any
 import httpx
 
 from chaski.door import Gap, Page, Record, Stream
+from chaski.doorbell import Doorbell
 
 from .buffer import Buffer
 
@@ -97,7 +103,6 @@ class Ingest:
         *,
         dispatch: dict[str, list[Handler]] | None = None,
         signal_ids: Iterable[str] | None = None,
-        poll_interval_s: float = 1.0,
         previous_generation: str | None = None,
         strict: bool = False,
         min_fetch_interval_s: float = MIN_FETCH_INTERVAL_S,
@@ -107,11 +112,10 @@ class Ingest:
         self._buffer = buffer
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
-        self._poll_interval_s = poll_interval_s
         self._cursor_name = cursor_name(buffer.generation)
         self._stream = open_stream(self._cursor_name, self._signal_ids)
         self._previous_generation = previous_generation
-        self._wake = asyncio.Event()
+        self._bell = Doorbell()
         self._window_started = time.monotonic()
         self._last_drain_at = self._window_started
         self._window_records = 0
@@ -138,7 +142,7 @@ class Ingest:
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
         self._stream = self._open_stream(self._cursor_name, self._signal_ids)
-        self._wake.set()
+        self._bell.ring()
 
     @property
     def cursor(self) -> str:
@@ -148,10 +152,6 @@ class Ingest:
     @property
     def stream(self) -> Stream:
         return self._stream
-
-    @property
-    def poll_interval_s(self) -> float:
-        return self._poll_interval_s
 
     @property
     def last_drain_at(self) -> float:
@@ -266,7 +266,9 @@ class Ingest:
         if ack_offset is None:
             self._behind = False
             return 0
-        self._behind = len(page.records) >= stream.page_size
+        # A page of skipped records still moved the read on: read again at once
+        # rather than take it for the head.
+        self._behind = len(page.records) >= stream.page_size or (not page.records and page.gap is None)
         if self._behind and self._read_ahead:
             self._last_fetch_at = time.monotonic()
             self._prefetch = (stream, asyncio.ensure_future(asyncio.to_thread(stream.fetch, from_offset=page.next)))
@@ -369,11 +371,8 @@ class Ingest:
     # ------------------------------------------------------------------ wake
 
     def wake(self) -> None:
-        """Signal that new data may be waiting, cutting the poll sleep short.
-
-        From another thread, call it through ``loop.call_soon_threadsafe``.
-        """
-        self._wake.set()
+        """New data may be waiting: drain again. Safe from any thread."""
+        self._bell.ring()
 
     #: How often the ingest lane logs what it did, the same cadence as the
     #: connectors' [DATA] line.
@@ -406,14 +405,17 @@ class Ingest:
     #: seconds.
     ERROR_BACKOFF_MAX_S = 30.0
 
+    #: The first backoff after a transport error, doubled per consecutive one.
+    ERROR_BACKOFF_S = 1.0
+
     def _error_backoff_s(self, attempt: int) -> float:
         """Backoff for the ``attempt``-th (1-based) consecutive transport error.
 
-        Exponential from the poll interval, capped at
+        Exponential from :attr:`ERROR_BACKOFF_S`, capped at
         :attr:`ERROR_BACKOFF_MAX_S`, plus up to 20% jitter so services do not
         retry in lockstep.
         """
-        base = min(max(self._poll_interval_s, 0.1) * (2 ** (attempt - 1)), self.ERROR_BACKOFF_MAX_S)
+        base = min(self.ERROR_BACKOFF_S * (2 ** (attempt - 1)), self.ERROR_BACKOFF_MAX_S)
         return base * (1.0 + _jitter.uniform(0.0, 0.2))
 
     async def _sleep_or_stop(self, seconds: float, stop: asyncio.Event) -> None:
@@ -429,9 +431,8 @@ class Ingest:
         """Process pages until ``stop`` is set.
 
         Drains while fetches return records, paced as the module docstring
-        says, then sleeps up to ``poll_interval_s``; :meth:`wake` cuts the
-        sleep short. Where the node supports it, the page after a full one is
-        read ahead while the full one is processed.
+        says, then waits for :meth:`wake`. Where the node supports it, the page
+        after a full one is read ahead while the full one is processed.
 
         ``httpx.HTTPError`` (colca restarting, a timeout, 429, 5xx) is logged
         and retried with backoff; the unacked page is simply fetched again. Any
@@ -446,7 +447,11 @@ class Ingest:
 
     async def _run(self, stop: asyncio.Event) -> None:
         consecutive_errors = 0
+        seen = self._bell.generation
         while not stop.is_set():
+            if not self._behind:
+                # Taken before the fetch: a wake from here on means another drain.
+                seen = self._bell.generation
             try:
                 processed = await self._step()
             except httpx.HTTPError as exc:
@@ -464,18 +469,13 @@ class Ingest:
 
             consecutive_errors = 0
             self._note_drain(processed)
-            if processed > 0:
+            if processed > 0 or self._behind:
                 continue
 
-            self._wake.clear()
-            wake_task = asyncio.ensure_future(self._wake.wait())
+            wake_task = asyncio.ensure_future(self._bell.after(seen))
             stop_task = asyncio.ensure_future(stop.wait())
             try:
-                await asyncio.wait(
-                    {wake_task, stop_task},
-                    timeout=self._poll_interval_s,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 for task in (wake_task, stop_task):
                     if not task.done():

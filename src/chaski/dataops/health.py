@@ -21,8 +21,7 @@ from dataclasses import dataclass, field
 log = logging.getLogger("chaski.dataops.health")
 
 PORT_DEFAULT = 8888
-#: No finished drain for this long, or ten poll intervals if longer, is a stall.
-#: Transport errors back off to at most 30 s, so a node restart stays under it.
+#: In coordinated step mode, no finished step for this long is a stall.
 STALL_AFTER_MIN_S = 300.0
 #: How long the broker may be away before the probe fails: paho reconnects
 #: within seconds of a node restart, so this is a reconnect that never comes.
@@ -34,12 +33,16 @@ class HealthState:
     """What the service knows about itself, set by ``run()``.
 
     An ingest task that died with an exception turns the answer into a 503,
-    because the service is up but doing nothing. So does one that is alive but
-    has not finished a drain for ``stall_after_s``: a healthy loop drains at
-    least once per poll interval, even with nothing to read. An ingest that
-    never started (nothing resolved yet) is healthy: a fresh node waiting to be
-    commissioned. A broker link that stays down for ``broker_grace_s`` fails the
-    probe too: without it no command, wake-up or watched record arrives.
+    because the service is up but doing nothing. So does the node's
+    ``cursor_lag`` finding about this service (``cursor_lag``): records it
+    reads have waited unread past the node's threshold, a lost wake or a stuck
+    loop. An idle stream is healthy however old its last record is: the ingest
+    reads when woken, not on a timer, and only records that wait count. An
+    ingest that never started (nothing resolved yet) is healthy: a fresh node
+    waiting to be commissioned. A broker link that stays down for
+    ``broker_grace_s`` fails the probe too: without it no command, wake-up or
+    watched record arrives. In coordinated step mode ``last_drain_at`` is the
+    step loop's, and ``stall_after_s`` without a step is a stall.
     """
 
     started_at: float = field(default_factory=time.time)
@@ -51,6 +54,8 @@ class HealthState:
     generation: str = ""
     broker_connected: Callable[[], bool] | None = None
     broker_grace_s: float = BROKER_GRACE_S
+    #: The node's cursor_lag finding about this service, "" while none stands.
+    cursor_lag: Callable[[], str] | None = None
     _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
@@ -77,14 +82,18 @@ class HealthState:
             self._broker_down_since = now
         return "reconnecting" if now - self._broker_down_since < self.broker_grace_s else "down"
 
+    def _lag(self) -> str:
+        return self.cursor_lag() if self.cursor_lag is not None else ""
+
     def healthy(self) -> bool:
-        return self._ingest() in ("not-started", "running") and self._broker() != "down"
+        return self._ingest() in ("not-started", "running") and self._broker() != "down" and not self._lag()
 
     def snapshot(self) -> dict:
         ingest = self._ingest()
         broker = self._broker()
+        lag = self._lag()
         body = {
-            "ok": ingest in ("not-started", "running") and broker != "down",
+            "ok": ingest in ("not-started", "running") and broker != "down" and not lag,
             "ingest": ingest,
             "broker": broker,
             "producers": self.producers,
@@ -93,6 +102,8 @@ class HealthState:
         }
         if self.ingest_task is not None and self.last_drain_at is not None:
             body["since_drain_s"] = round(self._since_drain(), 1)
+        if lag:
+            body["cursor_lag"] = lag
         return body
 
 

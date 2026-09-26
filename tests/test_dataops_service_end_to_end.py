@@ -67,6 +67,7 @@ class _FakeClient:
         self.subscriptions: list[str] = []
         self.callbacks: dict[str, object] = {}
         self.typed_callbacks: dict[str, object] = {}
+        self.qos: dict[str, int] = {}
         self.on_connect = None
         self.node_id = None
 
@@ -82,6 +83,7 @@ class _FakeClient:
 
     def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions.append(str(topic))
+        self.qos[str(topic)] = qos
         if callback is not None:
             self.typed_callbacks[str(topic)] = callback
 
@@ -295,7 +297,7 @@ async def _poll_until(predicate, timeout: float = 10.0) -> None:
 async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Path, monkeypatch):
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
     svc.add(Doubler)
 
     stop = asyncio.Event()
@@ -336,6 +338,7 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
     # client, and the service is a plain local service to the node:
     # registration is CONNECTOR-typed, and close() marked it inactive.
     assert f"colca/v1/_Metric/{NODE_ID}/oven/temperature" in client.subscriptions
+    assert client.qos[f"colca/v1/_Metric/{NODE_ID}/oven/temperature"] == 1, "a wake is not dropped on the way"
     assert not any(t.endswith("/#") and "_Metric" in t for t in client.subscriptions)
     details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
     assert details[0].name == "dataops" and details[0].service_type.value == "connector"
@@ -347,7 +350,7 @@ async def test_an_input_commissioned_later_is_followed_over_mqtt_without_reading
     client = _FakeClient()
     _connect(client, monkeypatch)
     monkeypatch.setattr(_FakeNodeDoor, "start_uncommissioned", True)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
     svc.add(Doubler)
 
     stop = asyncio.Event()
@@ -496,7 +499,7 @@ def test_pending_uses_the_buffer_of_unbound_samples(tmp_path: Path) -> None:
 async def test_on_ready_runs_after_outputs_are_bound_with_no_retry_needed(tmp_path: Path, monkeypatch):
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
     svc.add(ReadyAndWatched)
 
     stop = asyncio.Event()
@@ -521,7 +524,7 @@ async def test_on_constant_fires_on_write_and_sees_the_tombstone_as_none(tmp_pat
 
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
     svc.add(ReadyAndWatched)
 
     topic = f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint"
@@ -564,7 +567,7 @@ async def test_on_signal_fires_on_binding_change_and_on_release(tmp_path: Path, 
 
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", poll_interval=0.02, health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
     svc.add(ReadyAndWatched)
 
     topic = f"colca/v1/_Signal/{NODE_ID}/oven/temperature"

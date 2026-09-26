@@ -32,6 +32,8 @@ from typing import Any
 
 import httpx
 
+from chaski.doorbell import Doorbell
+
 log = logging.getLogger("chaski.door")
 
 
@@ -97,15 +99,18 @@ class Page:
     def ack_offset(self) -> int | None:
         """The offset to ack once every record of this page is processed.
 
-        The last record's offset; the gap's bound when no record survived the
-        low-water mark, so the same gap is not reported again; ``None`` for an
-        empty page.
+        The last record's offset. Past the records a filter skipped (``next -
+        1``) when the node says where the page started, so they do not stay
+        unread on the cursor. The gap's bound when no record survived the
+        low-water mark, so the same gap is not reported again. ``None`` when
+        the page read nothing: the cursor is at the head.
         """
-        if self.records:
-            return self.records[-1].offset
+        candidates = [self.records[-1].offset] if self.records else []
         if self.gap is not None:
-            return self.gap.to_offset
-        return None
+            candidates.append(self.gap.to_offset)
+        if self.start is not None and self.next > self.start:
+            candidates.append(self.next - 1)
+        return max(candidates) if candidates else None
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,7 @@ class Door:
         max: int = 1000,
         signal_ids: list[str] | None = None,
         contracts: Iterable[str] | None = None,
+        topics: Iterable[str] | None = None,
         from_offset: int | None = None,
     ) -> Page:
         """``GET /fetch`` — read FORWARD from ``cursor``'s stored position.
@@ -203,7 +209,9 @@ class Door:
         sent as repeated ``signal_id`` query params and is valid only when
         ``stream == "metrics"`` (the door rejects it otherwise).
         ``contracts`` keeps only records of those contracts (colca 0.18+);
-        ``next`` still moves past the others. ``from_offset`` reads ahead of
+        ``next`` still moves past the others. ``topics`` keeps records whose
+        topic matches one of the MQTT filters (colca 0.19+; older nodes ignore
+        it and return every record). ``from_offset`` reads ahead of
         the cursor, never behind it (colca 0.18.2+; older nodes ignore it and
         leave :attr:`Page.start` unset).
         """
@@ -218,6 +226,8 @@ class Door:
             params.append(("signal_id", signal_id))
         for contract in contracts or []:
             params.append(("contract", contract))
+        for topic in topics or []:
+            params.append(("topic", topic))
         resp = self._client.get("/fetch", params=params)
         resp.raise_for_status()
         body = resp.json()
@@ -397,8 +407,8 @@ class Stream:
     idempotent. Iteration stops at the first empty page.
 
     :meth:`ack` commits before the page boundary if needed. :meth:`follow`
-    repeats the drain, sleeping ``poll_interval`` after an empty page. A pruned
-    range (``Page.gap``) is logged as a warning.
+    repeats the drain whenever a :class:`chaski.Doorbell` rings; nothing is
+    read on a timer. A pruned range (``Page.gap``) is logged as a warning.
     """
 
     def __init__(
@@ -409,12 +419,14 @@ class Stream:
         *,
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
+        topics: Iterable[str] | None = None,
     ) -> None:
         self._door = door
         self.name = name
         self.cursor = cursor
         self._max = max
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
+        self._topics = list(topics) if topics is not None else None
 
     @property
     def page_size(self) -> int:
@@ -424,11 +436,12 @@ class Stream:
     def fetch(self, *, from_offset: int | None = None) -> Page:
         """One page from the cursor's stored position, or from ``from_offset``
         when that lies ahead of it. Never moves the cursor."""
-        if from_offset is None:
-            return self._door.fetch(self.name, self.cursor, max=self._max, signal_ids=self._signal_ids)
-        return self._door.fetch(
-            self.name, self.cursor, max=self._max, signal_ids=self._signal_ids, from_offset=from_offset
-        )
+        options: dict[str, Any] = {"max": self._max, "signal_ids": self._signal_ids}
+        if self._topics is not None:
+            options["topics"] = self._topics
+        if from_offset is not None:
+            options["from_offset"] = from_offset
+        return self._door.fetch(self.name, self.cursor, **options)
 
     def ack(self, upto: Record | int) -> bool:
         """Ack ``upto`` (a record, or its offset) as the last PROCESSED
@@ -468,14 +481,16 @@ class Stream:
                 return
             self._door.ack(self.name, self.cursor, ack_offset)
 
-    def follow(self, *, poll_interval: float = 1.0, stop: threading.Event | None = None) -> Iterator[Record]:
-        """:meth:`drain` forever — after an empty page, sleep ``poll_interval``
-        (waking early when ``stop`` is set) and drain again. Ends when
-        ``stop`` is set."""
-        # A plain sleep between drains; a consumer with its own wake-up calls
-        # drain() itself.
+    def follow(self, bell: Doorbell, *, stop: threading.Event | None = None) -> Iterator[Record]:
+        """:meth:`drain` now, then again after every ring of ``bell``, until
+        ``stop`` is set. Nothing is read on a timer: ring the bell from the
+        MQTT subscription to the topics this stream reads and on every
+        reconnect. The generation is taken before each drain, so a ring during
+        a drain is not lost. To end it, set ``stop`` and ring."""
         stop = stop or threading.Event()
         while not stop.is_set():
+            seen = bell.generation
             yield from self.drain()
-            if stop.wait(poll_interval):
+            if stop.is_set():
                 return
+            bell.wait_after(seen)

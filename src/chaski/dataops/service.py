@@ -48,8 +48,8 @@ Startup order inside :meth:`DataOpsService.serve`:
     alone
  8. retire the previous generation's ingest cursor, if one is known
  9. start the ingest task, and resolve again whenever the live index changes
-    (:func:`follow_index`); without one, retry inputs that did not resolve
-    every 15 s (:func:`reresolve_loop`)
+    (:func:`follow_index`); without one, whenever a ``_Signal`` record under
+    the service changes, and after every reconnect
  10. subscribe every ``@on_constant``/``@on_signal`` trigger
      (:mod:`chaski.dataops.watch`); the input topics that wake the ingest
      are subscribed when its stream opens (step 8)
@@ -309,8 +309,8 @@ def _resolve_dispatch(
     only by ticks still needs its inputs in the buffer.
 
     ``unresolved`` counts inputs that could not be resolved. They are logged,
-    left out of both, and retried by :func:`reresolve_loop`; producers often
-    start before their signals are commissioned.
+    left out of both, and resolved again by :func:`follow_index` once they
+    are commissioned; producers often start before their signals are.
     """
     dispatch: dict[str, list] = {}
     signal_ids: dict[str, None] = {}  # ordered de-dup, dict as a set
@@ -370,37 +370,6 @@ def _resolve_dispatch(
     return dispatch, list(signal_ids), unresolved
 
 
-async def reresolve_loop(
-    runtime: Runtime,
-    instances: list[Producer],
-    ingest,
-    stop: asyncio.Event,
-    ensure_running,
-    interval_s: float = 15.0,
-) -> None:
-    """Retry the inputs that did not resolve, until they all do.
-
-    Without this, a producer started before its signals were commissioned
-    would keep an empty dispatch table. Stops once everything resolves.
-    """
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval_s)
-            return  # stop was set
-        except TimeoutError:
-            pass
-
-        # A resolution pass is a KV read over sync httpx — worker thread,
-        # not the loop that owns every timer in the process.
-        dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, runtime, instances)
-        if signal_ids:
-            ingest.rebind(dispatch, signal_ids)
-            ensure_running()
-        if not unresolved:
-            log.info("Every declared input resolved — dispatch now covers %d signal(s).", len(dispatch))
-            return
-
-
 def _set_threadsafe(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
     loop.call_soon_threadsafe(event.set)
 
@@ -421,13 +390,16 @@ async def follow_index(
     bound: tuple,
     settle_s: float = INDEX_SETTLE_S,
 ) -> None:
-    """Resolve again whenever the live resolution index changes, instead of
-    on a timer: a signal that is commissioned, moved, rebound or retired
-    reaches the dispatch table and the fetch filter within ``settle_s``.
+    """Resolve again whenever ``changed`` is set, instead of on a timer: a
+    signal that is commissioned, moved, rebound or retired reaches the
+    dispatch table and the fetch filter within ``settle_s``.
 
-    Each pass reads the index, not KV. The ingest is rebound only when the
-    fetch filter or the dispatch table actually changed; ``bound`` is what it
-    holds now (:func:`_bound_shape`).
+    ``changed`` is set by the live resolution index, and each pass reads the
+    index. A service without one (placed, external) sets it for every
+    ``_Signal`` record under it and after every reconnect, and each pass reads
+    KV. The ingest is rebound only when the fetch filter or the dispatch
+    table actually changed; ``bound`` is what it holds now
+    (:func:`_bound_shape`).
     """
     while not stop.is_set():
         waiters = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(stop.wait())]
@@ -693,8 +665,8 @@ class DataOpsService(Service):
     directory, ``~/.colca/services/<name>``); ``retention`` is the broker's
     metrics retention in seconds, what a declared window is validated
     against; ``historian`` an optional read-only
-    :class:`~chaski.dataops.inputs.Historian`; ``poll_interval``/
-    ``trim_interval`` the ingest poll and buffer-trim cadences;
+    :class:`~chaski.dataops.inputs.Historian`; ``trim_interval`` the
+    buffer-trim cadence;
     ``health_port`` the health door (``0`` for an ephemeral port);
     ``live_index=False`` resolves from a KV read per pass instead of the live
     index (:meth:`_open_live_index`). Every other keyword is the base class's.
@@ -709,7 +681,6 @@ class DataOpsService(Service):
         data_dir: Path | None = None,
         retention: float | None = None,
         historian: Historian | None = None,
-        poll_interval: float = 1.0,
         trim_interval: float = 3600.0,
         health_port: int = health.PORT_DEFAULT,
         live_index: bool = True,
@@ -724,7 +695,6 @@ class DataOpsService(Service):
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
         self._historian = historian
-        self._poll_interval_s = poll_interval
         self._trim_interval_s = trim_interval
         self._health_port = health_port
         self._producers: dict[str, type[Producer]] = {}
@@ -885,12 +855,15 @@ class DataOpsService(Service):
         ones no longer read. Called whenever the ingest stream (re)opens, so a
         late-resolved input starts waking the ingest from then on.
 
-        QoS 0: a lost message costs one wake, which the poll interval covers.
+        QoS 1 on the service's persistent session, so a wake is not dropped on
+        the way. Nothing reads on a timer behind it: a reconnect wakes the
+        ingest, and a consumer that stops reading anyway is reported by the
+        node's cursor watchdog.
 
         The topics come from ``/kv``, which the node rate-limits. A transport
         error there (429, 5xx, a timeout) keeps the topics already
-        subscribed and retries with backoff, or sooner if the inputs rebind;
-        until then the poll interval covers the wakes that are missed.
+        subscribed and retries with backoff, or sooner if the inputs rebind.
+        The ingest is woken once the retry subscribed, for what arrived before.
         """
         client = self._client
         if client is None:
@@ -914,14 +887,18 @@ class DataOpsService(Service):
         self._wake_failures = 0
         if len(topics) < len(signal_ids):
             log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
-        for topic in sorted(topics - self._wake_topics):
+        added = sorted(topics - self._wake_topics)
+        for topic in added:
             client.message_callback_add(topic, self._on_input_metric)
-            client.subscribe(topic, qos=0)
+            client.subscribe(topic, qos=1)
         for topic in sorted(self._wake_topics - topics):
             client.message_callback_remove(topic)
             client.unsubscribe(topic)
         self._wake_topics = topics
         log.info("ingest wakes on %d input topic(s)", len(topics))
+        if added and self._ingest is not None:
+            # Records may have arrived before the subscription existed.
+            self._ingest.wake()
 
     def _cancel_wake_retry(self) -> None:
         if self._wake_retry is not None:
@@ -980,7 +957,16 @@ class DataOpsService(Service):
         index = self._index
         if index is not None:
             index.observe(str(message.topic), message.payload)
+        else:
+            self._resolution_changed()
         super()._on_signal(message)
+
+    def _resolution_changed(self) -> None:
+        """Without a live index: resolve again (a ``_Signal`` changed, or the
+        broker link came back). Safe from any thread."""
+        loop, changed = self._loop, self._index_changed
+        if loop is not None and changed is not None:
+            _set_threadsafe(loop, changed)
 
     def _on_index_record(self, message: Any) -> None:
         index = self._index
@@ -1057,19 +1043,21 @@ class DataOpsService(Service):
         handlers = commands.gather(instances)
         if not handlers:
             return None
+        node_id = cast(str, self._node_id)
+        topics = commands.command_topics(handlers, node_id)
         executor = commands.CommandExecutor(
             self.door,
             self.send,
-            self.stream(commands.STREAM, cursor=commands.CURSOR),
+            self.stream(commands.STREAM, cursor=commands.CURSOR, topics=topics),
             handlers,
-            cast(str, self._node_id),
+            node_id,
         )
-        executor.subscribe(self._started_client, cast(asyncio.AbstractEventLoop, self._loop))
+        executor.subscribe(self._started_client)
         return executor
 
     def _broker_state_changed(self, connected: bool) -> None:
-        """Back on the broker: commands sent while the link was down only
-        rang a bell nobody heard, so drain once."""
+        """Back on the broker: commands and input metrics sent while the link
+        was down only rang a bell nobody heard, so drain both once."""
         super()._broker_state_changed(connected)
         index, loop = self._index, self._loop
         if index is not None and loop is not None:
@@ -1077,9 +1065,14 @@ class DataOpsService(Service):
             index.suspend()
             if connected:
                 loop.call_soon_threadsafe(self._seed_index)
-        loop, executor = self._loop, self._commands
-        if connected and loop is not None and executor is not None:
-            loop.call_soon_threadsafe(executor.wake)
+        if connected and index is None:
+            self._resolution_changed()
+        executor, ingest = self._commands, self._ingest
+        if connected and executor is not None:
+            executor.wake()
+        if connected and ingest is not None:
+            # Wakes published while the link was down reached nobody.
+            ingest.wake()
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
@@ -1093,7 +1086,11 @@ class DataOpsService(Service):
         # The infrastructure stays live while a fresh deployment waits for its
         # first timeline/beacon. Producer setup may read application time, so it
         # must not run in a different clock domain or be skipped at startup.
-        health_state = health.HealthState(generation=self.buffer.generation, broker_connected=self.is_broker_connected)
+        health_state = health.HealthState(
+            generation=self.buffer.generation,
+            broker_connected=self.is_broker_connected,
+            cursor_lag=lambda: self.cursor_lag,
+        )
         health_server = None
         try:
             health_server = await health.serve(health_state, port=self._health_port)
@@ -1166,7 +1163,6 @@ class DataOpsService(Service):
                 self.buffer,
                 dispatch=dispatch,
                 signal_ids=signal_ids or None,
-                poll_interval_s=self._poll_interval_s,
                 # A lost buffer's generation cannot be recovered, so nothing knows
                 # the previous cursor yet and retiring it is a no-op.
                 previous_generation=None,
@@ -1177,10 +1173,8 @@ class DataOpsService(Service):
 
             # 9) Start ingest in the background and keep retrying unresolved inputs.
             health_state.producers = len(instances)
-            health_state.last_drain_at = (
-                (lambda: self._step_loop_last) if self.step is not None else (lambda: ingest.last_drain_at)
-            )
-            health_state.stall_after_s = max(health.STALL_AFTER_MIN_S, 10 * self._poll_interval_s)
+            if self.step is not None:
+                health_state.last_drain_at = lambda: self._step_loop_last
             ingest_task: asyncio.Task | None = None
             if self.step is not None:
                 ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
@@ -1201,8 +1195,10 @@ class DataOpsService(Service):
                     log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
             reresolve_task: asyncio.Task | None = None
-            if self._index_changed is not None and self.step is None:
-                # Resolve again when the index changes, not on a timer.
+            if self.step is None:
+                # Resolve again when the index or a _Signal changes, not on a timer.
+                if self._index_changed is None:
+                    self._index_changed = asyncio.Event()
                 reresolve_task = asyncio.ensure_future(
                     follow_index(
                         self,
@@ -1218,11 +1214,6 @@ class DataOpsService(Service):
                     log.info(
                         "%d declared input(s) unresolved — resolving again when they are commissioned.", unresolved
                     )
-            elif unresolved:
-                log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
-                reresolve_task = asyncio.ensure_future(
-                    reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
-                )
 
             # 10) Every @on_constant/@on_signal subscription, and the @on_command
             #     executor with its wake-ups.

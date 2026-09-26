@@ -88,9 +88,9 @@ async def test_a_dead_ingest_loop_turns_the_probe_503():
 
 
 @run_async
-async def test_an_ingest_loop_that_stopped_draining_turns_the_probe_503():
-    """Alive is not enough: a loop stuck on a door that never answers, or
-    retrying the same error for ever, has stopped finishing drains."""
+async def test_a_coordinated_step_loop_that_stopped_turns_the_probe_503():
+    """In coordinated step mode alive is not enough: a step loop stuck on a
+    door that never answers has stopped finishing steps."""
     last_drain = [time.monotonic() - 301.0]
     state = HealthState(last_drain_at=lambda: last_drain[0], stall_after_s=300.0)
     state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
@@ -129,3 +129,30 @@ def test_a_broker_link_down_past_the_grace_period_fails_the_probe(monkeypatch):
     assert state.healthy() and state.snapshot()["broker"] == "connected"
     connected[0] = False
     assert state.healthy(), "a new outage starts its own grace period"
+
+
+@run_async
+async def test_the_nodes_cursor_lag_finding_turns_the_probe_503_and_an_idle_stream_does_not():
+    """Records this service reads that wait unread past the node's threshold
+    fail the probe; an ingest that has had nothing to read for an hour is
+    healthy, because only waiting records count."""
+    lag = ["historian has records on metrics waiting 75 s that it has not read"]
+    state = HealthState(cursor_lag=lambda: lag[0])
+    state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
+    port = _free_port()
+    server = await serve(state, port=port)
+    try:
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 503, body
+        assert body["ok"] is False
+        assert body["cursor_lag"] == lag[0]
+
+        lag[0] = ""  # the node retired the finding: caught up, or simply idle
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 200, body
+        assert body["ingest"] == "running"
+        assert "cursor_lag" not in body and "since_drain_s" not in body
+    finally:
+        state.ingest_task.cancel()
+        server.close()
+        await server.wait_closed()

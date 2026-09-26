@@ -98,6 +98,13 @@ with chaski.Service("shift-report", mount="site1/reports") as svc:
         stream.ack(record)         # the cursor moves only when you say so
 ```
 
+A consumer that keeps up with a stream reads when woken, never on a timer:
+ring a `chaski.Doorbell` from the MQTT subscription to the topics the stream
+reads and on every reconnect, and `stream.follow(bell)` drains after each ring.
+Pass the same topics as `svc.stream(..., topics=[...])`. A consumer that stops
+reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
+`svc.cursor_lag` follows and a `DataOpsService` health door fails on.
+
 ## Poll a source
 
 A driver implements four `async` methods: `connect()`, `discover()` (the tags

@@ -14,7 +14,9 @@ record's ``actor_id``/``actor_label``/``actor_kind`` to the handler.
 **MQTT only rings the bell.** Each declared command topic is subscribed at
 QoS 1; a message wakes a drain of the stream and is not read itself. The
 executor drains once at startup, once per wake and once after the broker link
-comes back. There is no timed poll.
+comes back. There is no timed poll. The stream is read with the same topics
+as a filter (colca 0.19+), so commands to other services neither cost a read
+nor count as unread on this cursor.
 
 **Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
 with ``{correlation_id, result_code, message, performed_at}``:
@@ -54,6 +56,7 @@ from colca_data_contracts import topic_prefix
 
 from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream
+from chaski.doorbell import Doorbell
 
 from . import resolve
 from .base import Producer
@@ -131,6 +134,12 @@ def declared_routes(producer_classes: Iterable[type[Producer]]) -> list[tuple[st
     return sorted(routes)
 
 
+def command_topics(handlers: Iterable[tuple[str, str]], node_id: str) -> list[str]:
+    """The topic of every ``(contract, path)`` command at ``node_id``: what
+    the executor subscribes to as a wake-up and reads the stream by."""
+    return sorted(f"{topic_prefix()}{contract}/{node_id}/{path}" for contract, path in handlers)
+
+
 def parse_topic(topic: str) -> tuple[str, str] | None:
     """``(contract, path)`` of ``<root>/v1/<contract>/<owner>/<path...>``,
     or ``None`` for anything shorter."""
@@ -174,23 +183,23 @@ class CommandExecutor:
         self._stream = stream
         self._handlers = handlers
         self._node_id = node_id
-        self._wake = asyncio.Event()
+        self._bell = Doorbell()
 
     # -- topics -------------------------------------------------------------
 
     def command_topics(self) -> list[str]:
-        return sorted(f"{topic_prefix()}{contract}/{self._node_id}/{path}" for contract, path in self._handlers)
+        return command_topics(self._handlers, self._node_id)
 
     def ack_topic(self, path: str) -> str:
         return f"{topic_prefix()}_Ack/{self._node_id}/{path}"
 
-    def subscribe(self, client: Any, loop: asyncio.AbstractEventLoop) -> int:
+    def subscribe(self, client: Any) -> int:
         """Subscribe every declared command topic as a wake-up. The payload
         is not decoded: the stream record is what gets executed. A refused
         SUBACK is retried by the service's :class:`chaski.subscriptions.Subscriptions`."""
 
         def _ring(_client: Any, _userdata: Any, _message: Any) -> None:
-            loop.call_soon_threadsafe(self.wake)
+            self.wake()
 
         topics = self.command_topics()
         for topic in topics:
@@ -200,29 +209,19 @@ class CommandExecutor:
         return len(topics)
 
     def wake(self) -> None:
-        """New commands may be waiting. From another thread, call it through
-        ``loop.call_soon_threadsafe``."""
-        self._wake.set()
+        """New commands may be waiting. Safe from any thread."""
+        self._bell.ring()
 
     # -- loop -----------------------------------------------------------------
 
     async def run_forever(self, stop: asyncio.Event) -> None:
-        """Drain now, then once per wake, until ``stop``. A door failure is
-        retried with backoff; the unacked page is read again."""
+        """Drain now, then once per wake, until ``stop``. The wake generation
+        is taken before each drain, so a wake during a drain leads to one more.
+        A door failure is retried with backoff; the unacked page is read
+        again."""
         errors = 0
-        self._wake.set()
         while not stop.is_set():
-            wake_task = asyncio.ensure_future(self._wake.wait())
-            stop_task = asyncio.ensure_future(stop.wait())
-            try:
-                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                for task in (wake_task, stop_task):
-                    if not task.done():
-                        task.cancel()
-            if stop.is_set():
-                return
-            self._wake.clear()
+            seen = self._bell.generation
             try:
                 await self.drain()
                 errors = 0
@@ -232,7 +231,15 @@ class CommandExecutor:
                 log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", errors, exc, backoff)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=backoff)
-                self._wake.set()
+                continue
+            wake_task = asyncio.ensure_future(self._bell.after(seen))
+            stop_task = asyncio.ensure_future(stop.wait())
+            try:
+                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (wake_task, stop_task):
+                    if not task.done():
+                        task.cancel()
 
     async def drain(self) -> int:
         """Handle every command up to the head of the stream, acking page by
