@@ -16,6 +16,13 @@ QoS 1; a message wakes a drain of the stream and is not read itself. The
 executor drains once at startup, once per wake and once after the broker link
 comes back. There is no timed poll.
 
+**The stream rings it too.** The ``commands`` stream carries every command at
+the node, and the cursor must pass the ones this service does not execute, or
+it stands behind them, counted as unread, until the next command of its own
+comes. The executor follows the stream's growth over ``GET /watch``
+(:meth:`CommandExecutor.watch`) and reads only its declared contracts; the
+cursor is acked to the end of what the node scanned (:attr:`Page.ack_offset`).
+
 **Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
 with ``{correlation_id, result_code, message, performed_at}``:
 
@@ -44,6 +51,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -72,6 +81,14 @@ ACK_BUSY = 503
 _QOS = 1
 #: Upper bound on the retry backoff after the door failed.
 _ERROR_BACKOFF_MAX_S = 30.0
+#: How far apart the node sends stream-growth hints at most; what grows in
+#: between is one hint.
+WATCH_INTERVAL_MS = 1000
+
+
+def contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
+    """The command contracts ``handlers`` execute: what the executor's stream reads."""
+    return sorted({contract for contract, _path in handlers})
 
 
 @dataclass(frozen=True)
@@ -206,9 +223,38 @@ class CommandExecutor:
 
     # -- loop -----------------------------------------------------------------
 
+    def watch(self, loop: asyncio.AbstractEventLoop, stop: threading.Event) -> None:
+        """Wake a drain whenever the ``commands`` stream grows, until ``stop``.
+        Blocking, for a thread. A lost connection is opened again after a
+        backoff with jitter; the first hint of a new one names the stream, so a
+        command sent meanwhile is drained then."""
+        backoff = 0.5
+        while not stop.is_set():
+            try:
+                for _hint in self._door.watch([STREAM], interval_ms=WATCH_INTERVAL_MS):
+                    backoff = 0.5
+                    loop.call_soon_threadsafe(self.wake)
+                    if stop.is_set():
+                        return
+            except Exception as exc:  # noqa: BLE001 - reconnected below
+                log.debug("commands: stream watch ended (%s), reconnecting in %.1fs", exc, backoff)
+            if stop.wait(backoff * random.uniform(1.0, 1.5)):
+                return
+            backoff = min(2 * backoff, _ERROR_BACKOFF_MAX_S)
+
     async def run_forever(self, stop: asyncio.Event) -> None:
         """Drain now, then once per wake, until ``stop``. A door failure is
         retried with backoff; the unacked page is read again."""
+        watching = threading.Event()
+        threading.Thread(
+            target=self.watch, args=(asyncio.get_running_loop(), watching), name="commands-watch", daemon=True
+        ).start()
+        try:
+            await self._serve(stop)
+        finally:
+            watching.set()
+
+    async def _serve(self, stop: asyncio.Event) -> None:
         errors = 0
         self._wake.set()
         while not stop.is_set():

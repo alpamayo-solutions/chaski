@@ -13,6 +13,7 @@ from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 
 from chaski.dataops import Command, CommandRejected, on_command, resolve
 from chaski.dataops.base import Producer
+from chaski.dataops import commands
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
 from chaski.door import Page, Record, Stream
@@ -230,6 +231,50 @@ async def test_undeclared_commands_are_skipped_but_the_cursor_moves():
     assert len(door.published) == 1
     # One ack of the cursor, after the whole page.
     assert door.acked == [("commands", CURSOR, 3)]
+
+
+@run_async
+async def test_commands_of_other_services_move_the_cursor_past_them():
+    """Load test round 2: `c/<service>/commands` stood 8 and 14 records behind,
+    up to 53 min, behind commands other services execute."""
+    ex, producer, door = executor()
+    door.queue(Page(records=[], next=15, start=1))
+    await ex.drain()
+    assert producer.seen == []
+    assert door.acked == [("commands", CURSOR, 14)]
+
+
+def test_the_stream_reads_only_the_declared_command_contracts():
+    door = FakeDoor()
+    producer = Selection().attach(FakeRuntime(door, buffer=None))
+    handlers = gather([producer])
+    Stream(door, "commands", CURSOR, contracts=commands.contracts(handlers)).fetch()
+    assert door.fetch_calls[-1]["contracts"] == ["_CmdParam"]
+
+
+@run_async
+async def test_the_stream_growing_wakes_a_drain():
+    """A command of another service rings no MQTT bell here; the stream's growth does."""
+    ex, _producer, door = executor()
+    hints = [asyncio.Event()]
+
+    def watch(streams, *, interval_ms=None):
+        assert streams == ["commands"]
+        door.queue(Page(records=[], next=8, start=1))
+        yield object()
+        hints[0].set()
+
+    door.watch = watch
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if ("commands", CURSOR, 7) in door.acked:
+            break
+    stop.set()
+    ex.wake()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert ("commands", CURSOR, 7) in door.acked
 
 
 @run_async

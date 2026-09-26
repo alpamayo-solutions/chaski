@@ -1061,6 +1061,7 @@ class Service:
         cursor: str | None = None,
         max: int = 1000,
         signal_ids: Iterable[str] | None = None,
+        contracts: Iterable[str] | None = None,
     ) -> Stream:
         """A named, durable cursor over the node's stream ``name``
         (``metrics``, ``annotations``, ``alarms``, ...) — see
@@ -1070,8 +1071,8 @@ class Service:
         to the stream's name. Pass another name to follow a stream twice or to
         start fresh (``svc.stream("metrics", cursor="ingest-02")``), and retire
         the old one with ``Stream.retire()``. ``max`` bounds one page.
-        ``signal_ids`` filters the ``metrics`` stream at the door. Requires
-        :meth:`start`.
+        ``signal_ids`` filters the ``metrics`` stream at the door, ``contracts``
+        any stream (colca 0.18+). Requires :meth:`start`.
         """
         door = self._require_http("stream")
         return Stream(
@@ -1080,6 +1081,7 @@ class Service:
             self.cursor_prefix + (cursor or name),
             max=max,
             signal_ids=signal_ids,
+            contracts=contracts,
         )
 
     def pending(self) -> list[tuple[str, str]]:
