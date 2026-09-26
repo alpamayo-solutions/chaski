@@ -33,8 +33,10 @@ Startup order inside :meth:`DataOpsService.serve`:
  1. ``start()``: connect, register, open the door, then open the buffer
  2. instantiate every producer, attach it and run ``setup()``; a producer
     whose ``setup()`` raises is skipped with a logged reason
- 3. publish the ``SignalOutput`` catalogue if it changed, and bind every
-    output, ``AnnotationOutput`` included
+ 3. open the live resolution index (an unplaced local service: one KV read,
+    then the node's retained ``_SystemElement``/``_Signal``/``_AnnotationType``
+    records over MQTT), publish the ``SignalOutput`` catalogue if it changed,
+    and bind every output, ``AnnotationOutput`` included
  4. run every producer's ``on_ready()`` — outputs are bound, and no trigger
     has fired yet, so this is where startup compute belongs
  5. check every input window against the broker's metrics retention
@@ -45,7 +47,9 @@ Startup order inside :meth:`DataOpsService.serve`:
     buffered records through the live handlers. Unchanged producers are left
     alone
  8. retire the previous generation's ingest cursor, if one is known
- 9. start the ingest task, and a retry loop for inputs that did not resolve
+ 9. start the ingest task, and resolve again whenever the live index changes
+    (:func:`follow_index`); without one, retry inputs that did not resolve
+    every 15 s (:func:`reresolve_loop`)
  10. subscribe every ``@on_constant``/``@on_signal`` trigger
      (:mod:`chaski.dataops.watch`); the input topics that wake the ingest
      are subscribed when its stream opens (step 8)
@@ -75,6 +79,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
+from colca_data_contracts.root import topic_prefix
 
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
@@ -84,7 +89,7 @@ from .base import Producer, Runtime, runtime_now
 from .buffer import Buffer
 from .ingest import Ingest
 from .inputs import Historian, declared_inputs, validate_windows
-from .outputs import bind_annotation_outputs, build_catalogue, declared_outputs
+from .outputs import bind_annotation_outputs, build_catalogue, resolved_outputs
 from .scheduling import run_due, run_periodic, timer_key
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
@@ -99,6 +104,12 @@ WAKE_RETRY_MAX_S = 30.0
 #: colca's default metrics retention — what a declared window is checked
 #: against when the service is given no ``retention=`` of its own.
 DEFAULT_RETENTION_S = 14 * 24 * 3600.0
+#: After a change to the resolution index, wait this long for the rest of a
+#: burst (a plant model applied, a batch of bindings) before resolving again.
+INDEX_SETTLE_S = 0.5
+#: A failed seed of the resolution index is retried after this long,
+#: doubling per consecutive failure up to :data:`WAKE_RETRY_MAX_S`.
+INDEX_RETRY_S = 1.0
 _METRIC_FIELDS = {f.name for f in fields(Metric)}
 
 
@@ -274,12 +285,12 @@ def build_dispatch(
 
 def forget_resolved(instances: list[Producer]) -> None:
     """Drop every held id, inputs and outputs together, so this pass resolves
-    them again. Called only when `build_dispatch` pinned a fresh KV read.
+    them again. Called only when `build_dispatch` pinned a fresh index.
     """
     for instance in instances:
         for _name, declared_input in declared_inputs(instance):
             declared_input.forget()
-        for _name, declared_output in declared_outputs(instance):
+        for _name, declared_output in resolved_outputs(instance):
             declared_output.forget()
 
 
@@ -388,6 +399,63 @@ async def reresolve_loop(
         if not unresolved:
             log.info("Every declared input resolved — dispatch now covers %d signal(s).", len(dispatch))
             return
+
+
+def _set_threadsafe(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
+    loop.call_soon_threadsafe(event.set)
+
+
+def _bound_shape(dispatch: dict[str, list], signal_ids: list[str]) -> tuple:
+    """What a rebind changes: the fetch filter and how many handlers each
+    signal dispatches to. The handlers themselves are new closures every pass."""
+    return (tuple(sorted(signal_ids)), tuple(sorted((sid, len(h)) for sid, h in dispatch.items())))
+
+
+async def follow_index(
+    runtime: Runtime,
+    instances: list[Producer],
+    ingest,
+    stop: asyncio.Event,
+    ensure_running,
+    changed: asyncio.Event,
+    bound: tuple,
+    settle_s: float = INDEX_SETTLE_S,
+) -> None:
+    """Resolve again whenever the live resolution index changes, instead of
+    on a timer: a signal that is commissioned, moved, rebound or retired
+    reaches the dispatch table and the fetch filter within ``settle_s``.
+
+    Each pass reads the index, not KV. The ingest is rebound only when the
+    fetch filter or the dispatch table actually changed; ``bound`` is what it
+    holds now (:func:`_bound_shape`).
+    """
+    while not stop.is_set():
+        waiters = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(stop.wait())]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        if stop.is_set():
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=settle_s)
+            return
+        changed.clear()
+        dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, runtime, instances)
+        shape = _bound_shape(dispatch, signal_ids)
+        if shape == bound or not signal_ids:
+            # No signal ids would fetch every metric on the node: keep the
+            # filter as it is until something resolves again.
+            continue
+        bound = shape
+        log.info(
+            "Resolution index changed — dispatch now covers %d signal(s), %d input(s) unresolved.",
+            len(dispatch),
+            unresolved,
+        )
+        ingest.rebind(dispatch, signal_ids)
+        ensure_running()
 
 
 def compute_trim_horizons(
@@ -627,8 +695,9 @@ class DataOpsService(Service):
     against; ``historian`` an optional read-only
     :class:`~chaski.dataops.inputs.Historian`; ``poll_interval``/
     ``trim_interval`` the ingest poll and buffer-trim cadences;
-    ``health_port`` the health door (``0`` for an ephemeral port). Every
-    other keyword is the base class's.
+    ``health_port`` the health door (``0`` for an ephemeral port);
+    ``live_index=False`` resolves from a KV read per pass instead of the live
+    index (:meth:`_open_live_index`). Every other keyword is the base class's.
     """
 
     def __init__(
@@ -643,9 +712,15 @@ class DataOpsService(Service):
         poll_interval: float = 1.0,
         trim_interval: float = 3600.0,
         health_port: int = health.PORT_DEFAULT,
+        live_index: bool = True,
         **service_kw: Any,
     ) -> None:
         super().__init__(name, mount, node=node, **service_kw)
+        self._live_index_enabled = live_index
+        self._index: resolve.LiveIndex | None = None
+        self._index_failures = 0
+        self._index_retry: asyncio.TimerHandle | None = None
+        self._index_changed: asyncio.Event | None = None
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
         self._historian = historian
@@ -753,6 +828,10 @@ class DataOpsService(Service):
 
     def close(self) -> None:
         self._cancel_wake_retry()
+        self._cancel_index_retry()
+        if self._index is not None and self._http is not None:
+            resolve.attach(self._http, None)
+        self._index = None
         super().close()
         if self._local_buffer is not None:
             self._local_buffer.close()
@@ -860,6 +939,97 @@ class DataOpsService(Service):
         if self._ingest is not None:
             self._ingest.wake()
 
+    # -- the live resolution index ----------------------------------------
+
+    def _open_live_index(self) -> resolve.LiveIndex | None:
+        """Keep the resolution index current from the node's retained
+        records, so resolving reads no KV in steady state.
+
+        Only a service that may read the whole node can: an unplaced local
+        service. The node refuses a node-wide subscription to anyone else,
+        and a placed or external service may read records outside its own
+        subtree through grants it cannot see, so it keeps reading KV per pass.
+
+        ``_Signal`` arrives on the service's own node-wide subscription
+        (:meth:`_on_signal`); ``_SystemElement`` and ``_AnnotationType`` get
+        one each. The seed runs after they are made, so nothing written in
+        between is missed.
+        """
+        if not self._live_index_enabled or self._external or self._resolved_mount or self._system_element_id:
+            log.info("resolution reads KV per pass (live index needs an unplaced local service)")
+            return None
+        index = resolve.LiveIndex(self.door)
+        self._index = index
+        client = self._started_client
+        for contract in ("_SystemElement", "_AnnotationType"):
+            client.subscribe(f"{topic_prefix()}{contract}/{self._node_id}/#", qos=1, callback=self._on_index_record)
+        loop = self._loop
+        if loop is not None:
+            self._index_changed = asyncio.Event()
+            changed = self._index_changed
+            index.add_listener(lambda: _set_threadsafe(loop, changed))
+        resolve.attach(self.door, index)
+        return index
+
+    def _on_signal(self, message: Any) -> None:
+        index = self._index
+        if index is not None:
+            index.observe(str(message.topic), message.payload)
+        super()._on_signal(message)
+
+    def _on_index_record(self, message: Any) -> None:
+        index = self._index
+        if index is not None:
+            index.observe(str(message.topic), message.payload)
+
+    def _seed_index(self) -> None:
+        """Seed the live index off the loop; on a failure (a 429 at start),
+        resolution keeps reading KV and the seed is retried with backoff."""
+        index, loop = self._index, self._loop
+        if index is None or loop is None:
+            return
+        self._cancel_index_retry()
+
+        def _seed() -> None:
+            if self._resolved_mount or self._system_element_id:
+                # Placed on a reconnect: the node-wide view is no longer ours.
+                loop.call_soon_threadsafe(self._close_live_index)
+                return
+            try:
+                index.seed()
+            except Exception as exc:
+                loop.call_soon_threadsafe(self._index_seed_failed, exc)
+            else:
+                self._index_failures = 0
+
+        loop.run_in_executor(None, _seed)
+
+    def _index_seed_failed(self, exc: Exception) -> None:
+        self._index_failures += 1
+        delay = min(INDEX_RETRY_S * 2 ** (self._index_failures - 1), WAKE_RETRY_MAX_S)
+        log.warning(
+            "Could not seed the resolution index (attempt %d): %s — reading KV per pass, retrying in %.0fs",
+            self._index_failures,
+            exc,
+            delay,
+        )
+        if self._loop is not None and self._index is not None:
+            self._index_retry = self._loop.call_later(delay, self._seed_index)
+
+    def _close_live_index(self) -> None:
+        index = self._index
+        if index is None:
+            return
+        self._index = None
+        self._cancel_index_retry()
+        resolve.attach(self.door, None)
+        log.info("resolution reads KV per pass from now on: the service was placed below the node")
+
+    def _cancel_index_retry(self) -> None:
+        if self._index_retry is not None:
+            self._index_retry.cancel()
+            self._index_retry = None
+
     def _watch_constants_and_signals(self, instances: list[Producer]) -> None:
         """Subscribe every ``@on_constant``/``@on_signal`` trigger declared
         across ``instances`` — see :mod:`chaski.dataops.watch`. A no-op when
@@ -896,6 +1066,12 @@ class DataOpsService(Service):
         """Back on the broker: commands sent while the link was down only
         rang a bell nobody heard, so drain once."""
         super()._broker_state_changed(connected)
+        index, loop = self._index, self._loop
+        if index is not None and loop is not None:
+            # Down, changes can be missed; back, seed again before trusting it.
+            index.suspend()
+            if connected:
+                loop.call_soon_threadsafe(self._seed_index)
         loop, executor = self._loop, self._commands
         if connected and loop is not None and executor is not None:
             loop.call_soon_threadsafe(executor.wake)
@@ -943,7 +1119,15 @@ class DataOpsService(Service):
                 instances.append(instance)
             self.instances = instances
 
-            # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs.
+            # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
+            #    after opening the live resolution index so the bindings the
+            #    node writes for the catalogue arrive on it.
+            index = self._open_live_index()
+            if index is not None:
+                try:
+                    await asyncio.to_thread(index.seed)
+                except Exception as exc:
+                    self._index_seed_failed(exc)
             self.bind_outputs(instances)
 
             # 4) Outputs are bound and no trigger has fired yet: producers do
@@ -1012,7 +1196,24 @@ class DataOpsService(Service):
                     log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
             reresolve_task: asyncio.Task | None = None
-            if unresolved:
+            if self._index_changed is not None and self.step is None:
+                # Resolve again when the index changes, not on a timer.
+                reresolve_task = asyncio.ensure_future(
+                    follow_index(
+                        self,
+                        instances,
+                        ingest,
+                        stop,
+                        _ensure_ingest_running,
+                        self._index_changed,
+                        _bound_shape(dispatch, signal_ids),
+                    )
+                )
+                if unresolved:
+                    log.info(
+                        "%d declared input(s) unresolved — resolving again when they are commissioned.", unresolved
+                    )
+            elif unresolved:
                 log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
                 reresolve_task = asyncio.ensure_future(
                     reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
