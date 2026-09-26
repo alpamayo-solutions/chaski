@@ -13,11 +13,13 @@ replay are therefore the same code path.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +86,7 @@ class Buffer:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._deferred = 0
         self.generation: str = self._load_or_mint_generation()
 
     def close(self) -> None:
@@ -112,13 +115,35 @@ class Buffer:
     # ------------------------------------------------------------------ points
 
     def append(self, signal_id: str, ts: float, value: Any) -> None:
-        """Insert or overwrite one point. Idempotent on ``(signal_id, ts)``."""
+        """Insert or overwrite one point. Idempotent on ``(signal_id, ts)``.
+
+        Committed at once, or at the end of the enclosing :meth:`one_commit`.
+        """
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO points (signal_id, ts, value) VALUES (?, ?, ?)",
                 (signal_id, ts, json.dumps(value)),
             )
-            self._conn.commit()
+            if not self._deferred:
+                self._conn.commit()
+
+    @contextlib.contextmanager
+    def one_commit(self) -> Iterator[None]:
+        """Commit the :meth:`append` calls inside the block once, when it ends.
+
+        Reads inside the block already see the points. A crash inside it loses
+        them, so use it only where they are appended again after a crash, as
+        for a page that is acked after the block.
+        """
+        with self._lock:
+            self._deferred += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._deferred -= 1
+                if not self._deferred:
+                    self._conn.commit()
 
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
         """Points for ``signal_id`` with ``start <= ts < end``, ordered by ts.

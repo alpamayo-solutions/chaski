@@ -15,6 +15,19 @@ uses. The loop opens it again whenever the signal filter changes
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
 
+**Pacing.** :meth:`Ingest.run_forever` fetches again at once after a full
+page, as the loop is behind. After a partial page it waits until
+:data:`MIN_FETCH_INTERVAL_S` has passed since the previous fetch, so a busy
+stream is read in larger pages instead of more requests.
+
+**Read-ahead.** On a node that reads ahead of a cursor (colca 0.18.2+,
+``/fetch?from=``), the page after a full one is fetched while the full one is
+processed, and acks go out in the background: a page is still acked only
+after it was processed, acks only move forward, and while one is in flight
+later pages collapse into a single ack of the newest offset. A failed ack or
+fetch, and a :meth:`Ingest.rebind`, restart the read at the acked cursor. On
+older nodes the loop fetches, processes and acks in turn.
+
 **Gaps.** When the cursor fell below the stream's low-water mark, colca
 returns a ``gap`` with the surviving records. It is logged as a warning with
 the pruned range, and processing continues.
@@ -57,6 +70,12 @@ Handler = Callable[[Record], Awaitable[None]]
 OpenStream = Callable[[str, "list[str] | None"], Stream]
 
 
+#: While pages come back partial, fetches are at least this far apart, so a
+#: busy stream is read in larger pages rather than with more requests. It is
+#: also the most a caught-up record waits for its fetch.
+MIN_FETCH_INTERVAL_S = 0.1
+
+
 def cursor_name(generation: str) -> str:
     """The generational ingest cursor name for one buffer generation —
     relative to the service's cursor namespace."""
@@ -81,6 +100,7 @@ class Ingest:
         poll_interval_s: float = 1.0,
         previous_generation: str | None = None,
         strict: bool = False,
+        min_fetch_interval_s: float = MIN_FETCH_INTERVAL_S,
     ) -> None:
         self.strict = strict
         self._open_stream = open_stream
@@ -96,6 +116,17 @@ class Ingest:
         self._last_drain_at = self._window_started
         self._window_records = 0
         self._window_drains = 0
+        # Read-ahead state (see the module docstring). ``_read_ahead`` is None
+        # until the first page says whether the node supports it.
+        self._read_ahead: bool | None = None
+        self._next_from: int | None = None
+        self._prefetch: tuple[Stream, asyncio.Future[Page]] | None = None
+        self._ack_want: tuple[Stream, int] | None = None
+        self._ack_task: asyncio.Future[None] | None = None
+        self._ack_failed = False
+        self._behind = False
+        self._last_fetch_at = 0.0
+        self._min_fetch_interval_s = min_fetch_interval_s
 
     def rebind(self, dispatch: dict[str, list], signal_ids: Iterable[str] | None) -> None:
         """Swap what this loop dispatches and fetches, mid-run.
@@ -164,24 +195,117 @@ class Ingest:
         order; the page is acked once they are done."""
         stream = self._stream
         page: Page = stream.fetch()
-
-        if page.gap is not None:
-            if self.strict:
-                raise RuntimeError("input stream has a retention gap; refusing incomplete coordinated history")
-            self._log_gap(page.gap)
-
-        for record in page.records:
-            signal_id = self._append(record)
-            if signal_id is not None and self._dispatch.get(signal_id):
-                asyncio.run_coroutine_threadsafe(self._handle(signal_id, record), loop).result()
-
+        processed = self._process(page, loop)
         # See Page.ack_offset: the last record, or the gap's bound when nothing
         # survived it.
         ack_offset = page.ack_offset
         if ack_offset is not None:
             stream.ack(ack_offset)
+        return processed
 
+    def _process(self, page: Page, loop: asyncio.AbstractEventLoop) -> int:
+        """Append every record of ``page`` and run its handlers on ``loop``,
+        in stream order. Runs in a worker thread; does not ack."""
+        if page.gap is not None:
+            if self.strict:
+                raise RuntimeError("input stream has a retention gap; refusing incomplete coordinated history")
+            self._log_gap(page.gap)
+
+        # One commit per page: the page is acked only after it, and a crash
+        # before the ack appends the page again.
+        with self._buffer.one_commit():
+            for record in page.records:
+                signal_id = self._append(record)
+                if signal_id is not None and self._dispatch.get(signal_id):
+                    asyncio.run_coroutine_threadsafe(self._handle(signal_id, record), loop).result()
         return len(page.records)
+
+    # ------------------------------------------------------------------ read-ahead
+
+    async def _step(self) -> int:
+        """One page of :meth:`run_forever`, paced by how full pages come back.
+
+        A full page means the loop is behind: the next fetch follows at once,
+        read ahead while this page is processed where the node supports it. A
+        partial page means it is caught up: the next fetch waits until
+        ``min_fetch_interval_s`` has passed since the previous one, so records
+        collect into larger pages instead of more requests.
+
+        Returns the number of records processed, like :meth:`run_once`.
+        """
+        if self._ack_task is not None and self._ack_task.done():
+            self._ack_task.result()  # an ack that failed with more than an HTTP error ends the loop
+        stream = self._stream
+        if self._ack_failed or (self._prefetch is not None and self._prefetch[0] is not stream):
+            await self._restart_from_cursor()
+        loop = asyncio.get_running_loop()
+
+        if self._prefetch is not None:
+            pending = self._prefetch[1]
+            self._prefetch = None
+            page = await pending
+        else:
+            if not self._behind:
+                wait = self._last_fetch_at + self._min_fetch_interval_s - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._last_fetch_at = time.monotonic()
+            page = await asyncio.to_thread(stream.fetch, from_offset=self._next_from)
+
+        if page.start is None:
+            if self._read_ahead is None:
+                log.info(
+                    "Node does not read ahead of a cursor; ingest fetches and acks in turn (cursor=%s)", self.cursor
+                )
+            self._read_ahead = False
+        else:
+            self._read_ahead = True
+            self._next_from = page.next
+
+        ack_offset = page.ack_offset
+        if ack_offset is None:
+            self._behind = False
+            return 0
+        self._behind = len(page.records) >= stream.page_size
+        if self._behind and self._read_ahead:
+            self._last_fetch_at = time.monotonic()
+            self._prefetch = (stream, asyncio.ensure_future(asyncio.to_thread(stream.fetch, from_offset=page.next)))
+        processed = await asyncio.to_thread(self._process, page, loop)
+        if self._read_ahead:
+            self._queue_ack(stream, ack_offset)
+        else:
+            await asyncio.to_thread(stream.ack, ack_offset)
+        return processed
+
+    def _queue_ack(self, stream: Stream, offset: int) -> None:
+        """Ack ``offset`` in the background. Acks are cumulative, so while one
+        is in flight only the newest wanted offset is kept."""
+        self._ack_want = (stream, offset)
+        if self._ack_task is None or self._ack_task.done():
+            self._ack_task = asyncio.ensure_future(self._send_acks())
+
+    async def _send_acks(self) -> None:
+        while self._ack_want is not None:
+            stream, offset = self._ack_want
+            self._ack_want = None
+            try:
+                await asyncio.to_thread(stream.ack, offset)
+            except httpx.HTTPError as exc:
+                # A later ack covers this one; until then, reading restarts at
+                # the acked cursor so nothing is skipped.
+                self._ack_failed = True
+                log.warning("Ack of offset=%d failed on cursor=%s: %s", offset, stream.cursor, exc)
+
+    async def _restart_from_cursor(self) -> None:
+        """Drop the page read ahead and wait for the acks in flight; the next
+        fetch reads from the acked cursor."""
+        if self._prefetch is not None:
+            self._prefetch[1].cancel()
+            self._prefetch = None
+        if self._ack_task is not None:
+            await self._ack_task
+        self._next_from = None
+        self._ack_failed = False
 
     def _append(self, record: Record) -> str | None:
         """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
@@ -302,10 +426,12 @@ class Ingest:
                 stop_task.cancel()
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
-        """Run :meth:`run_once` until ``stop`` is set.
+        """Process pages until ``stop`` is set.
 
-        Drains without sleeping while fetches return records, then sleeps up
-        to ``poll_interval_s``; :meth:`wake` cuts the sleep short.
+        Drains while fetches return records, paced as the module docstring
+        says, then sleeps up to ``poll_interval_s``; :meth:`wake` cuts the
+        sleep short. Where the node supports it, the page after a full one is
+        read ahead while the full one is processed.
 
         ``httpx.HTTPError`` (colca restarting, a timeout, 429, 5xx) is logged
         and retried with backoff; the unacked page is simply fetched again. Any
@@ -313,11 +439,18 @@ class Ingest:
         to 503.
         """
         stop = stop or asyncio.Event()
+        try:
+            await self._run(stop)
+        finally:
+            await self._restart_from_cursor()
+
+    async def _run(self, stop: asyncio.Event) -> None:
         consecutive_errors = 0
         while not stop.is_set():
             try:
-                processed = await self.run_once()
+                processed = await self._step()
             except httpx.HTTPError as exc:
+                await self._restart_from_cursor()
                 consecutive_errors += 1
                 backoff = self._error_backoff_s(consecutive_errors)
                 log.warning(

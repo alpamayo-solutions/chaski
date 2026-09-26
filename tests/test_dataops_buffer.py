@@ -237,3 +237,22 @@ def test_trim_does_not_touch_watermarks_or_meta(buffer):
     assert buffer.watermark("machine_state") == 5.0
     assert buffer.code_hash("machine_state") == "hash-1"
     assert buffer.generation == generation_before
+
+
+def test_one_commit_writes_the_block_at_its_end_and_reads_see_it_before(db_path):
+    import sqlite3
+
+    buffer = Buffer(db_path)
+    other = sqlite3.connect(str(db_path))
+    try:
+        with buffer.one_commit():
+            buffer.append("sig-1", 1.0, 1.0)
+            buffer.append("sig-1", 2.0, 2.0)
+            assert buffer.points("sig-1", 0.0, 10.0) == [(1.0, 1.0), (2.0, 2.0)]
+            assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 0
+        assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 2
+        buffer.append("sig-1", 3.0, 3.0)
+        assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 3
+    finally:
+        other.close()
+        buffer.close()
