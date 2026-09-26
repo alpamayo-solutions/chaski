@@ -7,10 +7,11 @@ import json
 import time
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
+import httpx
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 
-from chaski.dataops import Command, CommandRejected, on_command
+from chaski.dataops import Command, CommandRejected, on_command, resolve
 from chaski.dataops.base import Producer
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
@@ -43,6 +44,13 @@ class Selection(Producer):
         sku = command.params.get("sku")
         if sku == "boom":
             raise RuntimeError("kaputt")
+        if sku == "resolve":
+            resolve.resolve_system_element(self.runtime.door, "line1")
+            resolve.resolve_system_element(self.runtime.door, "line2")
+            return "resolved"
+        if sku == "busy":
+            request = httpx.Request("GET", "http://colca/kv?prefix=")
+            raise httpx.HTTPStatusError("429", request=request, response=httpx.Response(429, request=request))
         if sku != "P-1":
             raise CommandRejected(422, f"unknown product {sku!r}")
         return f"product {sku} set"
@@ -253,3 +261,30 @@ async def test_run_forever_drains_at_start_and_on_wake():
     assert [c.correlation_id for c in producer.seen] == ["corr-1", "corr-2"]
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
+
+
+@run_async
+async def test_rapid_commands_do_not_read_the_whole_kv_each():
+    """A command reads the node's KV only when its handler resolves something."""
+    records = [record(offset=i, correlation_id=f"corr-{i}") for i in range(1, 21)]
+    ex, _producer, door = executor(*records)
+    await ex.drain()
+    assert [ack["result_code"] for _topic, ack in acks(door)] == [200] * 20
+    assert door.kv_calls == 0
+
+
+@run_async
+async def test_a_command_s_resolutions_share_one_kv_read():
+    ex, _producer, door = executor(record(command={"sku": "resolve"}))
+    await ex.drain()
+    assert acks(door)[0][1]["result_code"] == 200
+    assert door.kv_calls == 1
+
+
+@run_async
+async def test_a_node_that_is_busy_answers_503_without_its_address():
+    ex, _producer, door = executor(record(command={"sku": "busy"}))
+    await ex.drain()
+    ack = acks(door)[0][1]
+    assert ack["result_code"] == 503
+    assert "http" not in ack["message"]

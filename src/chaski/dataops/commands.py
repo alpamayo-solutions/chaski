@@ -67,6 +67,7 @@ ACK_OK = 200
 ACK_REFUSED = 400
 ACK_EXPIRED = 498
 ACK_FAILED = 500
+ACK_BUSY = 503
 #: QoS 1: a lost wake would leave a command waiting for the next one.
 _QOS = 1
 #: Upper bound on the retry backoff after the door failed.
@@ -287,13 +288,21 @@ class CommandExecutor:
         await asyncio.to_thread(self._send, self.ack_topic(path), json.dumps(answer))
 
     async def _run(self, handler: Any, command: Command) -> tuple[int, str]:
+        """Run one command. Its resolutions share one KV read, taken only when the
+        first of them needs it: a full read per command ran into the node's rate
+        limit when commands came fast."""
         producer = handler.__self__
-        with resolve.one_pass(self._door):
+        with resolve.lazy_pass(resolve.Snapshot(self._door)):
             try:
                 with producer._lock:
                     result = await handler(command)
             except CommandRejected as exc:
                 return exc.code, exc.message
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    return ACK_BUSY, "the node is busy; send the command again"
+                log.exception("%s.%s failed on %s", producer.name, getattr(handler, "__name__", handler), command.path)
+                return ACK_FAILED, f"the command failed: the node answered {exc.response.status_code}"
             except Exception as exc:
                 log.exception("%s.%s failed on %s", producer.name, getattr(handler, "__name__", handler), command.path)
                 return ACK_FAILED, f"the command failed: {type(exc).__name__}: {exc}"[:200]
