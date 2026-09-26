@@ -63,6 +63,9 @@ class _NetworkThreadClient:
     def subscribe(self, topic, qos: int = 0, callback=None) -> None:
         self.subscriptions[str(topic)] = callback
 
+    def unsubscribe(self, topic) -> None:
+        pass
+
     def publish(self, topic, payload, qos: int = 0, retain: bool = False, wait: bool = True):
         self.published.append((str(topic), payload))
         if wait:

@@ -24,6 +24,9 @@ PORT_DEFAULT = 8888
 #: No finished drain for this long, or ten poll intervals if longer, is a stall.
 #: Transport errors back off to at most 30 s, so a node restart stays under it.
 STALL_AFTER_MIN_S = 300.0
+#: How long the broker may be away before the probe fails: paho reconnects
+#: within seconds of a node restart, so this is a reconnect that never comes.
+BROKER_GRACE_S = 60.0
 
 
 @dataclass
@@ -35,7 +38,8 @@ class HealthState:
     has not finished a drain for ``stall_after_s``: a healthy loop drains at
     least once per poll interval, even with nothing to read. An ingest that
     never started (nothing resolved yet) is healthy: a fresh node waiting to be
-    commissioned.
+    commissioned. A broker link that stays down for ``broker_grace_s`` fails the
+    probe too: without it no command, wake-up or watched record arrives.
     """
 
     started_at: float = field(default_factory=time.time)
@@ -45,6 +49,9 @@ class HealthState:
     stall_after_s: float = STALL_AFTER_MIN_S
     producers: int = 0
     generation: str = ""
+    broker_connected: Callable[[], bool] | None = None
+    broker_grace_s: float = BROKER_GRACE_S
+    _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
         task = self.ingest_task
@@ -61,14 +68,25 @@ class HealthState:
             return 0.0
         return time.monotonic() - self.last_drain_at()
 
+    def _broker(self) -> str:
+        if self.broker_connected is None or self.broker_connected():
+            self._broker_down_since = None
+            return "connected"
+        now = time.monotonic()
+        if self._broker_down_since is None:
+            self._broker_down_since = now
+        return "reconnecting" if now - self._broker_down_since < self.broker_grace_s else "down"
+
     def healthy(self) -> bool:
-        return self._ingest() in ("not-started", "running")
+        return self._ingest() in ("not-started", "running") and self._broker() != "down"
 
     def snapshot(self) -> dict:
         ingest = self._ingest()
+        broker = self._broker()
         body = {
-            "ok": ingest in ("not-started", "running"),
+            "ok": ingest in ("not-started", "running") and broker != "down",
             "ingest": ingest,
+            "broker": broker,
             "producers": self.producers,
             "generation": self.generation,
             "uptime_s": round(time.time() - self.started_at, 1),
