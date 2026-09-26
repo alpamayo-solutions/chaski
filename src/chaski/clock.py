@@ -22,6 +22,13 @@ from typing import Literal, cast
 from colca_data_contracts.payload import ClockDefinition, ClockSegment
 
 
+def _current_task() -> asyncio.Task | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
 class ClockNotReady(RuntimeError):
     """Application time is unavailable; keep infrastructure alive and retry."""
 
@@ -139,7 +146,10 @@ class Clock:
         self._previous_definition: ClockDefinition | None = None
         self._last: float | None = None
         self._definition_available = not bool(definition_topic)
-        self._scheduled: ContextVar[float | None] = ContextVar("factory_scheduled_time", default=None)
+        # The scheduled time, and the task it was set in (None: set outside a loop).
+        self._scheduled: ContextVar[tuple[float, asyncio.Task | None] | None] = ContextVar(
+            "factory_scheduled_time", default=None
+        )
 
     @classmethod
     def from_env(cls) -> Clock:
@@ -206,8 +216,8 @@ class Clock:
 
     def now(self) -> float:
         scheduled = self._scheduled.get()
-        if scheduled is not None:
-            return scheduled
+        if scheduled is not None and (scheduled[1] is None or scheduled[1] is _current_task()):
+            return scheduled[0]
         with self._lock:
             if not self._definition_available:
                 raise ClockNotReady("waiting for clock definition")
@@ -236,10 +246,12 @@ class Clock:
 
         Context-local: other threads/tasks continue seeing the live clock. The
         scheduler owns the timestamp and progress, not a global clock rewind.
+        Entered in a task, it holds for that task only: a task it starts (a
+        trailing run, a retry) runs later, on the live clock.
         """
         if not math.isfinite(timestamp):
             raise ValueError("scheduled timestamp must be finite")
-        token = self._scheduled.set(timestamp)
+        token = self._scheduled.set((timestamp, _current_task()))
         try:
             yield
         finally:

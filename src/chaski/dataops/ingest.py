@@ -144,24 +144,24 @@ class Ingest:
     # ------------------------------------------------------------------ loop
 
     async def run_once(self) -> int:
-        """Fetch one page, process every record, then ack, in a worker thread.
+        """Fetch one page, process every record, then ack.
 
-        A drain is blocking work (door HTTP, sqlite, sync handler bodies), so it
-        runs off the event loop, which keeps timers, wake and the health door
-        responsive.
+        The blocking part of a drain (door HTTP, sqlite) runs in a worker
+        thread, which keeps timers, wake and the health door responsive. The
+        ``@on_metric`` handlers run on this event loop, the service's own, like
+        ``@on_constant`` handlers: whatever a handler schedules there (a
+        throttle's trailing run, a retry) outlives the page.
 
         Returns the number of records processed. A ``gap`` is logged, not
         raised. ``httpx.HTTPError`` propagates for :meth:`run_forever` to
         retry; any other exception ends the task.
         """
-        return await asyncio.to_thread(self.drain_once)
+        return await asyncio.to_thread(self.drain_once, asyncio.get_running_loop())
 
-    def drain_once(self) -> int:
-        """The synchronous body of :meth:`run_once`: one page, start to ack.
-
-        ``@on_metric`` handlers are coroutines with sync bodies, so one private
-        loop runs them one after another, keeping stream order.
-        """
+    def drain_once(self, loop: asyncio.AbstractEventLoop) -> int:
+        """The thread body of :meth:`run_once`: one page, start to ack. Each
+        record's handlers run on ``loop``, one after the other, keeping stream
+        order; the page is acked once they are done."""
         stream = self._stream
         page: Page = stream.fetch()
 
@@ -170,8 +170,10 @@ class Ingest:
                 raise RuntimeError("input stream has a retention gap; refusing incomplete coordinated history")
             self._log_gap(page.gap)
 
-        if page.records:
-            asyncio.run(self._process_records(page.records))
+        for record in page.records:
+            signal_id = self._append(record)
+            if signal_id is not None and self._dispatch.get(signal_id):
+                asyncio.run_coroutine_threadsafe(self._handle(signal_id, record), loop).result()
 
         # See Page.ack_offset: the last record, or the gap's bound when nothing
         # survived it.
@@ -181,21 +183,18 @@ class Ingest:
 
         return len(page.records)
 
-    async def _process_records(self, records: Iterable[Record]) -> None:
-        for record in records:
-            await self._process_record(record)
-
-    async def _process_record(self, record: Record) -> None:
+    def _append(self, record: Record) -> str | None:
+        """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
         signal_id = self._signal_id_of(record)
         if signal_id is None:
             log.warning(
                 "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
             )
-            return
+            return None
+        self._buffer.append(signal_id, self._timestamp_of(record), self._value_of(record))
+        return signal_id
 
-        ts = self._timestamp_of(record)
-        self._buffer.append(signal_id, ts, self._value_of(record))
-
+    async def _handle(self, signal_id: str, record: Record) -> None:
         for handler in self._dispatch.get(signal_id, []):
             try:
                 await handler(record)
