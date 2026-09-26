@@ -1,8 +1,9 @@
 """The colca door's HTTP client, the SDK's consume lane.
 
 One implementation of ``GET /fetch`` (named cursors), ``POST /ack``,
-``GET /kv`` (paged, contract-filtered), ``GET /self`` and ``POST /publish``,
-used by ``chaski.Service.stream()`` and ``chaski.Service.kv()``.
+``GET /kv`` (paged, contract-filtered), ``GET /watch`` (stream change
+hints), ``GET /self`` and ``POST /publish``, used by
+``chaski.Service.stream()`` and ``chaski.Service.kv()``.
 
 On the local door (plain HTTP inside the deployment's network) there is no
 credential: the caller names itself with ``X-Colca-Service`` and the door
@@ -106,6 +107,20 @@ class Page:
 
 
 @dataclass(frozen=True)
+class Hint:
+    """One line of ``GET /watch``: the streams that grew since the previous
+    hint, and each one's next offset."""
+
+    streams: list[str]
+    next: dict[str, int]
+
+
+#: A watch writes at least a heartbeat every 5 s; this long without a line is a
+#: dead connection.
+WATCH_SILENCE_S = 15.0
+
+
+@dataclass(frozen=True)
 class KvEntry:
     """One entry from ``GET /kv``."""
 
@@ -177,12 +192,15 @@ class Door:
         *,
         max: int = 1000,
         signal_ids: list[str] | None = None,
+        contracts: Iterable[str] | None = None,
     ) -> Page:
         """``GET /fetch`` — read FORWARD from ``cursor``'s stored position.
 
         Never moves the cursor; only :meth:`ack` does. ``signal_ids`` is
         sent as repeated ``signal_id`` query params and is valid only when
         ``stream == "metrics"`` (the door rejects it otherwise).
+        ``contracts`` keeps only records of those contracts (colca 0.18+);
+        ``next`` still moves past the others.
         """
         params: list[tuple[str, str | int | float | bool | None]] = [
             ("stream", stream),
@@ -191,6 +209,8 @@ class Door:
         ]
         for signal_id in signal_ids or []:
             params.append(("signal_id", signal_id))
+        for contract in contracts or []:
+            params.append(("contract", contract))
         resp = self._client.get("/fetch", params=params)
         resp.raise_for_status()
         body = resp.json()
@@ -229,6 +249,7 @@ class Door:
         prefix: str = "",
         *,
         contract: str | Iterable[str] | None = None,
+        depth: int | None = None,
     ) -> list[KvEntry]:
         """``GET /kv?prefix=...`` — a snapshot of retained KV entries under
         ``prefix``, every page followed until the door returns an empty
@@ -236,7 +257,9 @@ class Door:
 
         ``contract`` narrows the scan to one or more contracts
         (``?contract=_Group&contract=_MetadataType``); the node filters before
-        decoding payloads. An unknown contract name is a 400.
+        decoding payloads. An unknown contract name is a 400. ``depth`` keeps
+        entries at most that many path segments below ``prefix`` (colca
+        0.18+), so a tree view reads one level at a time.
         """
         contracts = [contract] if isinstance(contract, str) else list(contract or [])
         entries: list[KvEntry] = []
@@ -244,6 +267,8 @@ class Door:
         while True:
             params: list[tuple[str, str | int | float | bool | None]] = [("prefix", prefix), ("max", "10000")]
             params.extend(("contract", name) for name in contracts)
+            if depth is not None:
+                params.append(("depth", str(depth)))
             if after:
                 params.append(("after", after))
             resp = self._client.get("/kv", params=params)
@@ -266,6 +291,31 @@ class Door:
             if next_token == after:
                 raise RuntimeError("GET /kv: server repeated page token")
             after = next_token
+
+    def watch(self, streams: Iterable[str], *, interval_ms: int | None = None) -> Iterator[Hint]:
+        """``GET /watch`` (colca 0.18+): yield a :class:`Hint` whenever one of
+        ``streams`` grows, instead of polling :meth:`fetch` on an idle stream.
+
+        The first hint names every stream, so draining each named stream on
+        every hint misses nothing across a reconnect. Hints are at least
+        ``interval_ms`` apart (the node's default is 100); what grows in
+        between is merged. Heartbeats are not yielded. The generator ends
+        with an ``httpx`` error when the connection fails or stays silent for
+        :data:`WATCH_SILENCE_S`; reconnecting is the caller's.
+        """
+        params: list[tuple[str, str | int | float | bool | None]] = [("stream", name) for name in streams]
+        if interval_ms is not None:
+            params.append(("interval_ms", str(interval_ms)))
+        timeout = httpx.Timeout(self._client.timeout.connect, read=WATCH_SILENCE_S)
+        with self._client.stream("GET", "/watch", params=params, timeout=timeout) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                body = json.loads(line)
+                named = body.get("streams") or []
+                if named:
+                    yield Hint(streams=list(named), next={k: int(v) for k, v in (body.get("next") or {}).items()})
 
     def self_info(self) -> dict:
         """``GET /self`` — this service's minted identity: ulid, name, node, element, mount."""
