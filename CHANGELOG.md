@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.10](https://github.com/alpamayo-solutions/chaski/compare/v0.10.9...v0.10.10) (2026-09-26)
+
+
+### Fixes
+
+* keep the MQTT session alive through a misframed packet and a broker restart ([#59](https://github.com/alpamayo-solutions/chaski/issues/59)) ([cd34e74](https://github.com/alpamayo-solutions/chaski/commit/cd34e74d4c33246b5cd2445b3ebf1b1ba4add7ad))
+
 ## [0.10.9](https://github.com/alpamayo-solutions/chaski/compare/v0.10.8...v0.10.9) (2026-09-26)
 
 
