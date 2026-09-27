@@ -90,7 +90,7 @@ from chaski.failures import HandlerHealth, Reject
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
-from .base import Producer, Runtime, runtime_now
+from .base import Producer, Runtime, restore_checkpoint, runtime_now, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, consumer_name
 from .inputs import Historian, declared_inputs, validate_windows
@@ -571,14 +571,14 @@ def make_handler(method, *, time_domain="application"):
             key = method.__name__
             if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
                 return
-            previous = instance._state_copy() if checkpointed else None
+            previous = state_copy(instance) if checkpointed else None
             try:
                 await method(metric)
                 if checkpointed:
                     offsets = dict(instance._handled_offsets)
                     instance._handled_offsets[key] = record.offset
                     try:
-                        instance._save_checkpoint()
+                        save_checkpoint(instance)
                     except BaseException:
                         instance._handled_offsets = offsets
                         raise
@@ -648,7 +648,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
         cls = type(instance)
         new_hash = codehash.compute_code_hash(cls)
         old_hash = buffer.code_hash(instance.name)
-        restored = instance._restore_checkpoint()
+        restored = restore_checkpoint(instance)
         if old_hash == new_hash and (instance.state_version is None or restored):
             continue
 
@@ -684,7 +684,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
             rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
         rows.sort(key=lambda r: r[0])
 
-        previous = instance._state_copy() if instance.state_version is not None else None
+        previous = state_copy(instance) if instance.state_version is not None else None
         try:
             for ts, signal_id, value in rows:
                 record = synthetic_record(signal_id, ts, value)
@@ -700,7 +700,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
             raise
 
         final_position = rows[-1][0] if rows else start
-        instance._save_checkpoint()
+        save_checkpoint(instance)
         buffer.set_watermark(instance.name, final_position, new_hash)
         log.info(
             "%s: replay complete (%d record(s)) — watermark=%.3f",
@@ -1042,9 +1042,8 @@ class DataOpsService(Service):
 
     def _execute_commands(self, instances: list[Producer]) -> commands.CommandExecutor | None:
         """Build the executor for every ``@on_command`` declared across
-        ``instances`` and subscribe its wake-ups — see
-        :mod:`chaski.dataops.commands`. ``None``, with no subscription and no
-        cursor, when nothing declared one."""
+        ``instances`` — see :mod:`chaski.dataops.commands`. ``None``, with no
+        stream watch and no cursor, when nothing declared one."""
         handlers = commands.gather(instances)
         if not handlers:
             return None
@@ -1229,7 +1228,7 @@ class DataOpsService(Service):
                     )
 
             # 10) Every @on_constant/@on_signal subscription, and the @on_command
-            #     executor with its wake-ups.
+            #     executor.
             self._watch_constants_and_signals(instances)
             self._commands = self._execute_commands(instances)
             commands_task: asyncio.Task | None = None

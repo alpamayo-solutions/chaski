@@ -243,8 +243,9 @@ class Selection(Producer):
 
 The command is read from the node's `commands` stream through a durable
 cursor of the service's own, so `command.actor_id`/`actor_label` are the
-node's attestation, not the sender's claim; its MQTT topic only wakes the
-drain. An expired command (`expires_at`, unix ms) is answered `498` without
+node's attestation, not the sender's claim. The stream's growth, watched for
+the executor's command contracts and `_Ack`, wakes the drain, so its own
+answers never stay unread on its cursor. An expired command (`expires_at`, unix ms) is answered `498` without
 running the handler, and so is a deadline more than 60 s after the command
 arrived or was `created_at` (`400`): the sender's deadline is capped, not
 trusted. A receiver of its own checks the same rule with
@@ -255,8 +256,11 @@ A handler runs only while the executor's broker link is up. While it is down
 the executor waits, until the command's deadline at most; a command that
 expires meanwhile is answered `498` without running. Inside a handler, a
 write after the deadline or while the link is down is refused
-(`chaski.service.NotSent`) instead of queued for after a reconnect, and the
-command is answered `500`.
+(`chaski.NotSent`) instead of queued for after a reconnect, and the
+command is answered `500`. A command the handler sends (`Service.command`)
+expires, and is waited for, by the same deadline; with no time left it is not
+sent and raises `NotSent`. `chaski.write_deadline()` returns the deadline
+(unix seconds), `None` outside a handler.
 
 A handler whose write got no PUBACK (`franzmq.errors.PublishTimeout`, also as
 the cause of what it raised) is answered `504`, outcome unknown: the MQTT
