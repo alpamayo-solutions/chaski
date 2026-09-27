@@ -251,6 +251,13 @@ trusted. A receiver of its own checks the same rule with
 `chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`: that
 answer is the command's durable rejection, and the command is not retried.
 
+A handler runs only while the executor's broker link is up. While it is down
+the executor waits, until the command's deadline at most; a command that
+expires meanwhile is answered `498` without running. Inside a handler, a
+write after the deadline or while the link is down is refused
+(`chaski.service.NotSent`) instead of queued for after a reconnect, and the
+command is answered `500`.
+
 A handler whose write got no PUBACK (`franzmq.errors.PublishTimeout`, also as
 the cause of what it raised) is answered `504`, outcome unknown: the MQTT
 client keeps the write queued and may deliver it after a reconnect, so `500`

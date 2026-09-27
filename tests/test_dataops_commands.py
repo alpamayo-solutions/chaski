@@ -564,3 +564,94 @@ async def test_a_write_without_puback_is_answered_504_outcome_unknown():
     ack = acks(door)[0][1]
     assert ack["result_code"] == commands.ACK_UNKNOWN == 504
     assert "may still take effect" in ack["message"]
+
+
+# ─── the broker link and the command's deadline ───────────────────────────
+
+
+@run_async
+async def test_a_command_waits_for_the_broker_link_before_it_runs():
+    ex, producer, door = executor(record())
+    ex.link_changed(False)
+    drain = asyncio.ensure_future(ex.drain())
+    await asyncio.sleep(0.05)
+    assert producer.seen == [] and not drain.done()
+    ex.link_changed(True)
+    await asyncio.wait_for(drain, timeout=1.0)
+    assert len(producer.seen) == 1
+    assert [ack["result_code"] for _topic, ack in acks(door)] == [200]
+
+
+@run_async
+async def test_a_command_that_expires_while_the_link_is_down_is_answered_498_and_not_run():
+    ex, producer, door = executor(record(expires_at=(time.time() + 0.1) * 1000))
+    ex.link_changed(False)
+    drain = asyncio.ensure_future(ex.drain())
+    await asyncio.sleep(0.3)
+    assert producer.seen == []
+    assert door.published == [], "the answer waits for the link too"
+    ex.link_changed(True)
+    await asyncio.wait_for(drain, timeout=1.0)
+    assert producer.seen == []
+    (ack,) = [ack for _topic, ack in acks(door)]
+    assert ack["result_code"] == commands.ACK_EXPIRED == 498
+    assert "broker link was down" in ack["message"]
+
+
+def test_a_write_under_a_deadline_is_refused_once_it_passed_or_while_the_link_is_down(tmp_path):
+    from chaski.service import NotSent, Service, writes_until
+
+    class Client:
+        connected = True
+
+        def __init__(self) -> None:
+            self.published: list[str] = []
+
+        def is_connected(self) -> bool:
+            return self.connected
+
+        def publish(self, topic, payload, qos=0, retain=False):
+            self.published.append(topic)
+
+        def publish_tombstone(self, topic, qos=0):
+            self.published.append(topic)
+
+    svc = Service("writer", state_dir=tmp_path)
+    client = svc._client = Client()
+    with writes_until(time.time() + 30):
+        svc.send("t/1", "{}")
+        client.connected = False
+        with pytest.raises(NotSent, match="link is down"):
+            svc.send("t/2", "{}")
+        with pytest.raises(NotSent, match="link is down"):
+            svc.retract("t/3")
+    client.connected = True
+    with writes_until(time.time() - 1), pytest.raises(NotSent, match="deadline"):
+        svc.send("t/4", "{}")
+    # Without a deadline a write is handed to the client as before.
+    client.connected = False
+    svc.send("t/5", "{}")
+    assert client.published == ["t/1", "t/5"]
+
+
+class LateWriter(Producer):
+    name = "late_writer"
+    system_element_name = "line1"
+
+    @on_command("line1/operator/setSpeed")
+    async def set_speed(self, command: Command) -> str:
+        from chaski.service import NotSent
+
+        raise NotSent("colca/v1/_Metric/n-1/line1/speed: not sent, its deadline had passed")
+
+
+@run_async
+async def test_a_refused_write_is_answered_500_not_504():
+    door = FakeDoor()
+    producer = LateWriter().attach(FakeRuntime(door, buffer=None))
+    door.queue(Page(records=[record("line1/operator/setSpeed")], next=2))
+    ex = CommandExecutor(door, producer.runtime.send, Stream(door, "commands", CURSOR), gather([producer]), NODE_ID)
+    await ex.drain()
+    ack = acks(door)[0][1]
+    assert ack["result_code"] == commands.ACK_FAILED == 500
+    assert "deadline had passed" in ack["message"]

@@ -16,6 +16,7 @@ import urllib.request
 from typing import ClassVar
 
 import pytest
+from colca_data_contracts.root import topic_prefix
 from dataops_fakes import FakeRuntime
 from franzmq.errors import PublishTimeout
 
@@ -339,3 +340,87 @@ def test_answers_at_other_paths_do_not_leave_the_executor_cursor_unread(tmp_path
         finally:
             press.close()
             runner.close()
+
+
+EFFECT = "line1/operator/setSpeed"
+
+
+class Speed(Producer):
+    """Writes its effect over the executor service's own MQTT session."""
+
+    name = "speed"
+    system_element_name = "line1"
+    send: ClassVar[object] = None
+    effect_topic: ClassVar[str] = ""
+
+    @on_command(EFFECT)
+    async def set_speed(self, command: Command) -> str:
+        Operator.runs.append(command.correlation_id)
+        finding = {"reason": "speed", "summary": "set", "observed_at": time.time(), "suggested_severity": "info"}
+        Speed.send(Speed.effect_topic, json.dumps(finding))
+        return "speed set"
+
+
+def test_a_command_that_expires_while_the_link_is_down_is_not_run_and_leaves_no_late_effect(tmp_path):
+    Operator.runs = []
+    with (
+        chaski.Node("cmd-link-down", data_dir=tmp_path / "node") as node,
+        node.service("executor") as svc,
+        _sender(node, svc, tmp_path) as sender,
+    ):
+        Speed.send = svc.send
+        Speed.effect_topic = f"{topic_prefix()}_Finding/{svc.node_id}/{'/'.join(svc._hierarchy)}/speedEffect"
+        runner = Executor(svc, svc.send, Buffer(tmp_path / "ledger.sqlite"), producer_type=Speed)
+        # The service tells its executor about the link, as DataOpsService does.
+        original = svc._broker_state_changed
+
+        def link_changed(connected: bool) -> None:
+            original(connected)
+            runner.loop.call_soon_threadsafe(runner.executor.link_changed, connected)
+
+        svc._broker_state_changed = link_changed
+        client = svc._started_client
+        client.reconnect_delay_set(min_delay=1, max_delay=1)
+        blocked = threading.Event()
+        reconnect = client.reconnect
+
+        def refused_while_blocked():
+            if blocked.is_set():
+                raise ConnectionRefusedError("link cut by the test")
+            return reconnect()
+
+        client.reconnect = refused_while_blocked
+        try:
+            blocked.set()
+            client.socket().shutdown(socket.SHUT_RDWR)
+            _wait(lambda: not runner.executor._link.is_set())
+
+            # Sent through the sender's own link; the executor is woken over HTTP.
+            with pytest.raises(TimeoutError):
+                sender.command("_CmdParam", EFFECT, {"command": {"value": 3}}, timeout=3)
+            time.sleep(1.0)
+            blocked.clear()
+            _wait(lambda: runner.executor._link.is_set())
+
+            answers = svc.stream(commands.STREAM, cursor="answers", contracts=["_Ack"])
+
+            def answered():
+                return [r.payload for r in answers if r.topic.endswith(EFFECT)]
+
+            (ack,) = _wait_for(answered)
+            assert ack["result_code"] == commands.ACK_EXPIRED, ack
+            time.sleep(2.0)
+            assert Operator.runs == []
+            assert not [e for e in svc.kv(contract="_Finding") if e.path.endswith("speedEffect")]
+        finally:
+            blocked.clear()
+            client.reconnect = reconnect
+            runner.close()
+
+
+def _wait_for(value, timeout: float = 20.0):
+    deadline = time.monotonic() + timeout
+    while not (result := value()):
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.5)
+    return result

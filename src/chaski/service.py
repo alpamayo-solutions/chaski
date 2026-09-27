@@ -46,6 +46,8 @@ foreign system and ``publish()``-es what it learns, and follows a stream with
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime
 import json
 import logging
@@ -57,7 +59,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -125,6 +127,29 @@ _DEFAULT_EXTERNAL_MQTT_PORT = 8883
 _DEFAULT_EXTERNAL_API_PORT = 443
 _DEFAULT_LOCAL_HTTP_PORT = 80
 _DEFAULT_LOCAL_MQTT_PORT = 1883
+
+
+#: The deadline (unix seconds) writes from the current context must be sent by.
+_write_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("chaski_write_deadline", default=None)
+
+
+class NotSent(RuntimeError):
+    """A write refused before it was handed to the MQTT client, because its
+    deadline had passed or the broker link was down. Nothing was queued, so
+    nothing is sent after a reconnect."""
+
+
+@contextlib.contextmanager
+def writes_until(deadline: float | None) -> Iterator[None]:
+    """Refuse :meth:`Service.send`/:meth:`Service.retract` from this context
+    (tasks and ``asyncio.to_thread`` calls inherit it) once ``deadline``
+    (unix seconds) has passed or while the broker link is down, instead of
+    queueing the write for after a reconnect. ``None`` sets no deadline."""
+    token = _write_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _write_deadline.reset(token)
 
 
 class NotEnrolled(RuntimeError):
@@ -1204,15 +1229,28 @@ class Service:
         record. A record the node refuses raises
         ``franzmq.errors.PublishRejected``; no PUBACK in time raises
         ``PublishTimeout``. Must not be called from an MQTT callback, which
-        cannot wait for its own PUBACK.
+        cannot wait for its own PUBACK. Under :func:`writes_until`, a write
+        past the deadline or while the link is down raises :class:`NotSent`.
         """
         # franzmq sends ``payload.encode()``, which a JSON string already has.
-        self._require_client("send").publish(topic, payload, qos=1, retain=retain)
+        self._writable("send", topic).publish(topic, payload, qos=1, retain=retain)
 
     def retract(self, topic: str) -> None:
         """Retire the state record at ``topic``: an empty retained payload,
         which the node keeps as a tombstone and drops from its KV."""
-        self._require_client("retract").publish_tombstone(topic, qos=1)
+        self._writable("retract", topic).publish_tombstone(topic, qos=1)
+
+    def _writable(self, method: str, topic: str) -> Any:
+        """The client, unless a write deadline (:func:`writes_until`) refuses
+        the write: queued now, it could reach the node after the deadline."""
+        client = self._require_client(method)
+        deadline = _write_deadline.get()
+        if deadline is not None:
+            if time.time() >= deadline:
+                raise NotSent(f"{topic}: not sent, its deadline had passed")
+            if not client.is_connected():
+                raise NotSent(f"{topic}: not sent, the broker link is down")
+        return client
 
     def command(
         self,

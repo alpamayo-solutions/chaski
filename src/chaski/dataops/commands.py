@@ -36,7 +36,8 @@ with ``{correlation_id, result_code, message, performed_at}``:
         :data:`chaski.command.MAX_LIFETIME_S`, counted
         from its arrival at the node or from its ``created_at``, or says it
         was created after it arrived; the handler is not run
-498     ``expires_at`` (unix ms) had passed; the handler is not run
+498     ``expires_at`` (unix ms) had passed, also while the executor
+        waited for its broker link; the handler is not run
 500     the handler raised anything else; nothing it sent is pending
 504     outcome unknown: the handler sent a write the node did not
         confirm in time (``PublishTimeout``), or the service stopped
@@ -45,6 +46,14 @@ with ``{correlation_id, result_code, message, performed_at}``:
 
 A command without a ``correlation_id`` cannot be matched by its sender and is
 not answered.
+
+**A handler runs only while the broker link is up.** Its effects are MQTT
+writes. While the link is down the executor waits for it, until the
+command's deadline at most, and a command that expires meanwhile is answered
+498 without running. While the handler runs, a write after the deadline or
+while the link is down is refused (:class:`chaski.service.NotSent`) rather
+than queued for after a reconnect, where it would land late; the command is
+then answered 500.
 
 **504, not 500, for an unconfirmed write.** A publish without a PUBACK stays
 queued in the MQTT client and goes out after a reconnect, possibly after the
@@ -87,6 +96,7 @@ from franzmq.errors import PublishTimeout
 
 from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream, StreamGapError
+from chaski.service import NotSent, writes_until
 
 from . import resolve
 from .base import Producer
@@ -170,6 +180,8 @@ def unconfirmed_write(exc: BaseException) -> bool:
     while current is not None and id(current) not in seen:
         if isinstance(current, PublishTimeout):
             return True
+        if isinstance(current, NotSent):
+            return False
         seen.add(id(current))
         current = current.__cause__ or current.__context__
     return False
@@ -504,6 +516,8 @@ class CommandExecutor:
             code, message = ACK_REFUSED, refusal
         elif expired(payload.get("expires_at"), time.time() * 1000.0):
             code, message = ACK_EXPIRED, "expired before it was executed"
+        elif not await self._link_before(command.expires_at):
+            code, message = ACK_EXPIRED, "expired while the broker link was down; not executed"
         else:
             if correlation_id:
                 await asyncio.to_thread(self._ledger.command_started, correlation_id)
@@ -554,6 +568,17 @@ class CommandExecutor:
             self._remember(correlation_id)
             return
 
+    async def _link_before(self, expires_at: float | None) -> bool:
+        """Wait for the broker link, until ``expires_at`` (unix ms) at most.
+        False when the command expired first; raises :class:`_Stopping` when
+        the service stops first."""
+        if self._link.is_set():
+            return True
+        timeout = None if expires_at is None else max(0.0, expires_at / 1000.0 - time.time())
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._wait_for_link(), timeout)
+        return self._link.is_set() and not expired(expires_at, time.time() * 1000.0)
+
     async def _wait_for_link(self) -> None:
         link_task = asyncio.ensure_future(self._link.wait())
         stop_task = asyncio.ensure_future(self._stop.wait())
@@ -572,12 +597,16 @@ class CommandExecutor:
         limit when commands came fast."""
         producer = handler.__self__
         name = getattr(handler, "__name__", handler)
-        with resolve.lazy_pass(resolve.Snapshot(self._door)):
+        deadline = None if command.expires_at is None else command.expires_at / 1000.0
+        with resolve.lazy_pass(resolve.Snapshot(self._door)), writes_until(deadline):
             try:
                 with producer._lock:
                     result = await handler(command)
             except CommandRejected as exc:
                 return exc.code, exc.message
+            except NotSent as exc:
+                log.warning("%s.%s on %s: a write was refused: %s", producer.name, name, command.path, exc)
+                return ACK_FAILED, f"the command failed: {exc}"[:200]
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429:
                     return ACK_BUSY, "the node is busy; send the command again"
