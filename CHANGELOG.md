@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/alpamayo-solutions/chaski/compare/v0.13.0...v0.14.0) (2026-09-27)
+
+
+### Features
+
+* **dataops:** keep the command executor alive through broker outages and answer unconfirmed writes 504 ([#74](https://github.com/alpamayo-solutions/chaski/issues/74)) ([3ce98e1](https://github.com/alpamayo-solutions/chaski/commit/3ce98e17617367c49e9eb92055b2fd6caad3922d))
+
 ## [0.13.0](https://github.com/alpamayo-solutions/chaski/compare/v0.12.0...v0.13.0) (2026-09-27)
 
 
