@@ -10,12 +10,14 @@ import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patc
 import httpx
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
+from franzmq.errors import PublishTimeout
 
 from chaski.dataops import Command, CommandRejected, commands, on_command, resolve
 from chaski.dataops.base import Producer
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
 from chaski.dataops.triggers import OnCommandSpec
 from chaski.door import Page, Record, Stream
+from chaski.failures import HandlerHealth
 
 CURSOR = "c/dataops/commands"
 SET_PRODUCT = "line1/operator/setProduct"
@@ -334,3 +336,228 @@ async def test_a_node_that_is_busy_answers_503_without_its_address():
     ack = acks(door)[0][1]
     assert ack["result_code"] == 503
     assert "http" not in ack["message"]
+
+
+# ─── answers survive a broker outage ─────────────────────────────────────
+
+
+class FlakySend:
+    """``send`` that fails ``failures`` times with a missing PUBACK, then
+    lands on ``door.published``."""
+
+    def __init__(self, door: FakeDoor, failures: int) -> None:
+        self.door = door
+        self.failures = failures
+        self.attempts = 0
+
+    def __call__(self, topic: str, payload: str) -> None:
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise PublishTimeout(topic, 0.01)
+        self.door.published.append((topic, payload))
+
+
+def flaky_executor(*records: Record, failures: int, ledger=None, health=None):
+    door = FakeDoor()
+    producer = Selection().attach(FakeRuntime(door, buffer=None))
+    if records:
+        door.queue(Page(records=list(records), next=records[-1].offset + 1))
+    send = FlakySend(door, failures)
+    ex = CommandExecutor(
+        door,
+        send,
+        Stream(door, "commands", CURSOR),
+        gather([producer]),
+        NODE_ID,
+        ledger=ledger,
+        health=health,
+    )
+    return ex, producer, door, send
+
+
+@pytest.fixture
+def fast_answer_backoff(monkeypatch):
+    monkeypatch.setattr(commands, "ANSWER_BACKOFF_MAX_S", 0.02)
+
+
+@run_async
+async def test_a_failed_answer_is_sent_again_before_the_cursor_moves(fast_answer_backoff):
+    health = HandlerHealth()
+    ex, producer, door, send = flaky_executor(record(), failures=2, health=health)
+    await ex.drain()
+    assert len(producer.seen) == 1, "the command runs once, however often its answer is sent"
+    assert send.attempts == 3
+    assert [ack["result_code"] for _topic, ack in acks(door)] == [200]
+    assert door.acked == [("commands", CURSOR, 1)]
+    assert health.status == "ok", "a confirmed answer clears the failure"
+
+
+@run_async
+async def test_the_executor_survives_a_failing_answer_and_reports_it(fast_answer_backoff):
+    """Unity break test: the `_Ack` publish raised PublishTimeout, the executor
+    task died, and every later command went unanswered."""
+    health = HandlerHealth()
+    ex, producer, door, send = flaky_executor(record(), failures=10**6, health=health)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if send.attempts >= 6:
+            break
+    assert not task.done()
+    assert health.status == "unhealthy"
+    assert door.acked == [], "the cursor stays before an unanswered command"
+    send.failures = 0
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if door.acked:
+            break
+    assert door.acked == [("commands", CURSOR, 1)]
+    assert len(producer.seen) == 1
+    assert health.status == "ok"
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@run_async
+async def test_an_answer_waits_for_the_broker_link():
+    ex, _producer, door, send = flaky_executor(record(), failures=0)
+    ex.link_changed(False)
+    drain = asyncio.ensure_future(ex.drain())
+    await asyncio.sleep(0.05)
+    assert send.attempts == 0 and not drain.done()
+    ex.link_changed(True)
+    await asyncio.wait_for(drain, timeout=1.0)
+    assert [ack["result_code"] for _topic, ack in acks(door)] == [200]
+
+
+@run_async
+async def test_stopping_with_an_answer_pending_leaves_the_cursor(fast_answer_backoff):
+    ex, _producer, door, _send = flaky_executor(record(), failures=10**6)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert door.acked == []
+
+
+# ─── one execution, one answer ─────────────────────────────────────────────
+
+
+@run_async
+async def test_a_restart_republishes_the_recorded_answer_without_running_again(tmp_path, fast_answer_backoff):
+    from chaski.dataops.buffer import Buffer
+
+    ledger = Buffer(tmp_path / "buffer.sqlite")
+    first, producer, _door, _send = flaky_executor(record(), failures=10**6, ledger=ledger)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(first.run_forever(stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert len(producer.seen) == 1
+    ledger.close()
+
+    ledger = Buffer(tmp_path / "buffer.sqlite")
+    # The command is now past its deadline: before, a restart answered it 498.
+    late = record(expires_at=(time.time() - 1) * 1000)
+    second, again, door, _send = flaky_executor(late, failures=0, ledger=ledger)
+    await second.drain()
+    assert again.seen == []
+    ((_topic, ack),) = acks(door)
+    assert ack["result_code"] == 200
+    assert door.acked == [("commands", CURSOR, 1)]
+    ledger.close()
+
+
+@run_async
+async def test_a_command_started_but_not_answered_gets_504_and_does_not_run_again():
+    ledger = commands.MemoryLedger()
+    ledger.command_started("corr-1")
+    ex, producer, door, _send = flaky_executor(record(), failures=0, ledger=ledger)
+    await ex.drain()
+    assert producer.seen == []
+    ack = acks(door)[0][1]
+    assert ack["result_code"] == 504
+    assert "outcome unknown" in ack["message"]
+
+
+@run_async
+async def test_a_command_whose_answer_is_in_the_stream_is_neither_run_nor_answered():
+    answer = Record(
+        offset=2,
+        origin_offset=2,
+        topic=f"colca/v1/_Ack/{NODE_ID}/{SET_PRODUCT}",
+        payload={"correlation_id": "corr-1", "result_code": 500, "message": "x"},
+        ts=time.time() * 1000,
+        written_by="svc",
+        actor_id="svc",
+        actor_label="",
+        actor_kind="service",
+    )
+    ex, producer, door, _send = flaky_executor(record(offset=1), answer, failures=0)
+    await ex.drain()
+    assert producer.seen == []
+    assert door.published == []
+    assert door.acked == [("commands", CURSOR, 2)]
+
+
+@run_async
+async def test_a_full_page_reads_ahead_for_answers_before_executing():
+    door = FakeDoor()
+    producer = Selection().attach(FakeRuntime(door, buffer=None))
+    stream = Stream(door, "commands", CURSOR, max=1)
+    ex = CommandExecutor(door, FlakySend(door, 0), stream, gather([producer]), NODE_ID)
+    door.queue(Page(records=[record(offset=1)], next=2, start=1))
+    later = Record(
+        offset=2,
+        origin_offset=2,
+        topic=f"colca/v1/_Ack/{NODE_ID}/{SET_PRODUCT}",
+        payload={"correlation_id": "corr-1", "result_code": 200, "message": ""},
+        ts=time.time() * 1000,
+        written_by="svc",
+        actor_id="svc",
+        actor_label="",
+        actor_kind="service",
+    )
+    door.queue(Page(records=[later], next=3, start=2))  # read ahead
+    door.queue(Page(records=[], next=3, start=3))  # read ahead: the head
+    door.queue(Page(records=[later], next=3, start=2))  # the cursor's next page
+    door.queue(Page(records=[], next=3, start=3))
+    await ex.drain()
+    assert producer.seen == []
+    assert door.published == []
+    assert door.fetch_calls[1]["from_offset"] == 2
+
+
+def test_the_stream_reads_the_answers_too():
+    producer = Selection().attach(FakeRuntime(FakeDoor(), buffer=None))
+    assert commands.stream_contracts(gather([producer])) == ["_Ack", "_CmdParam"]
+
+
+# ─── an unconfirmed write is not "nothing changed" ──────────────────────────
+
+
+class Writer(Producer):
+    name = "writer"
+    system_element_name = "line1"
+
+    @on_command("line1/operator/setDensity")
+    async def set_density(self, command: Command) -> str:
+        try:
+            raise PublishTimeout("colca/v1/_Metric/n-1/line1/density", 10.0)
+        except PublishTimeout as exc:
+            raise RuntimeError("could not write the density") from exc
+
+
+@run_async
+async def test_a_write_without_puback_is_answered_504_outcome_unknown():
+    door = FakeDoor()
+    producer = Writer().attach(FakeRuntime(door, buffer=None))
+    door.queue(Page(records=[record("line1/operator/setDensity")], next=2))
+    ex = CommandExecutor(door, FlakySend(door, 0), Stream(door, "commands", CURSOR), gather([producer]), NODE_ID)
+    await ex.drain()
+    ack = acks(door)[0][1]
+    assert ack["result_code"] == commands.ACK_UNKNOWN == 504
+    assert "may still take effect" in ack["message"]

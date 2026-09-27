@@ -34,15 +34,36 @@ with ``{correlation_id, result_code, message, performed_at}``:
         from its arrival at the node or from its ``created_at``, or says it
         was created after it arrived; the handler is not run
 498     ``expires_at`` (unix ms) had passed; the handler is not run
-500     the handler raised anything else
+500     the handler raised anything else; nothing it sent is pending
+504     outcome unknown: the handler sent a write the node did not
+        confirm in time (``PublishTimeout``), or the service stopped
+        while the handler ran. The write may still take effect.
 ======  =====================================================
 
 A command without a ``correlation_id`` cannot be matched by its sender and is
 not answered.
 
-**Crash safety.** The cursor is acked per page, after every command on it was
-handled. A crash before that repeats the page, so handlers must be
-idempotent — setting a value is.
+**504, not 500, for an unconfirmed write.** A publish without a PUBACK stays
+queued in the MQTT client and goes out after a reconnect, possibly after the
+command was answered. Answering 500 ("nothing was changed") would then be
+false. The executor answers 504 instead: the sender must read the state back
+before it relies on either outcome.
+
+**An answer is published before the cursor passes its command.** A failed
+``_Ack`` publish (no PUBACK, broker away) does not end the executor: the answer
+stays pending and is sent again, once the broker link is back, with bounded
+and jittered backoff (:data:`ANSWER_BACKOFF_MAX_S`). The cursor is acked only
+after every answer on the page was confirmed. The same answer may therefore
+arrive more than once; it is always identical.
+
+**One execution, one answer.** The executor reads the ``_Ack`` records of its
+own paths from the ``commands`` stream next to the commands, and a command
+whose answer is already there is not executed again. With a ledger (the
+DataOps service's buffer, :meth:`~chaski.dataops.buffer.Buffer.command_started`)
+a command is recorded before its handler runs and its answer before it is
+published: after a restart a recorded answer is published again unchanged,
+and a command that was started but not answered gets 504. It is never run a
+second time, and never answered 500 first and 498 later.
 """
 
 from __future__ import annotations
@@ -52,12 +73,14 @@ import contextlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from colca_data_contracts import topic_prefix
+from franzmq.errors import PublishTimeout
 
 from chaski.command import lifetime_refusal
 from chaski.door import Page, Record, Stream, StreamGapError
@@ -75,6 +98,15 @@ ACK_REFUSED = 400
 ACK_EXPIRED = 498
 ACK_FAILED = 500
 ACK_BUSY = 503
+ACK_UNKNOWN = 504
+#: The contract of an answer; the executor reads its own back from the stream.
+ACK_CONTRACT = "_Ack"
+#: Upper bound on the backoff between attempts to publish one answer.
+ANSWER_BACKOFF_MAX_S = 5.0
+#: What a failing answer publish is reported as in the handler health.
+ANSWER_CONSUMER = "commands: answer"
+#: How many answered correlation ids the executor remembers in memory.
+_ANSWERED_LIMIT = 4096
 #: QoS 1: a lost wake would leave a command waiting for the next one.
 _QOS = 1
 #: Upper bound on the retry backoff after the door failed.
@@ -85,8 +117,52 @@ WATCH_INTERVAL_MS = 1000
 
 
 def contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
-    """The command contracts ``handlers`` execute: what the executor's stream reads."""
+    """The command contracts ``handlers`` execute: what wakes the executor."""
     return sorted({contract for contract, _path in handlers})
+
+
+def stream_contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
+    """What the executor's stream reads: its command contracts and ``_Ack``,
+    so it sees which of its commands were answered already."""
+    return sorted({*contracts(handlers), ACK_CONTRACT})
+
+
+class MemoryLedger:
+    """The ledger of a process without a buffer: it does not survive a
+    restart. The DataOps service passes its durable buffer instead."""
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[str, str | None] = OrderedDict()
+
+    def command_entry(self, correlation_id: str) -> tuple[bool, str | None]:
+        if correlation_id not in self._entries:
+            return False, None
+        return True, self._entries[correlation_id]
+
+    def command_started(self, correlation_id: str) -> None:
+        self._entries.setdefault(correlation_id, None)
+        while len(self._entries) > _ANSWERED_LIMIT:
+            self._entries.popitem(last=False)
+
+    def command_answered(self, correlation_id: str, answer: str) -> None:
+        self._entries[correlation_id] = answer
+
+
+def unconfirmed_write(exc: BaseException) -> bool:
+    """Whether ``exc`` (or what caused it) is a publish that got no PUBACK:
+    the write may still reach the node."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, PublishTimeout):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class _Stopping(Exception):
+    """The service stops while an answer is still pending."""
 
 
 @dataclass(frozen=True)
@@ -174,7 +250,10 @@ def _deadline(raw: Any) -> float | None:
 class CommandExecutor:
     """Drains the ``commands`` stream for the declared commands and answers
     them. ``handlers`` comes from :func:`gather`; ``send`` publishes the
-    ack (the service's :meth:`~chaski.Service.send`)."""
+    ack (the service's :meth:`~chaski.Service.send`). ``stream`` should read
+    :func:`stream_contracts`. ``ledger`` records started and answered
+    commands (:class:`MemoryLedger` when omitted); ``health`` counts failing
+    answer publishes under :data:`ANSWER_CONSUMER`."""
 
     def __init__(
         self,
@@ -183,13 +262,24 @@ class CommandExecutor:
         stream: Stream,
         handlers: dict[tuple[str, str], Callable],
         node_id: str,
+        *,
+        ledger: Any = None,
+        health: Any = None,
     ) -> None:
         self._door = door
         self._send = send
         self._stream = stream
         self._handlers = handlers
         self._node_id = node_id
+        self._ledger = ledger if ledger is not None else MemoryLedger()
+        self._health = health
         self._wake = asyncio.Event()
+        # Set while the broker link is up; an answer waits on it.
+        self._link = asyncio.Event()
+        self._link.set()
+        self._stop = asyncio.Event()
+        self._answered: OrderedDict[str, None] = OrderedDict()
+        self._ack_topics = {self.ack_topic(path) for _contract, path in handlers}
 
     # -- topics -------------------------------------------------------------
 
@@ -219,6 +309,15 @@ class CommandExecutor:
         ``loop.call_soon_threadsafe``."""
         self._wake.set()
 
+    def link_changed(self, connected: bool) -> None:
+        """The broker link went down or came back; on the loop's thread. A
+        pending answer is sent again once it is back."""
+        if connected:
+            self._link.set()
+            self._wake.set()
+        else:
+            self._link.clear()
+
     # -- loop -----------------------------------------------------------------
 
     async def run_forever(self, stop: asyncio.Event) -> None:
@@ -239,6 +338,7 @@ class CommandExecutor:
     async def _serve(self, stop: asyncio.Event) -> None:
         from chaski.retry import Backoff
 
+        self._stop = stop
         retry = Backoff(minimum=0.5, maximum=_ERROR_BACKOFF_MAX_S)
         self._wake.set()
         while not stop.is_set():
@@ -256,16 +356,24 @@ class CommandExecutor:
             try:
                 await self.drain()
                 retry.reset()
+            except _Stopping:
+                return
             except httpx.HTTPError as exc:
                 backoff = retry.delay(exc)
                 log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", retry.failures, exc, backoff)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                if await self._stopped_within(backoff):
+                    return
                 self._wake.set()
+
+    async def _stopped_within(self, seconds: float) -> bool:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        return self._stop.is_set()
 
     async def drain(self) -> int:
         """Handle every command up to the head of the stream, acking page by
-        page. Returns how many records were read."""
+        page once every answer on the page is published. Returns how many
+        records were read."""
         seen = 0
         while True:
             page: Page = await asyncio.to_thread(self._stream.fetch)
@@ -273,7 +381,12 @@ class CommandExecutor:
                 raise StreamGapError(
                     f"commands: offsets {page.gap.from_offset}..{page.gap.to_offset} were pruned; explicit recovery required"
                 )
+            self._note_answers(page.records)
+            scanned_ahead = False
             for record in page.records:
+                if not scanned_ahead and self._needs_look_ahead(record, page):
+                    await asyncio.to_thread(self._scan_ahead, page.next)
+                    scanned_ahead = True
                 await self.handle(record)
             seen += len(page.records)
             ack_offset = page.ack_offset
@@ -282,6 +395,46 @@ class CommandExecutor:
             await asyncio.to_thread(self._stream.ack, ack_offset)
             if not page.records:
                 return seen
+
+    # -- answered commands ----------------------------------------------------
+
+    def _note_answers(self, records: Iterable[Record]) -> None:
+        for record in records:
+            if record.topic not in self._ack_topics or not isinstance(record.payload, dict):
+                continue
+            correlation_id = str(record.payload.get("correlation_id") or "")
+            if correlation_id:
+                self._remember(correlation_id)
+
+    def _remember(self, correlation_id: str) -> None:
+        self._answered[correlation_id] = None
+        self._answered.move_to_end(correlation_id)
+        while len(self._answered) > _ANSWERED_LIMIT:
+            self._answered.popitem(last=False)
+
+    def _needs_look_ahead(self, record: Record, page: Page) -> bool:
+        """A full page may end before the answer to one of its commands: read
+        ahead for answers before executing it."""
+        if len(page.records) < self._stream.page_size or record.topic in self._ack_topics:
+            return False
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        correlation_id = str(payload.get("correlation_id") or "")
+        return bool(correlation_id) and correlation_id not in self._answered
+
+    def _scan_ahead(self, from_offset: int) -> None:
+        """Note the answers after ``from_offset`` without moving the cursor.
+        A node that cannot read ahead (no ``Page.start``) ends the scan."""
+        offset = from_offset
+        while True:
+            page = self._stream.fetch(from_offset=offset)
+            if page.start is None:
+                return
+            self._note_answers(page.records)
+            if len(page.records) < self._stream.page_size or page.next <= offset:
+                return
+            offset = page.next
+
+    # -- one command ------------------------------------------------------------
 
     async def handle(self, record: Record) -> None:
         """Execute one record if it is a declared command, and answer it."""
@@ -307,31 +460,100 @@ class CommandExecutor:
             ts=record.ts,
             offset=record.offset,
         )
+        correlation_id = command.correlation_id
+        who = command.actor_label or command.actor_id or "?"
+        if correlation_id in self._answered:
+            log.info("command %s %s by %s was answered already; not executed again", contract, path, who)
+            return
+        if correlation_id:
+            started, recorded = await asyncio.to_thread(self._ledger.command_entry, correlation_id)
+            if started:
+                if recorded is None:
+                    recorded = self._answer_body(
+                        correlation_id,
+                        ACK_UNKNOWN,
+                        "outcome unknown: the service stopped while executing it; it may have taken effect",
+                    )
+                    await asyncio.to_thread(self._ledger.command_answered, correlation_id, recorded)
+                log.info(
+                    "command %s %s by %s was executed before; answering it again, not re-executing", contract, path, who
+                )
+                await self._publish_answer(self.ack_topic(path), correlation_id, recorded)
+                return
+
         refusal = lifetime_refusal(payload.get("expires_at"), payload.get("created_at"), record.ts)
         if refusal is not None:
             code, message = ACK_REFUSED, refusal
         elif expired(payload.get("expires_at"), time.time() * 1000.0):
             code, message = ACK_EXPIRED, "expired before it was executed"
         else:
+            if correlation_id:
+                await asyncio.to_thread(self._ledger.command_started, correlation_id)
             code, message = await self._run(handler, command)
-        who = command.actor_label or command.actor_id or "?"
         log.info("command %s %s by %s -> %d %s", contract, path, who, code, message)
-        if not command.correlation_id:
+        if not correlation_id:
             log.warning("command %s %s has no correlation_id — not answered", contract, path)
             return
-        answer = {
-            "correlation_id": command.correlation_id,
-            "result_code": code,
-            "message": message,
-            "performed_at": time.time(),
-        }
-        await asyncio.to_thread(self._send, self.ack_topic(path), json.dumps(answer))
+        answer = self._answer_body(correlation_id, code, message)
+        await asyncio.to_thread(self._ledger.command_answered, correlation_id, answer)
+        await self._publish_answer(self.ack_topic(path), correlation_id, answer)
+
+    @staticmethod
+    def _answer_body(correlation_id: str, code: int, message: str) -> str:
+        return json.dumps(
+            {"correlation_id": correlation_id, "result_code": code, "message": message, "performed_at": time.time()}
+        )
+
+    async def _publish_answer(self, topic: str, correlation_id: str, answer: str) -> None:
+        """Publish ``answer`` until the node confirms it. While the broker is
+        away it waits for the link; a failed attempt is retried with jittered
+        backoff. Raises :class:`_Stopping` when the service stops first: the
+        cursor then stays before the command, and the ledger holds the answer."""
+        from chaski.retry import Backoff
+
+        retry = Backoff(minimum=min(0.5, ANSWER_BACKOFF_MAX_S), maximum=ANSWER_BACKOFF_MAX_S)
+        while True:
+            if not self._link.is_set():
+                await self._wait_for_link()
+            try:
+                await asyncio.to_thread(self._send, topic, answer)
+            except Exception as exc:
+                delay = retry.delay(exc)
+                count = self._health.failed(ANSWER_CONSUMER, exc) if self._health is not None else retry.failures
+                log.error(
+                    "commands: answer %s on %s not confirmed (%d in a row): %s — sending it again in %.1fs",
+                    correlation_id,
+                    topic,
+                    count,
+                    exc,
+                    delay,
+                )
+                if await self._stopped_within(delay):
+                    raise _Stopping from exc
+                continue
+            if retry.failures and self._health is not None:
+                self._health.succeeded(ANSWER_CONSUMER)
+            self._remember(correlation_id)
+            return
+
+    async def _wait_for_link(self) -> None:
+        link_task = asyncio.ensure_future(self._link.wait())
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        try:
+            await asyncio.wait({link_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (link_task, stop_task):
+                if not task.done():
+                    task.cancel()
+        if self._stop.is_set():
+            raise _Stopping
 
     async def _run(self, handler: Any, command: Command) -> tuple[int, str]:
         """Run one command. Its resolutions share one KV read, taken only when the
         first of them needs it: a full read per command ran into the node's rate
         limit when commands came fast."""
         producer = handler.__self__
+        name = getattr(handler, "__name__", handler)
         with resolve.lazy_pass(resolve.Snapshot(self._door)):
             try:
                 with producer._lock:
@@ -341,9 +563,15 @@ class CommandExecutor:
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429:
                     return ACK_BUSY, "the node is busy; send the command again"
-                log.exception("%s.%s failed on %s", producer.name, getattr(handler, "__name__", handler), command.path)
+                log.exception("%s.%s failed on %s", producer.name, name, command.path)
                 return ACK_FAILED, f"the command failed: the node answered {exc.response.status_code}"
             except Exception as exc:
-                log.exception("%s.%s failed on %s", producer.name, getattr(handler, "__name__", handler), command.path)
+                if unconfirmed_write(exc):
+                    log.warning("%s.%s on %s: a write was not confirmed: %s", producer.name, name, command.path, exc)
+                    return (
+                        ACK_UNKNOWN,
+                        "outcome unknown: a write was sent but the node did not confirm it in time; it may still take effect",
+                    )
+                log.exception("%s.%s failed on %s", producer.name, name, command.path)
                 return ACK_FAILED, f"the command failed: {type(exc).__name__}: {exc}"[:200]
         return ACK_OK, "" if result is None else str(result)

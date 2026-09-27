@@ -1,11 +1,13 @@
 """SQLite-backed input buffer, a DataOps service's only local state.
 
-One file under the service's data directory with five tables: ``points`` (the
+One file under the service's data directory. ``points`` (the
 retained window per input signal), ``watermarks`` (replay progress per
 producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
 (the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
 its own), and ``pending_outputs`` (computed samples waiting for a signal binding
-or a successful publish).
+or a successful publish), and ``command_ledger`` (the commands this service
+started executing and the answer each got, so a restart neither runs a command
+twice nor answers it twice).
 
 :meth:`Buffer.append` is idempotent on ``(signal_id, ts)``, so a record
 processed again after a crash rewrites the same row. Cold start, recovery and
@@ -59,6 +61,12 @@ CREATE TABLE IF NOT EXISTS watermarks (
     producer  TEXT PRIMARY KEY,
     position  REAL,
     code_hash TEXT
+);
+
+CREATE TABLE IF NOT EXISTS command_ledger (
+    correlation_id TEXT PRIMARY KEY,
+    started_at     REAL NOT NULL,
+    answer         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -261,6 +269,37 @@ class Buffer:
             )
             if not self._deferred:
                 self._conn.commit()
+
+    # ─── command ledger ───────────────────────────────────────────────
+
+    def command_entry(self, correlation_id: str) -> tuple[bool, str | None]:
+        """``(started, answer)`` of a command: whether this service started
+        executing it, and the answer it recorded (JSON), if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT answer FROM command_ledger WHERE correlation_id=?", (correlation_id,)
+            ).fetchone()
+        return (row is not None, row[0] if row is not None else None)
+
+    def command_started(self, correlation_id: str, *, keep_s: float = 3600.0) -> None:
+        """Record, durably and before the handler runs, that a command is
+        being executed. Entries older than ``keep_s`` are dropped."""
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM command_ledger WHERE started_at < ?", (now - keep_s,))
+            self._conn.execute(
+                "INSERT OR IGNORE INTO command_ledger (correlation_id, started_at) VALUES (?, ?)",
+                (correlation_id, now),
+            )
+
+    def command_answered(self, correlation_id: str, answer: str) -> None:
+        """Record a command's answer before it is published."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO command_ledger (correlation_id, started_at, answer) VALUES (?, ?, ?) "
+                "ON CONFLICT(correlation_id) DO UPDATE SET answer=excluded.answer",
+                (correlation_id, time.time(), answer),
+            )
 
     @contextlib.contextmanager
     def one_commit(self) -> Iterator[None]:

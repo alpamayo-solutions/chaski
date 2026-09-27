@@ -290,9 +290,33 @@ def _connect_external_mqtt(
         will_topic, will_payload = will
         client.will_set(str(will_topic), will_payload.encode(), qos=1, retain=True)
     client.reconnect_on_failure = True
-    client.reconnect_delay_set(min_delay=1, max_delay=120)
     client.connect(host=host, port=port, clean_start=False)
     return client
+
+
+#: Longest wait between two reconnect attempts. A broker that is back is
+#: reached within this, so commands sent right after an outage do not expire.
+RECONNECT_MAX_S = 5.0
+
+
+def bound_reconnect(client: Any, maximum: float = RECONNECT_MAX_S) -> Any:
+    """Make paho wait a jittered, growing delay of at most ``maximum`` seconds
+    between reconnect attempts, instead of doubling up to two minutes.
+    Returns the :class:`~chaski.retry.Backoff`; reset it on a CONNACK."""
+    from .retry import Backoff
+
+    backoff = Backoff(minimum=1.0, maximum=maximum)
+    wait = getattr(client, "_reconnect_wait", None)
+    if wait is None or not hasattr(client, "reconnect_delay_set"):
+        return backoff
+
+    def jittered_wait() -> None:
+        delay = backoff.delay()
+        client.reconnect_delay_set(min_delay=delay, max_delay=delay)
+        wait()
+
+    client._reconnect_wait = jittered_wait
+    return backoff
 
 
 def tolerate_undecodable(client: Any) -> None:
@@ -443,6 +467,7 @@ class Service:
         self.clock = clock or Clock()
         self._clock_subscriptions: set[str] = set()
         self._subscriptions: Subscriptions | None = None
+        self._reconnect_backoff: Any = None
         self._last_clock_report = float("-inf")
         self._processed_at: float | None = None
         self._progress_stop = threading.Event()
@@ -674,6 +699,7 @@ class Service:
         # right after CONNACK, ahead of any subscription made in this run
         tolerate_undecodable(client)
         guard_network_thread(client, self.name)
+        self._reconnect_backoff = bound_reconnect(client)
         self._subscriptions = Subscriptions(client)
         client.loop_start()
         if not self._connected_event.wait(connect_timeout):
@@ -697,6 +723,8 @@ class Service:
         sock = client.socket() if hasattr(client, "socket") else None
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self._reconnect_backoff is not None and not getattr(reason_code, "is_failure", False):
+            self._reconnect_backoff.reset()
         if not self._connected_event.is_set():
             self._connect_outcome = reason_code
             self._connected_event.set()
