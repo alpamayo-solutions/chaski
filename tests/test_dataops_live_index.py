@@ -43,7 +43,7 @@ class CountingDoor(FakeDoor):
             hook()
         return entries
 
-    def fetch(self, stream, cursor, *, max=1000, tail=False):
+    def fetch(self, stream, cursor, *, max=1000, tail=False, contracts=None):
         rows = self.records[stream]
         if tail:
             return Page([], len(rows) + 1)

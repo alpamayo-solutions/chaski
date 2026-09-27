@@ -136,7 +136,10 @@ def test_command_topics_and_subscription():
     assert client.subscribed == [
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct", 1),
         (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setRecipe", 1),
+        (f"colca/v1/_Ack/{NODE_ID}/line1/operator/setProduct", 1),
+        (f"colca/v1/_Ack/{NODE_ID}/line1/operator/setRecipe", 1),
     ]
+    assert sorted(t for t, _ in client.subscribed) == commands.stream_topics(ex._handlers, NODE_ID)
 
 
 # ─── execution ───────────────────────────────────────────────────────────
