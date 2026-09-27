@@ -33,7 +33,8 @@ def next_tick(spec: CronSpec | IntervalSpec, previous: float) -> float | None:
 async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | IntervalSpec, clock: Clock) -> None:
     """One sequential loop per trigger; shutdown cancellation stays real-time.
 
-    A callback failure retries the same tick. Callbacks must use idempotent
+    A callback failure retries the same tick with bounded, jittered backoff and
+    counts against the runtime's ``handler_health``. Callbacks must use idempotent
     output identities: a crash after output but before progress commits replays
     that tick. A bounded yield gives ingest and health work CPU even at 1000x.
     """
@@ -52,6 +53,8 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
         except ClockNotReady:
             await clock.changes.wait_async(version)
     method = getattr(instance, method_name)
+    consumer = f"{instance.name}.{method_name}"
+    health = getattr(instance.runtime, "handler_health", None)
     retry = Backoff()
     while (due := next_tick(spec, previous)) is not None:
         await clock.sleep_until(due)
@@ -69,9 +72,20 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
                 await worker  # Finish/commit before the runtime closes SQLite.
                 raise
         except Exception as exc:
-            log.exception("Factory callback %s.%s failed at %.6f; will retry", instance.name, method_name, due)
-            await asyncio.sleep(retry.delay(exc))
+            count = health.failed(consumer, exc) if health is not None else retry.failures + 1
+            delay = retry.delay(exc)
+            log.error(
+                "Factory callback %s failed at %.6f (%d in a row); retrying the same tick in %.1fs",
+                consumer,
+                due,
+                count,
+                delay,
+                exc_info=exc,
+            )
+            await asyncio.sleep(delay)
             continue
+        if health is not None:
+            health.succeeded(consumer)
         retry.reset()
         previous = due
         report = getattr(instance.runtime, "report_progress", None)

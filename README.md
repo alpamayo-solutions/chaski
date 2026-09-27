@@ -248,7 +248,8 @@ drain. An expired command (`expires_at`, unix ms) is answered `498` without
 running the handler, and so is a deadline more than 60 s after the command
 arrived or was `created_at` (`400`): the sender's deadline is capped, not
 trusted. A receiver of its own checks the same rule with
-`chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`. A page of commands is acked after it was handled, so a
+`chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`: that
+answer is the command's durable rejection, and the command is not retried. A page of commands is acked after it was handled, so a
 restart can deliver a command twice: handlers must be idempotent.
 
 ## Run a node
@@ -359,12 +360,45 @@ it does not poll. Pass a stop event for cancellation during a page. A partially
 consumed page remains unacknowledged. With an external doorbell, ring it after
 setting stop to wake an idle follower.
 
-DataOps no longer skips failed handlers or failed producer startup. An ordinary
-handler error stops processing and makes service health fail; transport/backpressure
-errors use the existing retry path. No successful cursor or replay watermark is
-recorded for failed processing. Remove `strict=False` if you previously passed it.
-Correct invalid inputs explicitly or route them through your own durable rejection
-workflow; logging and returning is not recovery.
+A failed handler is never acknowledged. This holds for `@on_metric`,
+`@on_constant`, `@on_signal`, factory-time `@every`/`@cron` callbacks and
+`Service.consume()`:
+
+- The cursor moves only past the records before the failed one, so a restart
+  resumes at it. No replay watermark is recorded for failed processing.
+- The same input is retried with bounded, jittered backoff (1 s doubling to
+  30 s). An `@on_constant`/`@on_signal` retry ends early when a newer record at
+  the same topic replaces the failed one. A wall-clock `@every`/`@cron` tick has
+  no input; its next tick is the retry.
+- Each failure is logged with its traceback and counted per handler in
+  `svc.handler_health`. One failure makes the service `degraded`; five in a row
+  (`HandlerHealth(unhealthy_after=...)`) make it `unhealthy`. The first success
+  clears the count. The DataOps health door reports `handlers` and `failing`
+  and answers 503 when unhealthy; `_ServiceDetails` turns unhealthy too,
+  combined with what `svc.status()` was told.
+
+To pass an input on purpose, raise `chaski.Reject(reason, detail=...)` from the
+handler. The runner records the rejection durably, as the service's retained
+`rejected_input` `_Finding` (PUBACK awaited; each rejection is also a record on
+the `entities` stream), and acknowledges the input only after that. A rejection
+that cannot be recorded counts as a failure. `svc.clear_rejections()` retires
+the finding once the inputs were dealt with.
+
+```python
+@on_metric("panel_edge")
+async def on_edge(self, metric) -> None:
+    if metric.value is None:
+        raise chaski.Reject("edge without a value", detail={"ts": metric.timestamp})
+    self.tracker.push(metric)          # may raise: retried, never skipped
+```
+
+A plain stream consumer gets the same through `svc.consume(stream, handler,
+bell=bell, stop=stop)`. `@on_command` handlers keep their answer: a failure is
+answered `500` in the command's `_Ack`, which the sender reads, and the command
+is not run again.
+
+Handlers must be idempotent, because a retry runs the same input again.
+Remove `strict=False` if you previously passed it.
 
 An `on_metric` producer with in-memory state can set `state_version = 1` and
 implement `snapshot_state()` and `restore_state(state)`. Snapshots must be JSON

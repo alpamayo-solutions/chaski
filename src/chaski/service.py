@@ -57,7 +57,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -93,7 +93,8 @@ from .catalogue import Catalogue, element_for
 from .clock import Clock, ClockNotReady
 from .command import CommandSender
 from .coordination import StepGate
-from .door import Door, KvEntry, Stream
+from .door import Door, KvEntry, Record, Stream
+from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
 from .subscriptions import Subscriptions
 
@@ -512,6 +513,12 @@ class Service:
         self._seen: set[str] = set()
         self._last_status = "healthy"
         self._last_detail = ""
+        # What status() was last told, combined with handler_health into what
+        # _ServiceDetails says (see _publish_status).
+        self._user_ok = True
+        self._user_detail = ""
+        self.handler_health = HandlerHealth(on_change=self._handler_health_changed)
+        self._rejected = 0
         self._command_sender: CommandSender | None = None
         # The node's cursor_lag finding about this service: its topic, and the
         # summary while it stands (see cursor_lag).
@@ -1366,16 +1373,98 @@ class Service:
 
     def status(self, ok: bool, detail: str = "") -> None:
         """Republish ``_ServiceDetails`` with ``architecture_metadata.status``
-        healthy/unhealthy (+``detail``) — what a health view reads."""
+        healthy/unhealthy (+``detail``) — what a health view reads.
+
+        Combined with :attr:`handler_health`: a service whose handlers are
+        failing reports that too, and is unhealthy once one failed
+        ``unhealthy_after`` times in a row, whatever ``ok`` says."""
         if self._closed:
             raise RuntimeError("chaski.Service is closed")
         if self._client is None:
             raise RuntimeError("chaski.Service: call start() (or use `with Service(...) as svc:`) before status()")
+        self._user_ok, self._user_detail = ok, detail
+        self._publish_status()
+
+    def _publish_status(self) -> None:
+        handlers = self.handler_health.status
+        summary = self.handler_health.summary()
+        ok = self._user_ok and handlers != UNHEALTHY
+        detail = "; ".join(
+            part for part in (self._user_detail, f"handlers {handlers}: {summary}" if summary else "") if part
+        )
         self._last_status = "healthy" if ok else "unhealthy"
-        self._last_detail = detail
+        self._last_detail = detail[:500]
         with self._lock:
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=detail)
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
         self._publish_details(details)
+
+    def _handler_health_changed(self, _status: str, _summary: str) -> None:
+        """A consumer started or stopped failing: republish the status, off
+        the reporting thread (it may be an event loop or an MQTT callback)."""
+        if self._client is None or self._closed:
+            return
+
+        def publish() -> None:
+            try:
+                self._publish_status()
+            except Exception:
+                logger.warning("chaski.Service: could not publish handler health", exc_info=True)
+
+        threading.Thread(target=publish, name=f"{self.name}-handler-health", daemon=True).start()
+
+    def _rejection_topic(self) -> str:
+        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{REJECTED_FINDING}"
+
+    def reject(self, consumer: str, subject: dict[str, Any], rejected: Reject) -> None:
+        """Record that ``consumer`` set an input aside on purpose, durably:
+        the service's ``rejected_input`` ``_Finding``, retained, with the
+        node's PUBACK awaited. Runners call this when a handler raises
+        :class:`chaski.Reject`, and acknowledge the input only after it
+        returned. Every rejection is one more record on the ``entities``
+        stream; the retained record is the latest. :meth:`clear_rejections`
+        retires it once the inputs were dealt with."""
+        with self._lock:
+            self._rejected += 1
+            count = self._rejected
+        payload = rejection_finding(consumer, subject, rejected, rejected=count)
+        self.send(self._rejection_topic(), json.dumps(payload), retain=True)
+        logger.warning("chaski.Service: %s rejected %s: %s", consumer, subject, rejected.reason)
+
+    def clear_rejections(self) -> None:
+        """Retire the ``rejected_input`` finding."""
+        self.retract(self._rejection_topic())
+
+    def consume(
+        self,
+        stream: Stream,
+        handler: Callable[[Record], Any],
+        *,
+        bell: Any = None,
+        stop: threading.Event | None = None,
+        consumer: str | None = None,
+    ) -> None:
+        """Run ``handler(record)`` for every record of ``stream`` (from
+        :meth:`stream`), now and whenever it grows, until ``stop`` is set.
+
+        A handler that raises is not acknowledged: the cursor moves only past
+        the records before it, the same record is retried with bounded,
+        jittered backoff, and :attr:`handler_health` reports the consumer
+        degraded, then unhealthy. Raise :class:`chaski.Reject` to set a
+        record aside instead (see :meth:`reject`). ``bell`` is a
+        :class:`chaski.Doorbell` rung by the stream's MQTT topics and on
+        reconnect; without one the stream's growth is watched. Blocks.
+        """
+        from .consume import consume
+
+        consume(
+            stream,
+            handler,
+            health=self.handler_health,
+            reject=self.reject,
+            bell=bell,
+            stop=stop,
+            consumer=consumer,
+        )
 
     # -- signal binding ------------------------------------------------
 

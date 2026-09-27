@@ -26,6 +26,7 @@ from .connector import (
 )
 from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
+from .failures import HandlerHealth, Reject
 from .node import Node
 from .service import LocalDoor, NotEnrolled, Service
 
@@ -42,6 +43,7 @@ __all__ = [
     "Doorbell",
     "Driver",
     "Gap",
+    "HandlerHealth",
     "KvEntry",
     "LocalDoor",
     "Node",
@@ -49,6 +51,7 @@ __all__ = [
     "Page",
     "Reading",
     "Record",
+    "Reject",
     "Service",
     "SourceDisconnectedError",
     "Stream",
