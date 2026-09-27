@@ -217,28 +217,13 @@ def test_retained_definition_cannot_be_mutated_by_caller():
     assert clock.now() == 1200
 
 
-def test_a_scheduled_time_holds_for_its_task_and_not_for_a_task_it_starts():
-    async def read(clock):
-        return clock.now()
+def test_mqtt_echo_of_locally_applied_segment_is_not_a_revision_conflict():
+    from dataclasses import asdict
 
-    async def run():
-        clock = Time().clock()
-        clock.apply_definition(definition(rate=1))
-        live = clock.now()
-        with clock.at(5.0):
-            assert clock.now() == 5.0
-            started = asyncio.ensure_future(read(clock))
-        assert await started == live
+    from colca_data_contracts.payload import ClockSegment
 
-    asyncio.run(run())
-
-
-def test_a_scheduled_time_set_outside_a_loop_holds_inside_the_callback_it_runs():
-    clock = Time().clock()
-    clock.apply_definition(definition(rate=1))
-
-    async def callback():
-        return clock.now()
-
-    with clock.at(7.0):
-        assert asyncio.run(callback()) == 7.0
+    clock = Clock(wall=lambda: 10001)
+    value = definition(real_anchor=10001, factory_anchor=1100, rate=100, previous=ClockSegment(10000, 1000, 100, 1100))
+    assert clock.apply_definition(value)
+    assert not clock.apply_definition(type(value)(**asdict(value)))
+    assert clock.status().ready

@@ -51,16 +51,16 @@ import json
 import logging
 import math
 import os
+import socket
 import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from urllib.parse import urlsplit
 
 import paho.mqtt.client as pahomqtt
@@ -88,12 +88,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import NameOID
 from franzmq import Client, Topic
 
+from ._wakeup import Wakeup
 from .catalogue import Catalogue, element_for
 from .clock import Clock, ClockNotReady
 from .command import CommandSender
 from .coordination import StepGate
 from .door import Door, KvEntry, Stream
+from .pending import PendingSamples
 from .subscriptions import Subscriptions
+
+if TYPE_CHECKING:
+    from .retained_view import RetainedView
+    from .stream_changes import StreamChanges
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +118,7 @@ class Binding(NamedTuple):
 
 # How often the "still unbound" line repeats for a buffering path.
 _UNBOUND_LOG_INTERVAL = 300.0
-# A path without a Signal buffers at most this many samples, dropping the oldest.
+# Unbound paths backpressure at this durable queue bound.
 _MAX_BUFFERED_PER_PATH = 100
 _DEFAULT_EXTERNAL_MQTT_PORT = 8883
 _DEFAULT_EXTERNAL_API_PORT = 443
@@ -452,7 +458,12 @@ class Service:
         self._announced_commands: list[tuple[str, str]] = sorted(set(commands or []))
         self._state_dir = Path(state_dir) if state_dir is not None else _default_state_dir(name)
         self.step = (
-            StepGate(self, step_dependencies, self._state_dir / "clock-progress.json")
+            StepGate(
+                self,
+                step_dependencies,
+                self._state_dir / "clock-progress.json",
+                asynchronous=os.environ.get("FACTORY_ASYNC_CONSUMER") == "true",
+            )
             if step_dependencies is not None
             else None
         )
@@ -468,6 +479,8 @@ class Service:
         # HTTP client for kv() and stream(), opened by start() on the same door
         # and identity as the MQTT client.
         self._http: Door | None = None
+        self._stream_watches: list[StreamChanges] = []
+        self._retained_views: list[RetainedView] = []
         self._connected = False
         self._closed = False
         self._node_id: str | None = None
@@ -485,10 +498,15 @@ class Service:
         # The SIGNAL's own topic -> Binding. See Binding for why the key is
         # the signal's topic and not the tag id.
         self._bindings: dict[str, Binding] = {}
-        self._buffer: dict[str, deque] = {}
+        self._pending_samples: PendingSamples | None = None
+        self._pending_sources: set[str] = set()
+        self._pending_wake = Wakeup()
+        self._pending_stop = threading.Event()
+        self._pending_thread = None
         # First CONNACK: start() waits on this; every later on_connect is a
         # reconnect and re-announces placement instead (see _on_connect).
         self._connected_event = threading.Event()
+        self._reannounce_stop = threading.Event()
         self._connect_outcome: Any = None
         self._unbound_log_at: dict[str, float] = {}
         self._seen: set[str] = set()
@@ -534,10 +552,26 @@ class Service:
         """
         if self._client is not None:
             return self
-        if self._external:
-            self._start_external(connect_timeout)
-        else:
-            self._start_local(connect_timeout)
+        try:
+            if self._external:
+                self._start_external(connect_timeout)
+            else:
+                self._start_local(connect_timeout)
+        except Exception:
+            self._reset_after_failed_connect()
+            raise
+        if (self._state_dir / "pending-samples.sqlite3").exists():
+            with self._lock:
+                self._open_pending()
+                pending = cast(PendingSamples, self._pending_samples)
+                for path in self._pending_sources:
+                    _, value, _, unit = pending.page(path, 1)[0]
+                    self._started_catalogue.ensure(path, value, unit)
+                    self._seen.add(path)
+                catalogue = self._catalogue_to_publish()
+            if catalogue is not None:
+                self._publish_catalogue(catalogue)
+            self._pending_wake.notify()
         return self
 
     def _start_local(self, connect_timeout: float) -> None:
@@ -649,9 +683,13 @@ class Service:
         """paho's CONNACK callback, on its network thread. The first one lets
         :meth:`start` finish on the caller's thread (:meth:`_after_connect`);
         later ones are reconnects, possibly after a re-placement, and
-        re-announce (:meth:`_reannounce`). A reconnect to a node that lost the
-        session subscribes everything again first. Nothing here may wait for
-        a PUBACK."""
+        re-announce (:meth:`_reannounce`). Nothing here may wait for a PUBACK."""
+        # Small ordered MQTT packets otherwise wait for TCP delayed ACKs
+        # when a subscription acknowledgement precedes a publish. Apply on
+        # every connection, including reconnects and TLS sockets.
+        sock = client.socket() if hasattr(client, "socket") else None
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if not self._connected_event.is_set():
             self._connect_outcome = reason_code
             self._connected_event.set()
@@ -669,13 +707,39 @@ class Service:
         else:
             logger.info("chaski.Service: %s reconnected; the broker kept the session", self.name)
         self._broker_state_changed(True)
+        self._reannounce_stop.set()
+        self._reannounce_stop = threading.Event()
         try:
             self._reannounce(client, fresh)
-        except Exception:
-            logger.exception("chaski.Service: re-announcing %s after a reconnect failed", self.name)
+        except Exception as exc:
+            logger.exception("chaski.Service: re-announcing %s after a reconnect failed; retrying", self.name)
+            threading.Thread(
+                target=self._retry_reannounce,
+                args=(client, self._reannounce_stop, exc, fresh),
+                daemon=True,
+                name=f"{self.name}-registration-retry",
+            ).start()
+
+    def _retry_reannounce(self, client: Any, cancelled: threading.Event, error=None, fresh=False) -> None:
+        # MQTT may accept connections before the HTTP registration door is ready.
+        # Retry only this failed operation; do not wait on the network thread or
+        # introduce a recurring registration poll once it succeeds.
+        from .retry import Backoff
+
+        retry = Backoff()
+        while not cancelled.wait(retry.delay(error)):
+            if self._closed:
+                return
+            try:
+                self._reannounce(client, fresh)
+                return
+            except Exception as exc:
+                error = exc
+                logger.warning("chaski.Service: registration retry for %s failed", self.name, exc_info=True)
 
     def _on_disconnect(self, *_args: Any, **_kwargs: Any) -> None:
         logger.warning("chaski.Service: %s disconnected from the broker (auto-reconnecting)", self.name)
+        self._reannounce_stop.set()
         self._broker_state_changed(False)
 
     def _broker_state_changed(self, connected: bool) -> None:
@@ -776,6 +840,12 @@ class Service:
         self._close_http()
 
     def _close_http(self) -> None:
+        for view in self._retained_views:
+            view.close()
+        self._retained_views.clear()
+        for watch in self._stream_watches:
+            watch.close()
+        self._stream_watches.clear()
         if self._http is not None:
             self._http.close()
             self._http = None
@@ -946,11 +1016,17 @@ class Service:
         )
 
     def wait_enrolled(self, timeout: float = 60.0, *, poll_interval: float = 2.0) -> Service:
-        """Poll ``start()`` — reconnecting — until the operator enrolls this
-        identity, or ``timeout`` elapses. Outside a deployment only."""
+        """Retry refused authentication until enrollment or the deadline.
+
+        An unenrolled identity cannot subscribe yet. ``poll_interval`` is the
+        compatibility name for the minimum retry backoff, not an idle poll.
+        """
         if not self._external:
             raise RuntimeError("chaski.Service.wait_enrolled() only applies outside a deployment (node=<url>)")
         deadline = time.monotonic() + timeout
+        from .retry import Backoff
+
+        retry = Backoff(minimum=min(30.0, max(0.001, poll_interval)))
         last_exc: Exception | None = None
         while True:
             remaining = deadline - time.monotonic()
@@ -961,7 +1037,7 @@ class Service:
                 return self
             except NotEnrolled as exc:
                 last_exc = exc
-                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(retry.delay(exc), max(0.0, deadline - time.monotonic())))
         raise TimeoutError(
             f"chaski.Service: {self.name} still not enrolled at {self._node_url} "
             f"after {timeout:.0f}s" + (f" ({last_exc})" if last_exc else "")
@@ -996,8 +1072,9 @@ class Service:
             catalogue = self._catalogue_to_publish()
             bound = self._bindings_for(tag_id)
             targets = [(b.topic, b.signal.id) for b in bound if b.signal.is_published]
-            if not bound:
-                self._buffer_sample(path, value, timestamp)
+            if not bound or (self._pending_samples is not None and path in self._pending_sources):
+                self._buffer_sample(path, value, timestamp, unit)
+                targets = []
         # Outside the lock — see _publish_outside_the_lock. The catalogue goes
         # first either way: it is what makes the node mint the Signal this
         # sample binds to, so a buffered sample still has to publish it.
@@ -1019,19 +1096,61 @@ class Service:
         metric = Metric(value=value, timestamp=_epoch(timestamp), signal_id=signal_id)
         self._started_client.publish(topic, metric, qos=1, wait=wait)
 
-    def _buffer_sample(self, path: str, value: Any, timestamp: Any | None) -> None:
-        queue = self._buffer.setdefault(path, deque(maxlen=_MAX_BUFFERED_PER_PATH))
-        queue.append((value, timestamp))
-        now = time.monotonic()
-        last = self._unbound_log_at.get(path, 0.0)
-        if now - last >= _UNBOUND_LOG_INTERVAL:
-            self._unbound_log_at[path] = now
-            logger.warning(
-                "chaski.Service: %r has no bound Signal yet — buffering (%d queued, capped at %d)",
-                path,
-                len(queue),
-                _MAX_BUFFERED_PER_PATH,
+    def _open_pending(self):
+        if self._pending_samples is None:
+            self._pending_samples = PendingSamples(self._state_dir / "pending-samples.sqlite3")
+            self._pending_sources = set(self._pending_samples.sources())
+            self._pending_thread = threading.Thread(
+                target=self._drain_pending, name=f"{self.name}-pending", daemon=True
             )
+            self._pending_thread.start()
+
+    def _buffer_sample(self, path, value, timestamp, unit=None):
+        self._open_pending()
+        self._pending_samples.append(path, value, timestamp, unit, _MAX_BUFFERED_PER_PATH)
+        self._pending_sources.add(path)
+        self._pending_wake.notify()
+        now = time.monotonic()
+        if now - self._unbound_log_at.get(path, 0.0) >= _UNBOUND_LOG_INTERVAL:
+            self._unbound_log_at[path] = now
+            logger.warning("chaski.Service: %r queued durably pending binding/publication", path)
+
+    def _drain_pending(self):
+        from .retry import Backoff
+
+        retry = Backoff()
+        while not self._pending_stop.is_set():
+            version = self._pending_wake.version
+            progressed = False
+            try:
+                with self._lock:
+                    paths = list(self._pending_sources)
+                for path in paths:
+                    with self._lock:
+                        catalogue = self._started_catalogue
+                        tag = next((tag for tag in catalogue.data_tags() if tag.source == path), None)
+                        bound = self._bindings_for(tag.id) if tag else []
+                        if not bound:
+                            continue
+                        targets = [(b.topic, b.signal.id) for b in bound if b.signal.is_published]
+                        rows = self._pending_samples.page(path)
+                    for _, value, timestamp, _ in rows:
+                        for topic, signal_id in targets:
+                            self._publish_metric(topic, signal_id, value, timestamp)
+                    # Disabled bindings deliberately suppress publication. Otherwise
+                    # every target has acknowledged before these rows are removed.
+                    with self._lock:
+                        self._pending_samples.ack([row[0] for row in rows])
+                        if not self._pending_samples.page(path, 1):
+                            self._pending_sources.discard(path)
+                    progressed |= bool(rows)
+                retry.reset()
+            except Exception as exc:
+                logger.warning("Pending sample publication failed; retaining rows: %s", type(exc).__name__)
+                self._pending_stop.wait(retry.delay(exc))
+                continue
+            if not progressed:
+                self._pending_wake.wait(version)
 
     # -- records and commands ------------------------------------------------
 
@@ -1107,6 +1226,24 @@ class Service:
         are returned. Requires :meth:`start`."""
         return self._require_http("kv").kv(prefix, contract=contract)
 
+    def watch_streams(self, *streams):
+        """Subscribe to local durable-stream changes. Closed with this service."""
+        from .stream_changes import StreamChanges
+
+        watch = StreamChanges(self._require_http("watch_streams"), streams).start()
+        self._stream_watches.append(watch)
+        return watch
+
+    def retained_view(self, *, contracts, streams, cursor, on_change=None):
+        """Rebuildable retained view, updated from durable stream notifications."""
+        from .retained_view import RetainedView
+
+        view = RetainedView(
+            self._require_http("retained_view"), contracts, streams, self.cursor_prefix + cursor, on_change=on_change
+        ).start()
+        self._retained_views.append(view)
+        return view
+
     def stream(
         self,
         name: str,
@@ -1148,13 +1285,13 @@ class Service:
             connector_id = self._catalogue.connector if self._catalogue is not None else ""
             return [
                 (path, _pending_reason(path, self._resolved_mount, connector_id, connected=self._connected))
-                for path in self._buffer
+                for path in self._pending_sources
             ]
 
     # -- health --------------------------------------------------------
 
     def report_progress(self, processed_at: float, *, force: bool = False) -> bool:
-        """Report application progress at most once per real second.
+        """Report application progress immediately when forced; health every five seconds.
 
         This is control/health state, not a business or historian fact. A
         simulation must report what it processed, not just its target clock.
@@ -1190,10 +1327,12 @@ class Service:
     def _publish_progress(self, *, force: bool = False) -> bool:
         now = time.monotonic()
         with self._lock:
-            if self._closed or self._processed_at is None or (not force and now - self._last_clock_report < 1):
+            if self._closed or self._processed_at is None or (not force and now - self._last_clock_report < 5):
                 return False
             processed_at = self._processed_at
-            self._last_clock_report = now
+            publish_details = now - self._last_clock_report >= 5
+            if publish_details:
+                self._last_clock_report = now
         status = asdict(self.clock.status())
         status["processed_at"] = processed_at
         try:
@@ -1203,7 +1342,11 @@ class Service:
         status["lag_s"] = max(0, status["factory_now"] - processed_at) if status["factory_now"] is not None else None
         with self._lock:
             self.metadata["application_clock"] = status
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+            details = (
+                self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+                if publish_details or self.step is None
+                else None
+            )
         try:
             if self.step is not None and status.get("run_id"):
                 # This marker travels in-order behind samples. Colca drains
@@ -1212,7 +1355,10 @@ class Service:
                 self.send(
                     marker_topic, json.dumps({"run_id": status["run_id"], "processed_at": processed_at}), retain=True
                 )
-            self._publish_details(details)
+            # Ordered progress is frequent; the full service projection only
+            # needs a real-time heartbeat, even during accelerated simulation.
+            if details is not None:
+                self._publish_details(details)
         except Exception:
             logger.warning("Could not publish application clock progress", exc_info=True)
             return False
@@ -1262,18 +1408,7 @@ class Service:
             metric_topic = Topic(payload_type=Metric, node_id=parts[3], context=tuple(parts[4:]))
             self._bindings[topic_str] = Binding(tag_id, metric_topic, signal)
             self._bindings_changed()
-            # The buffer held samples for a path with no binding; it has one
-            # now. Switched off by the node (is_published false), they are
-            # dropped rather than kept for a binding that already exists.
-            queued = self._buffer.pop(source, None)
-            if not signal.is_published:
-                queued = None
-        if queued:
-            # This runs on the MQTT network thread, which cannot wait for its own
-            # PUBACK, so publish without waiting; franzmq's own detection does not
-            # cover this callback path.
-            for value, timestamp in queued:
-                self._publish_metric(metric_topic, signal.id, value, timestamp, wait=False)
+            self._pending_wake.notify()
 
     def _bindings_changed(self) -> None:
         """Hook, under the lock: the binding table changed."""
@@ -1388,6 +1523,13 @@ class Service:
         self._disconnect_client()
 
     def _stop_progress(self) -> None:
+        self._pending_stop.set()
+        self._pending_wake.notify()
+        if self._pending_thread is not None:
+            self._pending_thread.join(timeout=15)
+            if not self._pending_thread.is_alive():
+                self._pending_samples.close()
+        self._reannounce_stop.set()
         self._progress_stop.set()
         if self._progress_thread is not None:
             self._progress_thread.join(timeout=10)
@@ -1426,6 +1568,8 @@ class Service:
             _revoke_external(node_url, ulid, token, api_port=self._api_port_override)
 
     def _disconnect_client(self) -> None:
+        if self._subscriptions is not None:
+            self._subscriptions.close()
         if self._client is not None:
             try:
                 self._client.loop_stop()

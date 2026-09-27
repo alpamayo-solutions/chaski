@@ -282,7 +282,7 @@ class GrowingDoor(CursorDoor):
 
 
 @run_async
-async def test_partial_pages_are_fetched_at_most_once_per_interval(tmp_path):
+async def test_drain_starts_are_batched_and_empty_head_reads_are_immediate(tmp_path):
     """A live stream at 200 records/s, read with 1000-record pages: every page
     is partial, so fetches are spaced by the interval and pages grow instead.
     Every record rings the bell, as its MQTT message would."""
@@ -304,5 +304,7 @@ async def test_partial_pages_are_fetched_at_most_once_per_interval(tmp_path):
     await asyncio.wait_for(task, timeout=5.0)
     buffer.close()
 
-    assert 5 <= len(door.fetches) <= 12, door.fetches
+    # Each batched start drains the nonempty page, then proves the head with
+    # an immediate empty read. No delay is inserted between these two pages.
+    assert 10 <= len(door.fetches) <= 26, door.fetches
     assert door.position > 150, "the loop fell behind the stream"

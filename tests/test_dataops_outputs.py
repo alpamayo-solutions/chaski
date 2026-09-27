@@ -52,18 +52,18 @@ def _bound_output(door, *, buffer=None, source="producer.computed", tag_id="tag-
 # ─── SignalOutput.publish: bound / unbound ─────────────────────────────────
 
 
-def test_unbound_output_publishes_nothing():
+def test_unbound_output_publishes_nothing(buffer):
     door = FakeDoor()  # no _Signal entries at all
-    out = _bound_output(door)
+    out = _bound_output(door, buffer=buffer)
 
     out.publish(1.0)
 
     assert door.published == []
 
 
-def test_unbound_output_logs_at_warning(caplog):
+def test_unbound_output_logs_at_warning(caplog, buffer):
     door = FakeDoor()
-    out = _bound_output(door)
+    out = _bound_output(door, buffer=buffer)
 
     with caplog.at_level("WARNING", logger="chaski.dataops.outputs"):
         out.publish(1.0)
@@ -71,9 +71,9 @@ def test_unbound_output_logs_at_warning(caplog):
     assert any("computed" in r.message and "tag-1" in r.message for r in caplog.records)
 
 
-def test_unbound_output_log_is_rate_limited(caplog, monkeypatch):
+def test_unbound_output_log_is_rate_limited(caplog, monkeypatch, buffer):
     door = FakeDoor()
-    out = _bound_output(door)
+    out = _bound_output(door, buffer=buffer)
 
     clock = [1000.0]
     monkeypatch.setattr(outputs.time, "time", lambda: clock[0])
@@ -155,10 +155,10 @@ def test_rebind_is_picked_up_on_the_next_resolution_pass():
     assert json.loads(door.published[-1][1])["signal_id"] == "sig-new"
 
 
-def test_an_unbound_output_keeps_looking():
+def test_an_unbound_output_keeps_looking(buffer):
     """A miss is not held, because nothing tells the service when it is bound."""
     door = FakeDoor()  # no _Signal entries at all
-    out = _bound_output(door)
+    out = _bound_output(door, buffer=buffer)
 
     out.publish(1.0)
     assert door.published == []
@@ -469,8 +469,8 @@ def test_clear_window_outside_the_range_deletes_nothing(buffer):
     assert door.published == []
 
 
-def test_a_refused_scan_idles_the_publish_instead_of_killing_the_tick():
-    """A 429 on the KV scan idles the value instead of raising; a 500 still raises."""
+def test_a_refused_scan_persists_the_sample_and_propagates_backpressure(buffer):
+    """A 429 preserves the sample and propagates Retry-After to the runtime."""
     import httpx
 
     class RefusingDoor(FakeDoor):
@@ -486,8 +486,10 @@ def test_a_refused_scan_idles_the_publish_instead_of_killing_the_tick():
                 response=httpx.Response(self.status, request=request),
             )
 
-    out = _bound_output(RefusingDoor(429), source="p.availability")
-    out.publish(1.0)  # must not raise
+    out = _bound_output(RefusingDoor(429), buffer=buffer, source="p.availability")
+    with pytest.raises(httpx.HTTPStatusError):
+        out.publish(1.0, timestamp=10)
+    assert buffer.pending_outputs("p.availability") == [(10, 1.0)]
 
     out500 = _bound_output(RefusingDoor(500), source="p.availability")
     try:
@@ -589,3 +591,25 @@ def test_delete_with_neither_a_start_nor_an_id_is_refused(buffer):
 
     with pytest.raises(TypeError, match="time_start, or the annotation_id"):
         out.delete()
+
+
+def test_unbound_samples_survive_restart_and_flush_without_another_sample(tmp_path):
+    path = tmp_path / "outputs.sqlite3"
+    door = FakeDoor()
+    with Buffer(path) as buffer:
+        out = _bound_output(door, buffer=buffer)
+        out.publish(1, timestamp=100)
+        out.publish(2, timestamp=101)
+    door.entries = [_signal_entry("colca/v1/_Signal/n-1/computed", signal_id="sig", data_tag="tag-1")]
+    with Buffer(path) as buffer:
+        restored = _bound_output(door, buffer=buffer)
+        restored.flush()
+        assert buffer.pending_outputs(restored.source) == []
+    assert [(json.loads(p)["timestamp"], json.loads(p)["value"]) for _, p in door.published] == [(100, 1), (101, 2)]
+
+
+def test_full_unbound_queue_refuses_new_sample_without_evicting_history(buffer):
+    buffer.queue_output("x", 1, 10, limit=1)
+    with pytest.raises(BufferError):
+        buffer.queue_output("x", 2, 20, limit=1)
+    assert buffer.pending_outputs("x") == [(1, 10)]

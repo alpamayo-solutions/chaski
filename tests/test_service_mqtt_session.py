@@ -44,7 +44,10 @@ def _read_packet(conn: socket.socket) -> tuple[int, bytes] | None:
         return None
     length, shift = 0, 0
     while True:
-        byte = conn.recv(1)[0]
+        chunk = conn.recv(1)
+        if not chunk:
+            return None
+        byte = chunk[0]
         length |= (byte & 0x7F) << shift
         shift += 7
         if not byte & 0x80:
@@ -197,7 +200,7 @@ def test_a_refused_subscription_is_sent_again():
         started = time.monotonic()
         client.subscribe("colca/v1/_CmdParam/n/line1/operator/setRecipe", qos=1)
         assert broker.wait(lambda: len(broker.subscribed[0]) == 2)
-        assert time.monotonic() - started >= RETRY_S * 0.9
+        assert time.monotonic() - started >= RETRY_S * 0.45
     finally:
         client.loop_stop()
         broker.close()

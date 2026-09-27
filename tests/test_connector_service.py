@@ -13,6 +13,7 @@ logged once, not per poll.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -83,6 +84,19 @@ class FakeNode:
                 continue
             out.append(KvEntry(path=path, node_id=NODE, topic=topic, payload=payload, ts=0, offset=0))
         return out
+
+    def publish_batch(self, records):
+        results = []
+        for topic, payload in records:
+            try:
+                self.publish(topic, Metric(**json.loads(payload)), qos=1)
+            except PublishRejected as exc:
+                results.append({"error": str(exc)})
+            except PublishTimeout as exc:
+                raise MqttDisconnectedError(str(exc)) from exc
+            else:
+                results.append({"stream": "metrics", "offset": len(self.published)})
+        return results
 
     # -- the MQTT half --
     def _handle_on_message(self, message) -> None:
@@ -246,6 +260,11 @@ class Clock:
         return self.now
 
 
+@pytest.fixture(autouse=True)
+def durable_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLCA_STATE_DIR", str(tmp_path))
+
+
 @pytest.fixture
 def node() -> FakeNode:
     return FakeNode()
@@ -281,6 +300,12 @@ def make_service(node: FakeNode, driver: Driver, monkeypatch, *, mount: str = ""
         slept.append(seconds)
 
     svc._sleep = no_sleep
+
+    async def no_wait(version, timeout=None, **kwargs):
+        if timeout is not None:
+            await no_sleep(timeout)
+
+    svc.clock.changes.wait_async = no_wait
     svc.slept = slept  # type: ignore[attr-defined]
     return svc
 
@@ -541,7 +566,7 @@ def test_two_signals_may_read_the_same_tag(node, driver, monkeypatch):
 # ── publish on change, precision, heartbeat ────────────────────────────
 
 
-def test_an_unchanged_value_is_not_republished_and_the_heartbeat_flips_on_its_interval(node, driver, monkeypatch):
+def test_unchanged_measurements_are_preserved_and_heartbeat_only_flips_on_its_interval(node, driver, monkeypatch):
     clock = Clock()
     svc = started(node, driver, monkeypatch, clock=clock, heartbeat_interval=5.0)
     bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
@@ -551,11 +576,11 @@ def test_an_unchanged_value_is_not_republished_and_the_heartbeat_flips_on_its_in
     assert sorted(m.signal_id for _t, m in node.metrics()) == ["s-hb", "s-temp"]
 
     poll(svc)
-    assert len(node.metrics()) == 2, "same value, same heartbeat phase: nothing new to say"
+    assert len(node.metrics()) == 3, "the stable measurement is a new observation"
 
     clock.now += 5.0
     poll(svc)
-    assert [m.signal_id for _t, m in node.metrics()[2:]] == ["s-hb"], "no value change -> heartbeat only"
+    assert [m.signal_id for _t, m in node.metrics()[3:]] == ["s-temp", "s-hb"]
     assert node.metrics()[-1][1].value != node.metrics()[0][1].value
 
     driver.values["Axis1/Temperature"] = 43.0
@@ -563,7 +588,7 @@ def test_an_unchanged_value_is_not_republished_and_the_heartbeat_flips_on_its_in
     assert node.metrics()[-1][1].signal_id == "s-temp" and node.metrics()[-1][1].value == 43.0
 
 
-def test_values_are_rounded_to_the_signals_precision_and_deduplicated_within_it(node, driver, monkeypatch):
+def test_precision_rounds_values_without_suppressing_observations(node, driver, monkeypatch):
     svc = started(node, driver, monkeypatch)
     bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s", precision=1)
     driver.values["Axis1/Temperature"] = 42.04
@@ -572,7 +597,7 @@ def test_values_are_rounded_to_the_signals_precision_and_deduplicated_within_it(
     poll(svc)
     driver.values["Axis1/Temperature"] = 42.14  # still 42.1: not a change
     poll(svc)
-    assert [m.value for _t, m in node.metrics()] == [42.0, 42.1]
+    assert [m.value for _t, m in node.metrics()] == [42.0, 42.1, 42.1]
 
 
 def test_every_metric_of_one_poll_carries_the_same_timestamp(node, driver, monkeypatch):
@@ -654,11 +679,10 @@ def test_a_lost_source_keeps_the_heartbeat_and_reconnects_with_backoff(node, dri
         "the connector is alive even when its source is not; the heartbeat says so"
     )
     assert ("source", False) in telemetry.events
-    # Two failed reconnects, each backed off longer than the next (5 s steps,
-    # jittered), then the third succeeds.
+    # Two failed reconnects with bounded exponential jitter, then success.
     assert driver.connects == 1 + 3 and driver.closes == 3
-    backoffs = [s for s in svc.slept if s >= 1.0]
-    assert len(backoffs) == 2 and backoffs[0] > backoffs[1] >= 6.0, svc.slept
+    backoffs = [s for s in svc.slept if s >= 0.5]
+    assert len(backoffs) == 2 and 0.5 <= backoffs[0] <= 1.0 and 1.0 <= backoffs[1] <= 2.0, svc.slept
 
     driver.fail_reads = False
     poll(svc)
@@ -726,13 +750,18 @@ def test_a_publish_timeout_mid_batch_buffers_the_rest_and_pending_goes_out_first
     assert svc._pending == []
 
 
-def test_backpressure_bounds_the_buffer_at_max_pending_dropping_the_oldest(node, driver, monkeypatch):
+def test_backpressure_refuses_an_oversized_cycle_without_eviction(node, driver, monkeypatch):
     svc = started(node, driver, monkeypatch, max_pending=100)
     node.connected = False
     batch = _batch(125)
-    with pytest.raises(MqttDisconnectedError):
+    with pytest.raises(BufferError):
         svc._publish_batch(batch)
-    assert svc._pending == batch[-100:]
+    assert svc._pending == []
+    with pytest.raises(MqttDisconnectedError):
+        svc._publish_batch(batch[:100])
+    with pytest.raises(BufferError):
+        svc._publish_batch(batch[100:])
+    assert svc._pending == batch[:100]
     assert node.queue_limit == 100, "paho's own queue is capped at the same bound — one bound, not two"
 
 
@@ -755,14 +784,14 @@ def test_a_broker_outage_in_the_loop_reconnects_and_flushes_when_it_returns(node
     assert any("MQTT reconnected after" in m for m in messages)
 
 
-def test_a_rejected_metric_is_dropped_loudly_not_buffered(node, driver, monkeypatch, caplog):
+def test_a_rejected_metric_remains_durable_and_fails_visibly(node, driver, monkeypatch):
     telemetry = RecordingTelemetry()
     svc = started(node, driver, monkeypatch, telemetry=telemetry)
     node.reject = PublishRejected(0x99, "colca/v1/_Metric/x")
-    with caplog.at_level(logging.ERROR):
+    with pytest.raises(PublishRejected):
         svc._publish_batch(_batch(1))
-    assert svc._pending == [] and ("rejected", 0x99) in telemetry.events
-    assert any("[PUBLISH]" in r.getMessage() for r in caplog.records)
+    assert svc._pending == _batch(1)
+    assert ("rejected", 0x80) in telemetry.events
 
 
 # ── an outage is a state ────────────────────────────────────────────────
@@ -924,3 +953,65 @@ def test_serve_runs_discovery_binding_and_polling_until_stopped(node, driver, mo
     thread.join(5)
     assert not thread.is_alive()
     assert node.details()[-1].is_active is False and driver.closes >= 1
+
+
+def test_connector_outage_journal_survives_process_restart(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch)
+    samples = _batch(3)
+    node.connected = False
+    with pytest.raises(MqttDisconnectedError):
+        svc._publish_batch(samples)
+    node.connected = True
+    svc.close()
+    resumed = started(node, driver, monkeypatch)
+    calls = []
+    publish = node.publish_batch
+
+    def record_batch(rows):
+        calls.append(len(rows))
+        return publish(rows)
+
+    node.publish_batch = record_batch
+    resumed._publish_batch([])
+    assert calls == [3]
+    assert [m for _, m in node.metrics()] == [m for _, m in samples]
+    assert resumed._pending == []
+    resumed.close()
+
+
+def test_batch_partial_refusal_retries_only_unaccepted_samples(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch)
+    publish = node.publish_batch
+
+    def partial(rows):
+        return publish(rows[:1]) + [{"error": "invalid binding"} for _ in rows[1:]]
+
+    node.publish_batch = partial
+    with pytest.raises(PublishRejected):
+        svc._publish_batch(_batch(3))
+    assert svc._pending == _batch(3)[1:]
+    node.publish_batch = publish
+    svc._publish_batch([])
+    assert [m.value for _, m in node.metrics()] == [0, 1, 2]
+
+
+def test_batch_throttling_preserves_samples_and_server_retry_deadline(node, driver, monkeypatch):
+    import httpx
+
+    svc = started(node, driver, monkeypatch)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    publish = node.publish_batch
+
+    def throttled(rows):
+        response = httpx.Response(
+            429, headers={"Retry-After": "7"}, request=httpx.Request("POST", "http://colca/publish/batch")
+        )
+        response.raise_for_status()
+
+    node.publish_batch = throttled
+    poll(svc)
+    assert svc.slept[-1] == 7
+    assert len(svc._pending) == 1
+    node.publish_batch = publish
+    svc._publish_batch([])
+    assert svc._pending == []

@@ -41,6 +41,8 @@ import ulid as ulid_lib
 import yaml
 
 from .clock import Clock
+from .door import Door
+from .retry import Backoff
 from .service import LocalDoor, Service
 
 logger = logging.getLogger(__name__)
@@ -56,7 +58,6 @@ _MAX_LOG_BYTES = 10 * 1024 * 1024
 _LOG_TAIL_LINES = 20
 
 _HEALTHZ_TIMEOUT = 5.0
-_STATUS_POLL_INTERVAL = 0.5
 
 
 class NodeCrashed(RuntimeError):
@@ -246,6 +247,7 @@ class Node:
 
         self._log_writer: _RotatingLogWriter | None = None
         self._log_thread: threading.Thread | None = None
+        self._startup_event = threading.Event()
         self._log_tail: deque[str] = deque(maxlen=_LOG_TAIL_LINES)
 
     # -- parent trust (TOFU) ---------------------------------------------
@@ -386,6 +388,7 @@ class Node:
         # nothing to read.
         self._addr_file().unlink(missing_ok=True)
         self._log_writer = _RotatingLogWriter(self.data_dir / "colcad.log")
+        self._startup_event.clear()
         self._process = subprocess.Popen(  # noqa: S603 - binary is resolved above, not shell-interpreted  # nosec B603
             [binary, str(self._config_path())],
             stdout=subprocess.PIPE,
@@ -411,20 +414,19 @@ class Node:
     def _wait_addresses(self, timeout: float) -> None:
         """Learn where colcad's doors landed. The file is written atomically
         once every listener is bound, so its existence means it is complete."""
-        deadline = time.monotonic() + timeout
         path = self._addr_file()
-        while time.monotonic() < deadline:
-            if self._process is not None and self._process.poll() is not None:
-                raise RuntimeError(self._crash_message(self._process.returncode))
-            if path.exists():
-                addresses = json.loads(path.read_text(encoding="utf-8"))
-                self._ports = {
-                    door: int(addresses[door].rsplit(":", 1)[1])
-                    for door in ("api", "api_local", "mqtt", "mqtt_local", "repl")
-                }
-                return
-            time.sleep(0.05)
-        raise TimeoutError(f"chaski.Node: colcad did not report its door addresses at {path} within {timeout:.0f}s")
+        if not self._startup_event.wait(timeout):
+            raise TimeoutError(
+                f"chaski.Node: colcad did not announce readiness within {timeout:.0f}s; use a Colca build supporting lifecycle events"
+            )
+        if self._process is not None and self._process.poll() is not None:
+            raise RuntimeError(self._crash_message(self._process.returncode))
+        if not path.exists():
+            raise RuntimeError("colcad ended without publishing door addresses")
+        addresses = json.loads(path.read_text(encoding="utf-8"))
+        self._ports = {
+            door: int(addresses[door].rsplit(":", 1)[1]) for door in ("api", "api_local", "mqtt", "mqtt_local", "repl")
+        }
 
     def _drain_log(self, pipe: Any) -> None:
         """Runs on its own thread for the process's life; an unread pipe would
@@ -435,13 +437,23 @@ class Node:
                 if writer is not None:
                     writer.write(raw_line)
                 self._log_tail.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
+                try:
+                    message = json.loads(raw_line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(message, dict) and message.get("event") == "colca.ready":
+                    self._startup_event.set()
         finally:
             pipe.close()
+            if self._process is not None:
+                self._process.wait()
+            self._startup_event.set()
 
     def _wait_healthy(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         url = f"http://127.0.0.1:{self._ports['api_local']}/healthz"
         last_error: BaseException | None = None
+        retry = Backoff()
         while time.monotonic() < deadline:
             if self._process is not None and self._process.poll() is not None:
                 raise RuntimeError(self._crash_message(self._process.returncode))
@@ -452,7 +464,7 @@ class Node:
                 return
             except Exception as exc:
                 last_error = exc
-            time.sleep(0.2)
+            time.sleep(min(retry.delay(last_error), max(0, deadline - time.monotonic())))
         raise TimeoutError(f"colcad did not become healthy within {timeout}s: {last_error}")
 
     def stop(self, *, timeout: float = 10.0) -> None:
@@ -537,14 +549,31 @@ class Node:
         a colcad crash while waiting raises NodeCrashed immediately rather
         than waiting out the deadline for a process that is never coming
         back."""
+        self._check_alive()
+        if not self._ports:
+            raise RuntimeError("Start the node before waiting for enrollment")
         deadline = time.monotonic() + timeout
         last: NodeStatus | None = None
-        while time.monotonic() < deadline:
-            self._check_alive()
-            last = self.status()
-            if last.state == "enrolled":
-                return
-            time.sleep(_STATUS_POLL_INTERVAL)
+        retry = Backoff()
+        with Door(f"http://127.0.0.1:{self._ports['api_local']}", "chaski-node-lifecycle") as door:
+            while time.monotonic() < deadline:
+                self._check_alive()
+                try:
+                    for state in door.watch_uplink(
+                        lambda: time.monotonic() >= deadline, timeout=max(0.001, min(15, deadline - time.monotonic()))
+                    ):
+                        self._check_alive()
+                        retry.reset()
+                        if state is None:
+                            continue
+                        value = state.get("state")
+                        if value in ("none", "connected"):
+                            self._ever_connected = value == "connected" or self._ever_connected
+                            return
+                        last = NodeStatus("awaiting_enrollment", self.enroll_hint())
+                except Exception as exc:
+                    self._check_alive()
+                    time.sleep(min(retry.delay(exc), max(0, deadline - time.monotonic())))
         detail = f" {last.detail}" if last and last.detail else ""
         raise TimeoutError(
             f"chaski.Node {self.name!r} did not reach 'enrolled' within {timeout}s "

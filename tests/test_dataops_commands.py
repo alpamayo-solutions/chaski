@@ -257,10 +257,12 @@ async def test_the_stream_growing_wakes_a_drain():
     ex, _producer, door = executor()
     hints = [asyncio.Event()]
 
-    def watch(streams, *, interval_ms=None):
-        assert streams == ["commands"]
+    def watch(streams, *, interval_ms=None, **kwargs):
+        assert list(streams) == ["commands"]
         door.queue(Page(records=[], next=8, start=1))
-        yield object()
+        from chaski.door import Hint
+
+        yield Hint(["commands"], {})
         hints[0].set()
 
     door.watch = watch

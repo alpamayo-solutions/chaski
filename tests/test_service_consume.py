@@ -91,8 +91,11 @@ class _FakeDoor:
     def close(self) -> None:
         self.closed = True
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
+    def fetch(self, stream, cursor, *, max=1000, signal_ids=None, tail=False):
         self.calls.append(("fetch", stream, cursor, max, signal_ids))
+        if tail:
+            records = self.streams.get(stream, [])
+            return Page(records=records[-1:], next=records[-1].offset + 1 if records else 1)
         position = self.cursors.get((stream, cursor), 0)
         lwm = self.lwm.get(stream, 1)
         gap = None
@@ -228,8 +231,8 @@ def test_drain_yields_every_record_in_order_and_acks_per_page_after_consumption(
     assert door.acks()[-1] == ("annotations", "c/erp-bridge/annotations", 5)
     assert door.cursors[("annotations", "c/erp-bridge/annotations")] == 5
     fetches = [c for c in door.calls if c[0] == "fetch"]
-    assert fetches[0][1:] == ("annotations", "c/erp-bridge/annotations", 2, None)
-    assert len(fetches) == 4, "three pages plus the empty one that ends the drain"
+    assert fetches[1][1:] == ("annotations", "c/erp-bridge/annotations", 2, None)
+    assert len(fetches) == 4, "one head capture and three data pages"
 
 
 def test_a_second_drain_resumes_from_the_acked_position(tmp_path, monkeypatch, fake_door):
@@ -280,21 +283,20 @@ def test_explicit_ack_commits_earlier_than_the_page_boundary(tmp_path, monkeypat
     assert door.cursors[("annotations", "c/erp-bridge/annotations")] == 2
 
 
-def test_a_gap_is_acked_at_its_bound_when_nothing_survived(tmp_path, monkeypatch, fake_door, caplog):
-    """When retention pruned everything unread, the drain acks the gap's bound,
-    warns, and yields nothing."""
+def test_a_gap_fails_without_ack_even_when_nothing_survived(tmp_path, monkeypatch, fake_door):
+    from chaski import StreamGapError
+
     svc = _local_service(tmp_path, monkeypatch)
     (door,) = fake_door.instances
     door.lwm["metrics"] = 50
     stream = svc.stream("metrics")
-
-    with caplog.at_level("WARNING", logger="chaski.door"):
-        assert list(stream) == []
-    assert door.acks() == [("metrics", "c/erp-bridge/metrics", 49)]
-    assert "offsets 1..49 were pruned" in caplog.text
-
+    with pytest.raises(StreamGapError, match=r"1\.\.49 were pruned"):
+        list(stream)
+    assert door.acks() == []
     door.streams["metrics"] = [_record(50, "metrics")]
-    assert [r.offset for r in stream] == [50]
+    with pytest.raises(StreamGapError):
+        list(stream)
+    assert door.acks() == []
 
 
 def test_a_new_cursor_name_starts_over_and_retire_deletes_the_old_one(tmp_path, monkeypatch, fake_door):
@@ -320,7 +322,7 @@ def test_stream_passes_signal_ids_through_to_the_metrics_fetch(tmp_path, monkeyp
     (door,) = fake_door.instances
     list(svc.stream("metrics", signal_ids=["sig-1", "sig-2"], max=10))
     fetches = [c for c in door.calls if c[0] == "fetch"]
-    assert fetches[0] == ("fetch", "metrics", "c/erp-bridge/metrics", 10, ["sig-1", "sig-2"])
+    assert fetches[1] == ("fetch", "metrics", "c/erp-bridge/metrics", 10, ["sig-1", "sig-2"])
 
 
 def test_follow_drains_at_start_then_only_when_the_bell_rings(tmp_path, monkeypatch, fake_door):
@@ -381,3 +383,32 @@ def test_kv_passes_prefix_and_contract_filter_to_the_door(tmp_path, monkeypatch,
     assert door.calls[-1] == ("kv", "line1", "_SystemElement")
     svc.kv(contract=["_Signal", "_Group"])
     assert door.calls[-1] == ("kv", "", ["_Signal", "_Group"])
+
+
+def test_drain_has_a_finite_boundary_under_continuous_input(tmp_path, monkeypatch, fake_door):
+    svc = _local_service(tmp_path, monkeypatch)
+    (door,) = fake_door.instances
+    door.streams["annotations"] = [_record(1), _record(2)]
+    seen = []
+    for record in svc.stream("annotations", max=1).drain():
+        seen.append(record.offset)
+        door.streams["annotations"].append(_record(len(door.streams["annotations"]) + 1))
+        assert len(seen) <= 2
+    assert seen == [1, 2]
+
+
+def test_cancel_mid_page_preserves_it_for_replay(tmp_path, monkeypatch, fake_door):
+    import threading
+
+    svc = _local_service(tmp_path, monkeypatch)
+    (door,) = fake_door.instances
+    door.streams["annotations"] = [_record(1), _record(2)]
+    stream = svc.stream("annotations")
+    stop = threading.Event()
+    seen = []
+    for record in stream.drain(stop=stop):
+        seen.append(record.offset)
+        stop.set()
+    assert seen == [1]
+    assert door.acks() == []
+    assert [r.offset for r in stream.drain()] == [1, 2]

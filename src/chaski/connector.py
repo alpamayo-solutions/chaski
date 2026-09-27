@@ -26,12 +26,12 @@ driver never sees a tag id, a topic it has to build, or a Metric.
 of the iteration; the next iteration starts ``interval`` after that top
 (drift-compensated), and an iteration that overran is counted and the next
 one starts immediately. A poll cycle that could not publish (broker down)
-keeps its metrics — bounded at ``max_pending``, oldest dropped — and
-prepends them to the next cycle's batch.
+journals every metric before publication. It drains that bounded journal before
+acquiring again, and preserves it through restart. Queue saturation is visible
+backpressure, never eviction.
 
 **Not included.** Metrics exposition: the loop reports to a
-:class:`Telemetry`, a no-op by default. Durability across restarts: the pending
-buffer is in memory; use ``chaski.Node`` for durability. Configuration from the
+:class:`Telemetry`, a no-op by default. Configuration from the
 environment: the process that builds a connector reads its own.
 """
 
@@ -39,8 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
-import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -50,6 +50,7 @@ from math import isclose, isfinite, isnan
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
+import httpx
 from colca_data_contracts.payload import DataTag, Metric
 from colca_data_contracts.payload import Signal as SignalRecord
 from franzmq import Topic
@@ -308,8 +309,13 @@ class ConnectorService(Service):
         self._source_healthy = False
         self._discovered = False
         self._next_discovery_retry = 0.0
+        from .retry import Backoff
+
+        self._source_backoff = Backoff()
+        self._mqtt_backoff = Backoff()
         self._heartbeat_start = self._now()
-        self._pending: list[tuple[Topic, Metric]] = []
+        self._metric_queue = None
+        self._http_backoff = Backoff()
         self._stopping = asyncio.Event()
 
         self._source_reconnects_total = 0
@@ -325,6 +331,7 @@ class ConnectorService(Service):
 
     def _bindings_changed(self) -> None:
         self._update_targets()
+        self.clock.changes.notify()
 
     def _seal_catalogue(self) -> None:
         """Discovery decides what is stale; a shutdown changes nothing."""
@@ -342,6 +349,7 @@ class ConnectorService(Service):
 
     async def stop(self) -> None:
         self._stopping.set()
+        self.clock.changes.notify()
 
     async def serve(self) -> None:
         """Register, discover, poll. Returns when :meth:`stop` is called;
@@ -473,6 +481,7 @@ class ConnectorService(Service):
     async def _poll_iteration(self) -> None:
         """One iteration of the loop, including the wait that paces the
         next one — see the module docstring's "Timing"."""
+        change_version = self.clock.changes.version
         loop_start_perf = time.perf_counter()
         # What every metric of this iteration carries: unix seconds
         # (the contract's timestamp is a number; a datetime would encode
@@ -490,7 +499,8 @@ class ConnectorService(Service):
             with self._lock:
                 targets = list(self._targets)
             if not targets:
-                await self._sleep(self.interval)
+                delay = max(0.0, self._next_discovery_retry - self._now()) if not self._discovered else None
+                await self.clock.changes.wait_async(change_version, delay, stop=self._stopping)
                 return
 
             heartbeat_id = self._started_catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
@@ -504,6 +514,11 @@ class ConnectorService(Service):
             # says so. Re-raised after publishing, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
             if protocol_targets and sampling:
+                # Retry durable output before taking another PLC observation.
+                # This is backpressure; an outage never evicts older samples.
+                self._publish_batch([])
+                if len(protocol_targets) + len(heartbeat_targets) > self.max_pending:
+                    raise BufferError("max_pending cannot hold one complete acquisition cycle")
                 try:
                     raw_batch = list(await self.driver.read(protocol_targets))
                     # The authoritative health signal: the protocol
@@ -533,7 +548,7 @@ class ConnectorService(Service):
                     value = round_to_precision(value, precision)
                 key = str(topic)
                 last = self._latest_by_topic.get(key)
-                if last is not None and is_equal(last.value, value, precision):
+                if signal.data_tag == heartbeat_id and last is not None and is_equal(last.value, value, precision):
                     continue
                 timestamp = (
                     loop_start_epoch
@@ -565,17 +580,24 @@ class ConnectorService(Service):
             self._log.error("Source disconnected: %s", exc)
             await self._reconnect_source()
 
+        except httpx.HTTPError as exc:
+            self.telemetry.broker_healthy(False)
+            self._log.warning("Metric batch deferred: %s", type(exc).__name__)
+            await self._sleep(self._http_backoff.delay(exc))
+            return
+
         except MqttDisconnectedError as exc:
             self.telemetry.broker_healthy(False)
             self._report_mqtt_outage(exc)
-            for retry in range(self.reconnect_retries):
+            for _retry in range(self.reconnect_retries):
                 try:
                     self._started_client.reconnect()
                     self._mqtt_reconnects_total += 1
                     self._report_mqtt_recovered()
+                    self._mqtt_backoff.reset()
                     break
-                except Exception:
-                    await self._sleep(1 + (self.reconnect_retries - retry) * 5)
+                except Exception as error:
+                    await self._sleep(self._mqtt_backoff.delay(error))
             await self._sleep(0.001)
             return
 
@@ -584,11 +606,23 @@ class ConnectorService(Service):
             raise
 
         elapsed = time.perf_counter() - loop_start_perf
-        cadence = (
-            0.01
-            if self.step is not None
-            else (self.interval / clock_status.rate if sampling else min(self.interval, 0.25))
-        )
+        if self.step is not None or not sampling:
+            self.telemetry.poll_completed(elapsed, overrun=False)
+            # Wake for commits or the actual heartbeat/discovery deadline.
+            # An incomplete PLC read retries on its acquisition cadence.
+            delay = None
+            if heartbeat_targets:
+                age = self._now() - self._heartbeat_start
+                delay = self.heartbeat_interval - (age % self.heartbeat_interval)
+            if not self._discovered:
+                discovery = max(0.0, self._next_discovery_retry - self._now())
+                delay = discovery if delay is None else min(delay, discovery)
+            if step_target is not None and self.step is not None and self.step.completed_at != step_target:
+                delay = self.interval if delay is None else min(delay, self.interval)
+            deadline = self.step.wait_delay(delay) if self.step is not None else delay
+            await self.clock.changes.wait_async(change_version, deadline, stop=self._stopping)
+            return
+        cadence = self.interval / clock_status.rate
         wait = cadence - elapsed
         self.telemetry.poll_completed(elapsed, overrun=wait <= 0)
         if wait > 0:
@@ -612,12 +646,10 @@ class ConnectorService(Service):
                 # authoritative (pymodbus backgrounds the TCP setup). The next
                 # read sets it once the channel actually answers.
                 self._source_reconnects_total += 1
+                self._source_backoff.reset()
                 return
-            except Exception:
-                # SystemRandom jitter: security-independent, but it also makes
-                # the delay unpredictable to a peer forcing reconnects.
-                delay = 1 + (self.reconnect_retries - retry) * 5 + secrets.randbelow(501) / 1000
-                await self._sleep(delay)
+            except Exception as exc:
+                await self._sleep(self._source_backoff.delay(exc))
         self._log.warning("Reconnect retries exhausted; staying alive with source_healthy=0")
 
     def _log_summary(self, target_count: int) -> None:
@@ -717,54 +749,66 @@ class ConnectorService(Service):
 
     # -- publishing -------------------------------------------------------
 
-    def _buffer_pending(self, pending: list[tuple[Topic, Metric]]) -> None:
-        """Keep what a cycle could not publish for the next one — bounded
-        at ``max_pending``, oldest dropped, so a long outage costs bounded
-        memory."""
-        if len(pending) > self.max_pending:
-            drop = len(pending) - self.max_pending
-            self._log.warning("Dropping %d buffered metrics (backpressure). Max pending: %d.", drop, self.max_pending)
-            pending = pending[drop:]
-        self._pending = pending
+    def _open_metric_queue(self):
+        if self._metric_queue is None:
+            from .pending import PendingSamples
+
+            self._metric_queue = PendingSamples(self._state_dir / "connector-samples.sqlite3")
+        return self._metric_queue
+
+    @property
+    def _pending(self):
+        """Diagnostic snapshot; the durable journal owns these records."""
+        if self._metric_queue is None:
+            return []
+        return [
+            (Topic.from_str(topic), Metric(**payload))
+            for _, topic, payload, _, _ in self._metric_queue.page_all(self.max_pending)
+        ]
 
     def _publish_batch(self, batch: list[tuple[Topic, Metric]]) -> None:
-        """Publish one cycle's metrics, pending ones from earlier cycles first.
-        Checks ``is_connected()`` first: paho queues a QoS 1 publish while
-        disconnected instead of raising, and waiting out each timeout would
-        stall the loop."""
-        if self._pending:
-            batch = self._pending + batch
-            self._pending = []
-        client = self._client
-        if client is None or not client.is_connected():
-            self._buffer_pending(batch)
-            raise MqttDisconnectedError("MQTT client not connected (checked before publish).")
-        # The link answered: an outage that paho's own reconnect ended between
-        # two polls is over, and the next one is news again.
+        """One durable acquisition cycle, one broker append per stream.
+
+        The HTTP door uses the same admission and MQTT fanout as individual
+        publishes. Per-record results decide which journal entries may retire;
+        transport failure or a lost reply leaves them available for replay.
+        """
+        if not batch and self._metric_queue is None and not (self._state_dir / "connector-samples.sqlite3").exists():
+            return
+        queue = self._open_metric_queue()
+        if batch:
+            queue.append_batch(
+                [(str(topic), json.loads(metric.encode()), metric.timestamp, None) for topic, metric in batch],
+                self.max_pending,
+            )
+        while rows := queue.page_all(min(self.max_pending, 1000)):
+            results = self._require_http("publish metrics").publish_batch(
+                [(topic, json.dumps(payload)) for _, topic, payload, _, _ in rows]
+            )
+            if len(results) != len(rows):
+                raise RuntimeError("broker batch receipt length does not match acquisition batch")
+            accepted = []
+            refused = []
+            for row, result in zip(rows, results, strict=True):
+                identity, topic, payload, _, _ = row
+                if result.get("error") or "offset" not in result:
+                    refused.append(PublishRejected(0x80, topic, str(result.get("error", "missing durable offset"))))
+                else:
+                    accepted.append(identity)
+                    self._summary_published += 1
+                    self.telemetry.published(Metric(**payload), node_id=self._node_id or "")
+            queue.ack(accepted)
+            if refused:
+                self.telemetry.publish_rejected(refused[0].reason_code)
+                raise refused[0]
+        self._http_backoff.reset()
         self._report_mqtt_recovered()
-        for index, (topic, metric) in enumerate(batch):
-            try:
-                # QoS 1: durable ingest is the point, and it is the only
-                # level at which the broker can say it refused a record.
-                client.publish(topic, metric, qos=1)
-                self._summary_published += 1
-                self.telemetry.published(metric, node_id=self._node_id or "")
-            except PublishRejected as exc:
-                if self.step is not None:
-                    raise
-                # Refused by the broker: retrying would fail the same way, so the
-                # record is dropped and the reason reported.
-                self.telemetry.publish_rejected(exc.reason_code)
-                self._log.error("[PUBLISH] %s", exc)
-            except (ConnectionError, MqttDisconnectedError, PublishTimeout) as exc:
-                # A timeout means paho queued the publish undelivered: the broker
-                # is gone, so treat it as a disconnect.
-                self._buffer_pending(batch[index:])
-                raise MqttDisconnectedError(str(exc)) from exc
-            except Exception as exc:
-                if self.step is not None:
-                    raise
-                self._log.error("Publish error to %s: %s", topic, exc)
+
+    def close(self) -> None:
+        super().close()
+        if self._metric_queue is not None:
+            self._metric_queue.close()
+            self._metric_queue = None
 
     # -- outage reporting -------------------------------------------------
 

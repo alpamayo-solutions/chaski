@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import textwrap
+import threading
 import types
 
 import pytest
@@ -383,17 +384,22 @@ def test_wait_enrolled_raises_node_crashed_immediately_on_a_crashed_process(tmp_
 
 def test_wait_enrolled_times_out_with_the_status_detail(tmp_path, monkeypatch):
     node = _node_with_fake_process(tmp_path)
-    monkeypatch.setattr(
-        node_mod,
-        "_fetch_json",
-        lambda url, timeout: {
-            "ok": True,
-            "ulid": "n-child",
-            "pubkey": "childpub",
-            "uplink": {"state": "unauthorized"},
-        },
-    )
-    monkeypatch.setattr(node_mod.time, "sleep", lambda s: None)
+
+    class LifecycleDoor:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def watch_uplink(self, stop, **kwargs):
+            yield {"state": "unauthorized"}
+            threading.Event().wait(0.02)
+
+    monkeypatch.setattr(node_mod, "Door", LifecycleDoor)
     with pytest.raises(TimeoutError, match="POST /enroll"):
         node.wait_enrolled(timeout=0.01)
 
@@ -502,6 +508,7 @@ FAKE_COLCAD = textwrap.dedent(
         json.dump(addresses, f)
     os.replace(addr_file + ".tmp", addr_file)
     print("fake colcad up", flush=True)
+    print(json.dumps({"event": "colca.ready"}), flush=True)
     server.serve_forever()
     """
 )

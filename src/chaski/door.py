@@ -25,7 +25,7 @@ import json
 import logging
 import ssl
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -97,7 +97,7 @@ class Page:
 
     @property
     def ack_offset(self) -> int | None:
-        """The offset to ack once every record of this page is processed.
+        """Last scanned offset after processing the page's matching records.
 
         The last offset the node scanned for the page (``next - 1``): a
         filtered fetch (``signal_ids``, ``contracts``) moves ``next`` past the
@@ -111,9 +111,7 @@ class Page:
             return max(self.records[-1].offset, self.next - 1)
         if self.start is not None and self.next > self.start:
             return self.next - 1 if self.gap is None else max(self.gap.to_offset, self.next - 1)
-        if self.gap is not None:
-            return self.gap.to_offset
-        return None
+        return self.gap.to_offset if self.gap is not None else None
 
 
 @dataclass(frozen=True)
@@ -195,6 +193,32 @@ class Door:
 
     # ------------------------------------------------------------------ reads
 
+    def backlog(self, prefixes):
+        """Bounded local queue telemetry. Positions are next offsets to consume."""
+        response = self._client.get("/backlog", params=[("prefix", p) for p in prefixes])
+        response.raise_for_status()
+        return response.json()["queues"]
+
+    def watch_uplink(self, stop, *, timeout=15):
+        """Local node lifecycle transitions; heartbeat messages yield None."""
+        with self._client.stream("GET", "/watch", params={"uplink": "1"}, timeout=timeout) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if stop():
+                    return
+                if line:
+                    yield json.loads(line).get("uplink")
+
+    def watch_backlog(self, stop):
+        """Yield queue-change hints and False transport heartbeats; no record reads."""
+        with self._client.stream("GET", "/watch", params={"backlog": "1"}, timeout=15) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if stop():
+                    return
+                if line:
+                    yield bool(json.loads(line)["backlog_changed"])
+
     def fetch(
         self,
         stream: str,
@@ -202,6 +226,7 @@ class Door:
         *,
         max: int = 1000,
         signal_ids: list[str] | None = None,
+        tail: bool = False,
         contracts: Iterable[str] | None = None,
         topics: Iterable[str] | None = None,
         from_offset: int | None = None,
@@ -223,6 +248,8 @@ class Door:
             ("cursor", cursor),
             ("max", str(max)),
         ]
+        if tail:
+            params.append(("tail", 1))
         if from_offset is not None:
             params.append(("from", str(from_offset)))
         for signal_id in signal_ids or []:
@@ -312,7 +339,14 @@ class Door:
                 raise RuntimeError("GET /kv: server repeated page token")
             after = next_token
 
-    def watch(self, streams: Iterable[str], *, interval_ms: int | None = None) -> Iterator[Hint]:
+    def watch(
+        self,
+        streams: Iterable[str],
+        *,
+        interval_ms: int | None = None,
+        contracts: Iterable[str] = (),
+        stop: Callable[[], bool] | None = None,
+    ) -> Iterator[Hint]:
         """``GET /watch`` (colca 0.18+): yield a :class:`Hint` whenever one of
         ``streams`` grows, instead of polling :meth:`fetch` on an idle stream.
 
@@ -324,12 +358,15 @@ class Door:
         :data:`WATCH_SILENCE_S`; reconnecting is the caller's.
         """
         params: list[tuple[str, str | int | float | bool | None]] = [("stream", name) for name in streams]
+        params.extend(("contract", name) for name in contracts)
         if interval_ms is not None:
             params.append(("interval_ms", str(interval_ms)))
         timeout = httpx.Timeout(self._client.timeout.connect, read=WATCH_SILENCE_S)
         with self._client.stream("GET", "/watch", params=params, timeout=timeout) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
+                if stop is not None and stop():
+                    return
                 if not line:
                     continue
                 body = json.loads(line)
@@ -409,6 +446,10 @@ class Door:
         resp.raise_for_status()
 
 
+class StreamGapError(RuntimeError):
+    """Consumer history was pruned; effects and cursor remain unchanged."""
+
+
 class Stream:
     """A named cursor over one colca stream, as ``Service.stream()`` returns it.
 
@@ -424,7 +465,7 @@ class Stream:
 
     :meth:`ack` commits before the page boundary if needed. :meth:`follow`
     repeats the drain whenever a :class:`chaski.Doorbell` rings; nothing is
-    read on a timer. A pruned range (``Page.gap``) is logged as a warning.
+    read on a timer. A pruned range (``Page.gap``) raises :class:`StreamGapError`.
     """
 
     def __init__(
@@ -442,6 +483,7 @@ class Stream:
         self.name = name
         self.cursor = cursor
         self._max = max
+        self._acknowledged = 0
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
         self._contracts = sorted(contracts) if contracts is not None else None
         self._topics = list(topics) if topics is not None else None
@@ -463,54 +505,85 @@ class Stream:
             scope["from_offset"] = from_offset
         return self._door.fetch(self.name, self.cursor, max=self._max, **scope)
 
+    def head(self) -> int:
+        """Capture the last admitted offset without moving/changing this cursor.
+
+        A coordinated drain must stop at a fixed boundary: a live producer may
+        never leave the stream empty. Tail reads do not replace cursor filters.
+        """
+        return self._door.fetch(self.name, self.cursor, max=1, tail=True).next - 1
+
     def ack(self, upto: Record | int) -> bool:
         """Ack ``upto`` (a record, or its offset) as the last PROCESSED
         position. Returns whether the cursor moved."""
         offset = upto.offset if isinstance(upto, Record) else int(upto)
-        return self._door.ack(self.name, self.cursor, offset)
+        if offset <= self._acknowledged:
+            return False
+        moved = self._door.ack(self.name, self.cursor, offset)
+        self._acknowledged = offset
+        return moved
 
     def retire(self) -> None:
         """Delete this cursor at the door — idempotent, also when it never
         existed. A later fetch under the same name starts over."""
         self._door.delete_cursor(self.name, self.cursor)
+        self._acknowledged = 0
 
     def __iter__(self) -> Iterator[Record]:
         return self.drain()
 
-    def drain(self) -> Iterator[Record]:
+    def drain(self, *, stop: threading.Event | None = None) -> Iterator[Record]:
         """Yield every record from the cursor's position to the head, page
-        by page, acking each page after its records were consumed (see the
-        class docstring). Stops at the first empty page."""
-        while True:
+        by page, acking each page after its records were consumed. Capture a
+        finite head so continuous producers cannot keep this call open forever.
+        Cancellation leaves a partially consumed page unacknowledged for replay.
+        The final page may include records admitted after the captured head.
+        """
+        if stop is not None and stop.is_set():
+            return
+        head = self.head()
+        while stop is None or not stop.is_set():
             page = self.fetch()
             if page.gap is not None:
-                log.warning(
-                    "Gap on stream=%s cursor=%s: offsets %d..%d were pruned (first_ts=%s last_ts=%s "
-                    "approx=%s) — continuing from the low-water mark",
-                    self.name,
-                    self.cursor,
-                    page.gap.from_offset,
-                    page.gap.to_offset,
-                    page.gap.first_ts,
-                    page.gap.last_ts,
-                    page.gap.approx,
+                raise StreamGapError(
+                    f"stream={self.name} cursor={self.cursor}: retained offsets "
+                    f"{page.gap.from_offset}..{page.gap.to_offset} were pruned; "
+                    "rebuild the consumer state before advancing its cursor"
                 )
-            yield from page.records
+            for record in page.records:
+                if stop is not None and stop.is_set():
+                    return
+                yield record
+            if stop is not None and stop.is_set():
+                return
             ack_offset = page.ack_offset
             if ack_offset is None:
+                if page.next <= head:
+                    raise RuntimeError("stream stopped before its captured head")
                 return
-            self._door.ack(self.name, self.cursor, ack_offset)
+            self.ack(ack_offset)
+            if ack_offset >= head:
+                return
 
-    def follow(self, bell: Doorbell, *, stop: threading.Event | None = None) -> Iterator[Record]:
+    def follow(self, bell: Doorbell | None = None, *, stop: threading.Event | None = None) -> Iterator[Record]:
         """:meth:`drain` now, then again after every ring of ``bell``, until
         ``stop`` is set. Nothing is read on a timer: ring the bell from the
         MQTT subscription to the topics this stream reads and on every
         reconnect. The generation is taken before each drain, so a ring during
         a drain is not lost. To end it, set ``stop`` and ring."""
         stop = stop or threading.Event()
+        if bell is None:
+            from .stream_changes import StreamChanges
+
+            watch = StreamChanges(self._door, [self.name], stop=stop).start()
+            try:
+                yield from self.follow(watch[self.name], stop=stop)
+            finally:
+                watch.close()
+            return
         while not stop.is_set():
             seen = bell.generation
-            yield from self.drain()
+            yield from self.drain(stop=stop)
             if stop.is_set():
                 return
             bell.wait_after(seen)

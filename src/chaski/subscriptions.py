@@ -19,6 +19,8 @@ import threading
 from collections.abc import Iterable
 from typing import Any
 
+from .retry import Backoff
+
 logger = logging.getLogger(__name__)
 
 RETRY_S = 1.0
@@ -40,6 +42,8 @@ class Subscriptions:
         self._client = client
         self._held: dict[str, int] = {}
         self._pending: dict[int, str] = {}
+        self._retry: dict[str, Backoff] = {}
+        self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
         subscribe, unsubscribe = client.subscribe, client.unsubscribe
 
@@ -53,11 +57,24 @@ class Subscriptions:
         def tracked_unsubscribe(topic: Any, *args: Any, **kwargs: Any) -> Any:
             with self._lock:
                 self._held.pop(str(topic), None)
+                self._retry.pop(str(topic), None)
+                if timer := self._timers.pop(str(topic), None):
+                    timer.cancel()
             return unsubscribe(topic, *args, **kwargs)
 
         client.subscribe = tracked_subscribe
         client.unsubscribe = tracked_unsubscribe
         client.on_subscribe = self._on_subscribe
+
+    def close(self) -> None:
+        """Cancel refused-subscription retries when their client closes."""
+        with self._lock:
+            self._held.clear()
+            self._pending.clear()
+            self._retry.clear()
+            for timer in self._timers.values():
+                timer.cancel()
+            self._timers.clear()
 
     def topics(self) -> dict[str, int]:
         with self._lock:
@@ -76,6 +93,8 @@ class Subscriptions:
         """Subscribe one held topic again; a topic no longer held is skipped."""
         with self._lock:
             qos = self._held.get(topic)
+            if timer := self._timers.pop(topic, None):
+                timer.cancel()
         if qos is None:
             return
         self._client.subscribe(topic, qos)
@@ -90,13 +109,24 @@ class Subscriptions:
         with self._lock:
             topic = self._pending.pop(mid, None)
             held = topic in self._held
-        if topic is None or not held or not any(_refused(code) for code in reason_codes or ()):
+        if topic is None or not held:
+            return
+        if not any(_refused(code) for code in reason_codes or ()):
+            with self._lock:
+                self._retry.pop(topic, None)
+                if timer := self._timers.pop(topic, None):
+                    timer.cancel()
             return
         logger.warning(
             "subscription to %s refused (%s) — retrying",
             topic,
             ", ".join(str(code) for code in reason_codes),
         )
-        timer = threading.Timer(RETRY_S, self.renew, (topic,))
-        timer.daemon = True
-        timer.start()
+        with self._lock:
+            if topic not in self._held or topic in self._timers:
+                return
+            backoff = self._retry.setdefault(topic, Backoff(minimum=RETRY_S))
+            timer = threading.Timer(backoff.delay(), self.renew, (topic,))
+            timer.daemon = True
+            self._timers[topic] = timer
+            timer.start()

@@ -204,47 +204,97 @@ class FailingProducer(Producer):
 
 
 @run_async
-async def test_a_handler_that_raises_on_replay_does_not_crash_the_service(buffer, runtime):
-    """Replay must survive a producer error exactly like live traffic does —
-    no exception escapes replay_changed_producers."""
+async def test_failed_replay_is_not_marked_complete_and_retries(buffer, runtime):
     buffer.append("sig-event", 100.0, "a")
     instance = FailingProducer().attach(runtime)
-
-    await replay_changed_producers(runtime, [instance])  # must not raise
-
-    assert instance.calls == 1, "the handler must still have been invoked (and its failure survived)"
+    for attempt in range(2):
+        with pytest.raises(RuntimeError, match="boom"):
+            await replay_changed_producers(runtime, [instance])
+        assert buffer.code_hash("failing") is None
+        assert buffer.watermark("failing") is None
+        assert instance.calls == attempt + 1
 
 
 @run_async
-async def test_a_failing_producer_still_gets_its_watermark_and_hash_persisted(buffer, runtime):
-    """Watermark and hash are stored after a replay pass even when handlers
-    failed, so the replay does not repeat on every start."""
-    from chaski.dataops import codehash
+async def test_coordinated_replay_stops_before_pending_inputs(buffer, runtime):
+    from types import SimpleNamespace
 
-    buffer.append("sig-event", 100.0, "a")
-    instance = FailingProducer().attach(runtime)
+    from chaski.dataops.service import synthetic_record
 
+    runtime.step = SimpleNamespace()
+    for ts, value in [(100, "committed"), (200, "pending"), (300, "later pending")]:
+        buffer.append("sig-event", ts, value)
+    from dataclasses import replace
+
+    records = [
+        replace(synthetic_record("sig-event", ts, value), offset=i)
+        for i, ts, value in [(1, 200, "pending"), (2, 300, "later pending")]
+    ]
+    buffer.queue_inputs(records, 2)
+    instance = RecordingProducer().attach(runtime)
     await replay_changed_producers(runtime, [instance])
+    assert instance.received == [(100, "committed")]
+    assert len(buffer.input_batch(300)) == 2
 
-    assert buffer.code_hash("failing") == codehash.compute_code_hash(FailingProducer)
-    assert buffer.watermark("failing") == 100.0
 
-    # With the hash stored, a second start with the same failing code does not
-    # replay again.
-    instance.calls = 0
-    await replay_changed_producers(runtime, [instance])
-    assert instance.calls == 0, "an unchanged hash must not replay a failing producer again either"
+class CheckpointProducer(RecordingProducer):
+    name = "checkpointed"
+    state_version = 1
+
+    def snapshot_state(self):
+        return self.received
+
+    def restore_state(self, state):
+        self.received = [tuple(item) for item in state]
 
 
 @run_async
-async def test_a_failing_producer_does_not_block_a_later_producer_in_the_same_pass(buffer, runtime):
-    """A failing producer does not stop a later producer in the same pass from
-    replaying and advancing."""
-    buffer.append("sig-event", 100.0, "a")
-    failing = FailingProducer().attach(runtime)
-    healthy = RecordingProducer().attach(runtime)
+async def test_restart_restores_state_and_redelivered_page_does_not_repeat_effects(buffer, runtime):
+    from dataclasses import replace
 
-    await replay_changed_producers(runtime, [failing, healthy])
+    from chaski.dataops.service import make_handler, synthetic_record
 
-    assert healthy.received == [(100.0, "a")], "a later healthy producer must still replay"
-    assert buffer.watermark("recording") == 100.0, "a later healthy producer must still advance its watermark"
+    first = CheckpointProducer().attach(runtime)
+    await replay_changed_producers(runtime, [first])
+    record = replace(synthetic_record("sig-event", 100, "opened"), offset=12)
+    await make_handler(first.on_event)(record)
+    second = CheckpointProducer().attach(runtime)
+    await replay_changed_producers(runtime, [second])
+    assert second.received == [(100, "opened")]
+    await make_handler(second.on_event)(record)
+    assert second.received == [(100, "opened")]
+    await make_handler(second.on_event)(
+        replace(record, offset=13, payload={"signal_id": "sig-event", "timestamp": 200, "value": "closed"})
+    )
+    assert second.received == [(100, "opened"), (200, "closed")]
+
+
+@run_async
+async def test_checkpoint_failure_restores_memory_and_preserves_retry(buffer, runtime, monkeypatch):
+    from dataclasses import replace
+
+    from chaski.dataops.service import make_handler, synthetic_record
+
+    instance = CheckpointProducer().attach(runtime)
+    await replay_changed_producers(runtime, [instance])
+    save = buffer.save_checkpoint
+
+    def broken(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(buffer, "save_checkpoint", broken)
+    record = replace(synthetic_record("sig-event", 100, "opened"), offset=12)
+    with pytest.raises(OSError, match="disk full"):
+        await make_handler(instance.on_event)(record)
+    assert instance.received == []
+    monkeypatch.setattr(buffer, "save_checkpoint", save)
+    await make_handler(instance.on_event)(record)
+    assert instance.received == [(100, "opened")]
+
+
+def test_checkpoint_requires_both_state_hooks():
+    class Incomplete(Producer):
+        state_version = 1
+
+    with pytest.raises(TypeError, match="requires snapshot_state"):
+        Incomplete()

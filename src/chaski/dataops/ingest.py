@@ -29,8 +29,7 @@ fetch, and a :meth:`Ingest.rebind`, restart the read at the acked cursor. On
 older nodes the loop fetches, processes and acks in turn.
 
 **Gaps.** When the cursor fell below the stream's low-water mark, colca
-returns a ``gap`` with the surviving records. It is logged as a warning with
-the pruned range, and processing continues.
+returns a ``gap`` with the surviving records. Processing fails visibly rather than acknowledging missing history.
 
 **MQTT only wakes it.** A message on one of the service's input topics calls
 :meth:`Ingest.wake` (through
@@ -46,6 +45,7 @@ reports (:mod:`chaski.dataops.health`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -54,8 +54,9 @@ from typing import Any
 
 import httpx
 
-from chaski.door import Gap, Page, Record, Stream
+from chaski.door import Gap, Page, Record, Stream, StreamGapError
 from chaski.doorbell import Doorbell
+from chaski.retry import Backoff
 
 from .buffer import Buffer
 
@@ -104,10 +105,14 @@ class Ingest:
         dispatch: dict[str, list[Handler]] | None = None,
         signal_ids: Iterable[str] | None = None,
         previous_generation: str | None = None,
-        strict: bool = False,
+        strict: bool = True,
         min_fetch_interval_s: float = MIN_FETCH_INTERVAL_S,
+        retry_min_s: float = 1.0,
     ) -> None:
-        self.strict = strict
+        self._retry_min_s = retry_min_s
+        self.waiting = False
+        if not strict:
+            raise ValueError("DataOps cannot skip failed handlers; strict=False is no longer supported")
         self._open_stream = open_stream
         self._buffer = buffer
         self._dispatch = dispatch or {}
@@ -128,6 +133,7 @@ class Ingest:
         self._ack_want: tuple[Stream, int] | None = None
         self._ack_task: asyncio.Future[None] | None = None
         self._ack_failed = False
+        self._ack_error: httpx.HTTPError | BufferError | None = None
         self._behind = False
         self._last_fetch_at = 0.0
         self._min_fetch_interval_s = min_fetch_interval_s
@@ -183,11 +189,61 @@ class Ingest:
         ``@on_constant`` handlers: whatever a handler schedules there (a
         throttle's trailing run, a retry) outlives the page.
 
-        Returns the number of records processed. A ``gap`` is logged, not
-        raised. ``httpx.HTTPError`` propagates for :meth:`run_forever` to
+        Returns the number of records processed. A ``gap`` raises
+        :class:`StreamGapError`. ``httpx.HTTPError`` propagates for :meth:`run_forever` to
         retry; any other exception ends the task.
         """
         return await asyncio.to_thread(self.drain_once, asyncio.get_running_loop())
+
+    async def run_window(self, target, before_sample, finish_window, *, real_signals=(), clock=None):
+        """Durable intake followed by event-time dispatch through a watermark.
+
+        Intake and effects have separate progress. Future samples remain in the
+        inbox, so upstream generation need not wait for this consumer. A crash
+        after a callback replays that callback; outputs must remain idempotent.
+        """
+        head = await asyncio.to_thread(self._stream.head)
+        while True:
+            page = await asyncio.to_thread(self._stream.fetch)
+            if page.gap is not None:
+                raise StreamGapError(f"input stream has a retention gap: {page.gap}")
+            if page.ack_offset is None:
+                if page.next <= head:
+                    raise RuntimeError("input stream stopped before its captured head")
+                break
+            await asyncio.to_thread(self._buffer.queue_inputs, page.records, page.ack_offset)
+            await asyncio.to_thread(self._stream.ack, page.ack_offset)
+            if page.next > head:
+                break
+        # Infrastructure readings retain real UTC timestamps. Make them
+        # available to freshness checks, but dispatch their callbacks at the
+        # processed boundary after historical machine records, never in future
+        # generation time.
+        after = 0
+        while records := await asyncio.to_thread(
+            self._buffer.input_batch, target, real_signals=real_signals, real=True, after=after
+        ):
+            for record in records:
+                await asyncio.to_thread(self._append, record)
+            after = records[-1].offset
+        while records := await asyncio.to_thread(self._buffer.input_batch, target, real_signals=real_signals):
+            with self._buffer.one_commit():
+                for record in records:
+                    await before_sample(self._timestamp_of(record))
+                    signal_id = await asyncio.to_thread(self._append, record)
+                    if signal_id is not None:
+                        await self._handle(signal_id, record)
+                    await asyncio.to_thread(self._buffer.finish_input, record.offset)
+        while records := await asyncio.to_thread(
+            self._buffer.input_batch, target, real_signals=real_signals, real=True
+        ):
+            for record in records:
+                signal_id = self._signal_id_of(record)
+                if signal_id is not None:
+                    with clock.at(target) if clock is not None else contextlib.nullcontext():
+                        await self._handle(signal_id, record)
+                await asyncio.to_thread(self._buffer.finish_input, record.offset)
+        await finish_window(target)
 
     def drain_once(self, loop: asyncio.AbstractEventLoop) -> int:
         """The thread body of :meth:`run_once`: one page, start to ack. Each
@@ -207,9 +263,7 @@ class Ingest:
         """Append every record of ``page`` and run its handlers on ``loop``,
         in stream order. Runs in a worker thread; does not ack."""
         if page.gap is not None:
-            if self.strict:
-                raise RuntimeError("input stream has a retention gap; refusing incomplete coordinated history")
-            self._log_gap(page.gap)
+            raise StreamGapError(f"input stream has a retention gap: {page.gap}")
 
         # One commit per page: the page is acked only after it, and a crash
         # before the ack appends the page again.
@@ -236,7 +290,12 @@ class Ingest:
         if self._ack_task is not None and self._ack_task.done():
             self._ack_task.result()  # an ack that failed with more than an HTTP error ends the loop
         stream = self._stream
-        if self._ack_failed or (self._prefetch is not None and self._prefetch[0] is not stream):
+        if self._ack_failed:
+            error = self._ack_error
+            await self._restart_from_cursor()
+            if error is not None:
+                raise error
+        elif self._prefetch is not None and self._prefetch[0] is not stream:
             await self._restart_from_cursor()
         loop = asyncio.get_running_loop()
 
@@ -268,7 +327,7 @@ class Ingest:
             return 0
         # A page of skipped records still moved the read on: read again at once
         # rather than take it for the head.
-        self._behind = len(page.records) >= stream.page_size or (not page.records and page.gap is None)
+        self._behind = ack_offset is not None
         if self._behind and self._read_ahead:
             self._last_fetch_at = time.monotonic()
             self._prefetch = (stream, asyncio.ensure_future(asyncio.to_thread(stream.fetch, from_offset=page.next)))
@@ -282,6 +341,8 @@ class Ingest:
     def _queue_ack(self, stream: Stream, offset: int) -> None:
         """Ack ``offset`` in the background. Acks are cumulative, so while one
         is in flight only the newest wanted offset is kept."""
+        if self._ack_failed:
+            return  # Retry/backoff owns the cursor; do not bypass a refused ack.
         self._ack_want = (stream, offset)
         if self._ack_task is None or self._ack_task.done():
             self._ack_task = asyncio.ensure_future(self._send_acks())
@@ -292,11 +353,15 @@ class Ingest:
             self._ack_want = None
             try:
                 await asyncio.to_thread(stream.ack, offset)
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, BufferError) as exc:
                 # A later ack covers this one; until then, reading restarts at
                 # the acked cursor so nothing is skipped.
                 self._ack_failed = True
+                self._ack_error = exc
+                self._ack_want = None
+                self.wake()
                 log.warning("Ack of offset=%d failed on cursor=%s: %s", offset, stream.cursor, exc)
+                return
 
     async def _restart_from_cursor(self) -> None:
         """Drop the page read ahead and wait for the acks in flight; the next
@@ -308,6 +373,7 @@ class Ingest:
             await self._ack_task
         self._next_from = None
         self._ack_failed = False
+        self._ack_error = None
 
     def _append(self, record: Record) -> str | None:
         """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
@@ -325,15 +391,12 @@ class Ingest:
             try:
                 await handler(record)
             except Exception:
-                if self.strict:
-                    raise
-                # The record is already in the buffer; a failing handler only
-                # misses this event.
                 log.exception(
-                    "on_metric handler failed for signal_id=%s at offset=%d — continuing",
+                    "on_metric handler failed for signal_id=%s at offset=%d; input remains pending",
                     signal_id,
                     record.offset,
                 )
+                raise
 
     @staticmethod
     def _signal_id_of(record: Record) -> str | None:
@@ -446,32 +509,33 @@ class Ingest:
             await self._restart_from_cursor()
 
     async def _run(self, stop: asyncio.Event) -> None:
-        consecutive_errors = 0
+        retry = Backoff(minimum=min(self._retry_min_s, self.ERROR_BACKOFF_MAX_S), maximum=self.ERROR_BACKOFF_MAX_S)
         seen = self._bell.generation
         while not stop.is_set():
             if not self._behind:
                 # Taken before the fetch: a wake from here on means another drain.
                 seen = self._bell.generation
+            self.waiting = False
             try:
                 processed = await self._step()
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, BufferError) as exc:
                 await self._restart_from_cursor()
-                consecutive_errors += 1
-                backoff = self._error_backoff_s(consecutive_errors)
+                backoff = retry.delay(exc)
                 log.warning(
                     "Ingest drain failed (attempt %d): %s — retrying in %.1fs",
-                    consecutive_errors,
+                    retry.failures,
                     exc,
                     backoff,
                 )
                 await self._sleep_or_stop(backoff, stop)
                 continue
 
-            consecutive_errors = 0
+            retry.reset()
             self._note_drain(processed)
             if processed > 0 or self._behind:
                 continue
 
+            self.waiting = True
             wake_task = asyncio.ensure_future(self._bell.after(seen))
             stop_task = asyncio.ensure_future(stop.wait())
             try:

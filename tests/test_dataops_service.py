@@ -169,79 +169,40 @@ def test_unresolvable_input_is_skipped_not_raised(runtime):
 
 
 @run_async
-async def test_a_late_commissioned_signal_reaches_dispatch_on_the_change_not_on_a_timer(runtime):
-    """A signal commissioned after the producer started reaches dispatch
-    without a restart, when the change arrives, and nothing is resolved while
-    nothing changes.
-    """
+async def test_definition_push_rebinds_without_idle_scans_and_stops(runtime):
+    from types import SimpleNamespace
+
     import chaski.dataops.service as service_module
+    from chaski._wakeup import Wakeup
 
-    class _Ingest:
-        def __init__(self):
-            self.bound: list[tuple[dict, list]] = []
-
-        def rebind(self, dispatch, signal_ids):
-            self.bound.append((dispatch, list(signal_ids or [])))
-
-    ingest = _Ingest()
+    changes = Wakeup()
+    runtime.door._dataops_definitions = SimpleNamespace(changes=changes)
+    bound, calls, started = [], [], []
     stop = asyncio.Event()
-    changed = asyncio.Event()
-    started: list[str] = []
-    calls = {"n": 0}
+    first = asyncio.Event()
+    second = asyncio.Event()
 
-    def fake_build(runtime, instances):
-        calls["n"] += 1
-        return {"sig-late": ["handler"]}, ["sig-late"], 0
+    def build(*_):
+        calls.append(1)
+        return ({}, [], 1) if len(calls) == 1 else ({"sig-late": ["handler"]}, ["sig-late"], 0)
 
-    with patch.object(service_module, "build_dispatch", fake_build):
-        task = asyncio.ensure_future(
-            service_module.follow_index(
-                runtime, [], ingest, stop, lambda: started.append("ingest"), changed, ((), ()), settle_s=0.01
-            )
+    def rebind(dispatch, ids):
+        bound.append(list(ids))
+        (first if len(bound) == 1 else second).set()
+
+    with patch.object(service_module, "build_dispatch", build):
+        task = asyncio.create_task(
+            service_module.reresolve_loop(runtime, [], SimpleNamespace(rebind=rebind), stop, lambda: started.append(1))
         )
-        await asyncio.sleep(0.2)
-        assert calls["n"] == 0, "nothing changed, nothing is resolved"
-        changed.set()  # the _Signal record of the commissioned input arrived
-        for _ in range(100):
-            if ingest.bound:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(first.wait(), 1)
+        await asyncio.sleep(0.03)
+        assert len(calls) == 1
+        changes.notify()
+        await asyncio.wait_for(second.wait(), 1)
         stop.set()
-        await asyncio.wait_for(task, timeout=2)
-
-    assert ingest.bound == [({"sig-late": ["handler"]}, ["sig-late"])]
-    assert started == ["ingest"], "the loop must start if nothing resolved at startup"
-
-
-@run_async
-async def test_without_a_live_index_a_signal_record_or_a_reconnect_resolves_again(tmp_path):
-    """A placed or external service has no live index: every _Signal record
-    under it, and every reconnect, asks for another resolution pass. A
-    reconnect also drains the ingest and the commands."""
-    from chaski.dataops import DataOpsService
-
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", live_index=False)
-    svc._loop = asyncio.get_running_loop()
-    svc._index_changed = asyncio.Event()
-
-    svc._resolution_changed()
-    await asyncio.sleep(0)
-    assert svc._index_changed.is_set()
-
-    class _Woken:
-        def __init__(self) -> None:
-            self.wakes = 0
-
-        def wake(self) -> None:
-            self.wakes += 1
-
-    ingest, executor = _Woken(), _Woken()
-    svc._ingest, svc._commands = ingest, executor  # type: ignore[assignment]
-    svc._index_changed.clear()
-    svc._broker_state_changed(True)
-    await asyncio.sleep(0)
-    assert svc._index_changed.is_set(), "a reconnect may have missed a change"
-    assert (ingest.wakes, executor.wakes) == (1, 1), "what arrived while the link was down is drained"
+        await asyncio.wait_for(task, 1)
+    assert bound == [[], ["sig-late"]]
+    assert started == [1]
 
 
 # ─── trim horizons and the periodic trim ─────────────────────────────────
@@ -307,9 +268,10 @@ def test_horizon_skips_an_unresolved_input_rather_than_raising(runtime):
 
 def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runtime):
     """A producer's declared window flows through trim_buffer: a point older
-    than the horizon is deleted, one inside it survives."""
+    than the boundary anchor is deleted; the in-force value survives."""
     now = time.time()
-    buffer.append("sig-event", now - 20.0, "old")  # older than the 10s window
+    buffer.append("sig-event", now - 30.0, "obsolete")
+    buffer.append("sig-event", now - 20.0, "old")  # boundary anchor
     buffer.append("sig-event", now - 1.0, "recent")  # inside the 10s window
 
     instances = _instantiate(runtime, ShortWindowProducer)
@@ -319,7 +281,7 @@ def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runti
     trim_buffer(buffer, instances, retention_s=1.0)
 
     df = buffer.window("sig-event", 0.0, now + 1.0)
-    assert list(df["value"]) == ["recent"], "trim must delete the point past the horizon and keep the one inside it"
+    assert list(df["value"]) == ["old", "recent"], "retain the boundary anchor and recent history"
 
 
 class LateResolvedProducer(Producer):
@@ -341,13 +303,14 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
     late is trimmed too."""
     instances = _instantiate(runtime, LateResolvedProducer)
     now = time.time()
+    buffer.append("sig-late", now - 30.0, "obsolete")
     buffer.append("sig-late", now - 20.0, "old")  # older than the 10s window, once it resolves
 
     # At "startup" the signal is not commissioned in KV yet — unresolved,
     # so nothing can be trimmed for it.
     trim_buffer(buffer, instances, retention_s=1.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
-    assert list(df["value"]) == ["old"], "an unresolved input must not be trimmed"
+    assert list(df["value"]) == ["obsolete", "old"], "an unresolved input must not be trimmed"
 
     # The signal is commissioned later: KV gains the _Signal entry (mirrors
     # a commissioning while the service keeps running).
@@ -355,7 +318,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
 
     trim_buffer(buffer, instances, retention_s=1.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
-    assert list(df["value"]) == [], "a late-resolved input must be trimmed on the very next trim run, without a restart"
+    assert list(df["value"]) == ["old"], "late resolution trims obsolete rows but keeps the boundary value"
 
 
 def test_an_input_topic_still_wakes_for_a_metric_franzmq_cannot_decode():
@@ -806,11 +769,13 @@ def test_buffer_trim_preserves_a_slow_factory_timer_and_uses_real_health_time(ru
             pass
 
     instance = Mixed().attach(runtime)
+    runtime.buffer.append("sig-tick", 1030, 0)
     runtime.buffer.append("sig-tick", 1040, 1)
     runtime.buffer.append("sig-tick", 1050, 2)
+    runtime.buffer.append("sig-event", 9970, -1)
     runtime.buffer.append("sig-event", 9980, 0)
     runtime.buffer.append("sig-event", 9999, 1)
     runtime.buffer.set_watermark(timer_key(instance, "tick", type(instance)._triggers[0][1]), 1060, "clock-v1")
     trim_buffer(runtime.buffer, [instance], 10, clock)
-    assert runtime.buffer.earliest("sig-tick") == 1050
-    assert runtime.buffer.earliest("sig-event") == 9999
+    assert runtime.buffer.earliest("sig-tick") == 1040
+    assert runtime.buffer.earliest("sig-event") == 9980

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import ClassVar
 
@@ -133,6 +134,7 @@ class _FakeNodeDoor:
     start_uncommissioned: ClassVar[bool] = False
 
     def __init__(self, base_url: str, service: str, *, timeout: float = 10.0, cert=None) -> None:
+        self.index_reads = 0
         self.service = service
         self.entries: list[KvEntry] = [
             KvEntry(
@@ -144,6 +146,9 @@ class _FakeNodeDoor:
                 offset=1,
             ),
         ]
+        self.uncommissioned = list(self.entries) if self.start_uncommissioned else []
+        if self.start_uncommissioned:
+            self.entries.clear()
         self.published: list[tuple[str, dict]] = []
         self.records: list[Record] = [
             Record(
@@ -158,9 +163,9 @@ class _FakeNodeDoor:
                 actor_kind="local",
             ),
         ]
-        self.cursors: dict[str, int] = {}
-        self.index_reads = 0
-        self.uncommissioned = [self.entries.pop()] if self.start_uncommissioned else []
+        self.cursors: dict[tuple[str, str], int] = {}
+        self.changed = threading.Condition()
+        self.change_version = 0
         self.acks: list[tuple[str, str, int]] = []
         self.fetches: list[tuple[str, str, list[str] | None]] = []
         type(self).instances.append(self)
@@ -188,31 +193,64 @@ class _FakeNodeDoor:
                         topic=signal_topic,
                         payload=signal,
                         ts=0.0,
-                        offset=2,
+                        offset=len(self.entries) + 1,
                     )
                 )
                 if _FakeClient.current is not None:
                     _FakeClient.current.deliver_retained(signal_topic, SignalRecord(**signal))
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
+        with self.changed:
+            self.change_version += 1
+            self.changed.notify_all()
+
+    def watch(self, streams, *, stop=None, contracts=(), interval_ms=None):
+        from chaski.door import Hint
+
+        stopped = stop or (lambda: False)
+        version = -1
+        while not stopped():
+            with self.changed:
+                if version == self.change_version:
+                    self.changed.wait_for(
+                        lambda observed=version: observed != self.change_version or stopped(), timeout=0.1
+                    )
+                if version == self.change_version:
+                    continue
+                version = self.change_version
+            yield Hint(list(streams), {})
+
+    def fetch(
+        self, stream, cursor, *, max=1000, signal_ids=None, tail=False, from_offset=None, contracts=None, topics=None
+    ):
         self.fetches.append((stream, cursor, signal_ids))
-        position = self.cursors.get(cursor, 0)
+        source = (
+            self.records
+            if stream == "metrics"
+            else [Record(e.offset, e.offset, e.topic, e.payload, e.ts, "node", "n", "n", "local") for e in self.entries]
+            if stream == "entities"
+            else []
+        )
+        head = source[-1].offset if source else 0
+        position = sorted([self.cursors.get((stream, cursor), 0), (from_offset or 1) - 1])[-1]
+        if tail:
+            return Page(records=[], next=head + 1)
         records = [
             r
-            for r in self.records
-            if r.offset > position and (signal_ids is None or r.payload["signal_id"] in signal_ids)
+            for r in source
+            if r.offset > position and (signal_ids is None or r.payload.get("signal_id") in signal_ids)
         ][:max]
-        return Page(records=records, next=(records[-1].offset + 1) if records else position + 1)
+        return Page(records=records, next=(records[-1].offset + 1) if records else head + 1, start=position + 1)
 
     def ack(self, stream, cursor, offset) -> bool:
         self.acks.append((stream, cursor, offset))
-        moved = offset > self.cursors.get(cursor, 0)
+        key = (stream, cursor)
+        moved = offset > self.cursors.get(key, 0)
         if moved:
-            self.cursors[cursor] = offset
+            self.cursors[key] = offset
         return moved
 
     def delete_cursor(self, stream, cursor) -> None:
-        self.cursors.pop(cursor, None)
+        self.cursors.pop((stream, cursor), None)
 
     def metrics(self) -> list[tuple[str, dict]]:
         return [(t, p) for t, p in self.published if "/_Metric/" in t]
@@ -297,7 +335,7 @@ async def _poll_until(predicate, timeout: float = 10.0) -> None:
 async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Path, monkeypatch):
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
     svc.add(Doubler)
 
     stop = asyncio.Event()
@@ -327,9 +365,10 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
     # It came in through the SDK's consume lane: the generational cursor
     # inside this identity's namespace, filtered to the declared input, and
     # acked after the page was processed.
-    generation = door.fetches[0][1].split("ingest-")[1]
-    assert door.fetches[0] == ("metrics", f"c/dataops/ingest-{generation}", ["sig-in"])
-    assert door.acks[0] == ("metrics", f"c/dataops/ingest-{generation}", 1)
+    metric_fetches = [f for f in door.fetches if f[0] == "metrics"]
+    generation = metric_fetches[0][1].split("ingest-")[1]
+    assert metric_fetches[0] == ("metrics", f"c/dataops/ingest-{generation}", ["sig-in"])
+    assert next(a for a in door.acks if a[0] == "metrics") == ("metrics", f"c/dataops/ingest-{generation}", 1)
 
     # The buffer is the only local state: the point landed, the watermark advanced, in data_dir.
     assert (tmp_path / "data" / "buffer.sqlite3").exists()
@@ -359,18 +398,23 @@ async def test_an_input_commissioned_later_is_followed_over_mqtt_without_reading
         await _poll_until(lambda: _FakeNodeDoor.instances and _FakeNodeDoor.instances[0].index_reads == 1)
         door = _FakeNodeDoor.instances[0]
         await asyncio.sleep(0.3)
-        assert door.fetches == [], "nothing to fetch before the input is commissioned"
+        assert not any(f[0] == "metrics" for f in door.fetches), "no metrics before commissioning"
 
         (signal,) = door.uncommissioned
-        door.entries.insert(0, signal)
+        from dataclasses import replace
+
+        door.entries.append(replace(signal, offset=max(e.offset for e in door.entries) + 1))
         client.deliver_retained(signal.topic, SignalRecord(id="sig-in", name="temperature"))
+        with door.changed:
+            door.change_version += 1
+            door.changed.notify_all()
         await _poll_until(lambda: door.metrics(), timeout=5.0)
     finally:
         stop.set()
         await asyncio.wait_for(task, timeout=10.0)
 
     assert door.metrics()[0][1]["value"] == 43.0
-    assert door.fetches[0][2] == ["sig-in"]
+    assert next(f for f in door.fetches if f[0] == "metrics")[2] == ["sig-in"]
     # The seed was the only read of the index contracts; no 15 s retry either.
     assert door.index_reads == 1
 
@@ -499,7 +543,7 @@ def test_pending_uses_the_buffer_of_unbound_samples(tmp_path: Path) -> None:
 async def test_on_ready_runs_after_outputs_are_bound_with_no_retry_needed(tmp_path: Path, monkeypatch):
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
     svc.add(ReadyAndWatched)
 
     stop = asyncio.Event()
@@ -524,7 +568,7 @@ async def test_on_constant_fires_on_write_and_sees_the_tombstone_as_none(tmp_pat
 
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
     svc.add(ReadyAndWatched)
 
     topic = f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint"
@@ -558,7 +602,7 @@ async def test_on_constant_fires_on_write_and_sees_the_tombstone_as_none(tmp_pat
     # through the metrics stream: `ReadyAndWatched` declares no
     # `SignalRangeInput`, so nothing was ever fetched at all.
     assert f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint" in client.subscriptions
-    assert _FakeNodeDoor.instances[0].fetches == []
+    assert not any(f[0] == "metrics" for f in _FakeNodeDoor.instances[0].fetches)
 
 
 @run_async
@@ -567,7 +611,7 @@ async def test_on_signal_fires_on_binding_change_and_on_release(tmp_path: Path, 
 
     client = _FakeClient()
     _connect(client, monkeypatch)
-    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", health_port=0)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
     svc.add(ReadyAndWatched)
 
     topic = f"colca/v1/_Signal/{NODE_ID}/oven/temperature"

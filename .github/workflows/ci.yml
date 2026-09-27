@@ -83,8 +83,19 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           version: "0.11.17"
-      - name: Tests
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: colca/go.mod
+      - name: Build broker for consumer conformance tests
+        working-directory: colca
+        run: |
+          make bundle
+          go build -o build/colcad ./cmd/colcad
+      - name: Tests including broker reconnect and recovery
         working-directory: chaski
+        env:
+          COLCAD_BINARY: ${{ github.workspace }}/colca/build/colcad
+          COLCAD_CONTRACTS_BUNDLE: ${{ github.workspace }}/colca/build/bundle/contracts-bundle.json
         run: uv run --python ${{ matrix.python-version }} --extra test pytest
 
   # Pushes to main and version tags build the package once lint and tests pass;

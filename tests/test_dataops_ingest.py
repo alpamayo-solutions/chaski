@@ -196,36 +196,18 @@ async def test_a_record_with_no_payload_timestamp_buffers_colca_ts_converted_to_
 # ------------------------------------------------------------------ gaps
 
 
+@pytest.mark.parametrize("records", [[], [_record(100, "sig-1", 1.0, 200.0)]])
 @run_async
-async def test_gap_is_logged_and_processing_continues(door, buffer, caplog):
+async def test_gap_blocks_effects_and_acknowledgement(door, buffer, records):
+    from chaski import StreamGapError
+
     gap = Gap(stream="metrics", from_offset=1, to_offset=99, first_ts=10.0, last_ts=90.0, approx=True)
-    door.queue(Page(records=[_record(100, "sig-1", 1.0, 200.0)], next=101, gap=gap))
+    door.queue(Page(records=records, next=101, gap=gap))
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])
-
-    with caplog.at_level(logging.WARNING, logger="chaski.dataops.ingest"):
-        processed = await ingest.run_once()
-
-    assert processed == 1
-    gap_messages = [r.message for r in caplog.records if "Gap on stream" in r.message]
-    assert len(gap_messages) == 1
-    assert "1" in gap_messages[0] and "99" in gap_messages[0]
-    # processing continued from the LWM: the record after the gap was buffered...
-    assert len(buffer.window("sig-1", 0.0, 1000.0)) == 1
-    # ...and the page's own last record offset is what got acked, not the gap.
-    assert door.acked == [("metrics", ingest.cursor, 100)]
-
-
-@run_async
-async def test_gap_only_page_acks_the_gap_bound_to_clear_it(door, buffer, caplog):
-    gap = Gap(stream="metrics", from_offset=1, to_offset=499, first_ts=None, last_ts=None, approx=True)
-    door.queue(Page(records=[], next=500, gap=gap))
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
-
-    with caplog.at_level(logging.WARNING, logger="chaski.dataops.ingest"):
-        processed = await ingest.run_once()
-
-    assert processed == 0
-    assert door.acked == [("metrics", ingest.cursor, 499)]
+    with pytest.raises(StreamGapError, match="retention gap"):
+        await ingest.run_once()
+    assert len(buffer.window("sig-1", 0.0, 1000.0)) == 0
+    assert door.acked == []
 
 
 @run_async
@@ -321,11 +303,8 @@ async def test_handler_invocations_never_overlap(door, buffer):
 
 
 @run_async
-async def test_a_failing_handler_does_not_stop_the_page_or_the_ack(door, buffer, caplog):
-    """One broken @on_metric handler must not sink the whole page: the
-    record still lands in the buffer, the remaining handler still runs,
-    and the page still gets acked."""
-    calls: list[str] = []
+async def test_a_failing_handler_leaves_the_page_unacknowledged(door, buffer):
+    calls = []
 
     async def broken(record):
         raise RuntimeError("boom")
@@ -335,15 +314,15 @@ async def test_a_failing_handler_does_not_stop_the_page_or_the_ack(door, buffer,
 
     door.queue(Page(records=[_record(1, "sig-1", 1.0, 10.0)], next=2))
     ingest = _ingest(door, buffer, dispatch={"sig-1": [broken, fine]}, signal_ids=["sig-1"])
+    with pytest.raises(RuntimeError, match="boom"):
+        await ingest.run_once()
+    assert calls == []
+    assert door.acked == []
 
-    with caplog.at_level(logging.ERROR, logger="chaski.dataops.ingest"):
-        processed = await ingest.run_once()
 
-    assert processed == 1
-    assert calls == ["fine"]
-    assert len(buffer.window("sig-1", 0.0, 100.0)) == 1
-    assert door.acked == [("metrics", ingest.cursor, 1)]
-    assert any("on_metric handler failed" in r.message for r in caplog.records)
+def test_skip_failed_handlers_is_rejected(door, buffer):
+    with pytest.raises(ValueError, match="strict=False"):
+        _ingest(door, buffer, strict=False)
 
 
 # ------------------------------------------------------------------ doorbell
@@ -360,10 +339,8 @@ async def _poll_until(predicate, timeout: float = 2.0, interval: float = 0.01) -
 
 
 @run_async
-async def test_an_idle_ingest_reads_nothing_until_woken(door, buffer):
-    """No timer: after the drain at start the loop waits for a wake, however
-    long, and a wake starts the next drain at once."""
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+async def test_wake_triggers_an_immediate_run_once_without_waiting_for_retry_min(door, buffer):
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"], retry_min_s=60.0)
 
     def calls() -> int:
         return len(door.fetch_calls)
@@ -460,7 +437,7 @@ async def test_run_forever_survives_one_transient_transport_error_and_resumes_fe
     fetches again."""
     monkeypatch.setattr(Ingest, "ERROR_BACKOFF_S", 0.02)
     door = FlakyDoor(fail_times=1)
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"], retry_min_s=0.02)
 
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
@@ -480,7 +457,7 @@ async def test_only_a_finished_drain_counts_as_progress(buffer, monkeypatch):
     """Retrying a transport error is not progress."""
     monkeypatch.setattr(Ingest, "ERROR_BACKOFF_S", 0.02)
     door = FlakyDoor(fail_times=1_000_000)
-    ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"], retry_min_s=0.02)
     built = ingest.last_drain_at
 
     stop = asyncio.Event()
@@ -504,23 +481,34 @@ async def test_run_forever_still_dies_on_a_non_transport_error(buffer):
         def fetch(self, stream, cursor, *, max=1000, signal_ids=None):
             raise RuntimeError("not a transport error")
 
-    ingest = _ingest(BrokenDoor(), buffer, signal_ids=["sig-1"])
+    ingest = _ingest(BrokenDoor(), buffer, signal_ids=["sig-1"], retry_min_s=0.02)
 
     with pytest.raises(RuntimeError, match="not a transport error"):
         await asyncio.wait_for(ingest.run_forever(asyncio.Event()), timeout=2.0)
 
 
-def test_error_backoff_grows_with_consecutive_attempts_and_is_bounded(door, buffer):
-    """The backoff grows with each attempt, with jitter, up to a bound."""
+@run_async
+async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
+    import httpx
+
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])
+    stop = asyncio.Event()
+    request = httpx.Request("GET", "http://node/fetch")
+    response = httpx.Response(429, headers={"Retry-After": "90"}, request=request)
 
-    first = ingest._error_backoff_s(1)
-    second = ingest._error_backoff_s(2)
-    many = ingest._error_backoff_s(10)
+    async def refused():
+        raise httpx.HTTPStatusError("limited", request=request, response=response)
 
-    assert 1.0 <= first <= 1.2
-    assert 2.0 <= second <= 2.4
-    assert Ingest.ERROR_BACKOFF_MAX_S <= many <= Ingest.ERROR_BACKOFF_MAX_S * 1.2
+    delays = []
+
+    async def wait(delay, event):
+        delays.append(delay)
+        event.set()
+
+    ingest._step = refused
+    ingest._sleep_or_stop = wait
+    await ingest.run_forever(stop)
+    assert delays == [90]
 
 
 # ------------------------------------------------------------------ generational cursor retirement
@@ -631,3 +619,203 @@ def test_the_rollup_says_what_a_window_ingested_and_that_an_empty_one_ingested_n
 
     assert len(caplog.records) == 1
     assert "Ingested 0 records over 1 drains" in caplog.records[0].getMessage()
+
+
+@run_async
+async def test_hint_during_empty_fetch_is_not_lost(door, buffer):
+    ingest = _ingest(door, buffer, signal_ids=["sig-1"], retry_min_s=60)
+    stop = asyncio.Event()
+    calls = []
+
+    async def fetch():
+        calls.append(1)
+        if len(calls) == 1:
+            ingest.wake()  # commit races the empty fetch response
+        else:
+            stop.set()
+        return 0
+
+    ingest._step = fetch
+    await asyncio.wait_for(ingest.run_forever(stop), timeout=1)
+    assert len(calls) == 2
+
+
+@run_async
+async def test_adjacent_input_only_records_batch_without_future_visibility(door, buffer):
+    commits = []
+    buffer._conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+    seen = []
+
+    async def handler(record):
+        seen.append(buffer.window("input", 0, 100)["value"].tolist())
+
+    door.queue(
+        Page(
+            records=[
+                _record(1, "input", 1, 1),
+                _record(2, "input", 2, 2),
+                _record(3, "trigger", 0, 3),
+                _record(4, "input", 4, 4),
+                _record(5, "input", 5, 5),
+            ],
+            next=6,
+        )
+    )
+    ingest = _ingest(door, buffer, dispatch={"trigger": [handler]})
+    await ingest.run_once()
+    assert seen == [[1, 2]]
+    assert buffer.window("input", 0, 100)["value"].tolist() == [1, 2, 4, 5]
+    assert len(commits) == 1
+
+
+@run_async
+async def test_coordinated_inbox_orders_pages_keeps_future_and_survives_restart(door, tmp_path):
+    import threading
+    from types import SimpleNamespace
+
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+    from chaski.dataops.scheduling import run_due
+    from chaski.dataops.triggers import IntervalSpec
+
+    clock = Clock(wall=lambda: 10010)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 1100, start_at=1000))
+    path = tmp_path / "ordered.db"
+    buffer = Buffer(path)
+    events = []
+
+    class Scheduled:
+        name = "scheduled"
+        _lock = threading.RLock()
+        _triggers = (("tick", IntervalSpec(5)),)
+        runtime = SimpleNamespace(buffer=buffer)
+
+        async def tick(self):
+            row = self.runtime.buffer.latest_before("s", clock.now())
+            events.append(("tick", clock.now(), row[1] if row else None))
+
+    scheduled = Scheduled()
+
+    async def handler(record):
+        events.append(("metric", record.payload["timestamp"], record.payload["value"]))
+
+    async def before(at):
+        await run_due([scheduled], clock, at, inclusive=False)
+
+    async def finish(at):
+        await run_due([scheduled], clock, at, inclusive=True)
+
+    # Stream order spans two producers/pages; event-time order differs.
+    future = _record(1, "s", 30, 1030)
+    near = _record(2, "s", 10, 1010)
+    middle = _record(3, "s", 20, 1020)
+    door.queue(Page([future, near], 3))
+    door.queue(Page([middle], 4))
+    ingest = _ingest(door, buffer, dispatch={"s": [handler]}, strict=True)
+    await ingest.run_window(1020, before, finish)
+    assert events == [
+        ("tick", 1005, None),
+        ("metric", 1010, 10),
+        ("tick", 1010, 10),
+        ("tick", 1015, 10),
+        ("metric", 1020, 20),
+        ("tick", 1020, 20),
+    ]
+    assert len(buffer.input_batch(1040)) == 1
+    buffer.close()
+    # Lost ack repeats an intake page after restart. Completed callbacks do not
+    # repeat, and the future sample remains available despite broker ack.
+    buffer = Buffer(path)
+    scheduled.runtime.buffer = buffer
+    door.queue(Page([future, near, middle], 4))
+    ingest = _ingest(door, buffer, dispatch={"s": [handler]}, strict=True)
+    await ingest.run_window(1030, before, finish)
+    assert events[-3:] == [("tick", 1025, 20), ("metric", 1030, 30), ("tick", 1030, 30)]
+    assert len([e for e in events if e[0] == "metric"]) == 3
+    assert not buffer.input_batch(1040)
+    buffer.close()
+
+
+@run_async
+async def test_coordinated_inbox_retries_failed_effect_and_bounds_queue(door, buffer):
+    failures = [True]
+
+    async def handler(record):
+        if failures[0]:
+            raise RuntimeError("effect unavailable")
+
+    async def noop(at):
+        pass
+
+    record = _record(1, "s", 1, 10)
+    door.queue(Page([record], 2))
+    ingest = _ingest(door, buffer, dispatch={"s": [handler]}, strict=True)
+    with pytest.raises(RuntimeError, match="effect unavailable"):
+        await ingest.run_window(10, noop, noop)
+    assert len(buffer.input_batch(10)) == 1
+    with pytest.raises(BufferError):
+        buffer.queue_inputs([_record(2, "s", 2, 20)], 2, limit=1)
+    failures[0] = False
+    await ingest.run_window(10, noop, noop)
+    assert not buffer.input_batch(10)
+
+
+@run_async
+async def test_coordinated_inbox_keeps_real_health_out_of_factory_schedule(door, buffer):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+
+    clock = Clock(wall=lambda: 10010)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 1100, start_at=1000))
+    events = []
+
+    async def machine(record):
+        assert buffer.latest_before("health", 10010)[1] is True
+        events.append(("machine", record.payload["timestamp"]))
+
+    async def health(record):
+        events.append(("health", clock.now()))
+
+    async def before(at):
+        events.append(("before", at))
+
+    async def finish(at):
+        events.append(("finish", at))
+
+    door.queue(Page([_record(1, "health", True, 10010), _record(2, "s", 10, 1010)], 3))
+    ingest = _ingest(door, buffer, dispatch={"s": [machine], "health": [health]}, strict=True)
+    await ingest.run_window(1010, before, finish, real_signals={"health"}, clock=clock)
+    assert events == [("before", 1010), ("machine", 1010), ("health", 1010), ("finish", 1010)]
+    assert not buffer.input_batch(20000)
+
+
+@run_async
+async def test_window_completes_with_continuous_input(buffer):
+    class LiveDoor(FakeDoor):
+        position = 0
+
+        def fetch(self, stream, cursor, *, tail=False, **kwargs):
+            if tail:
+                return Page([], 4)  # Three admitted records at the boundary.
+            self.position += 1
+            assert self.position <= 3, "must not chase the moving stream head"
+            return Page([_record(self.position, "s", self.position, 10)], self.position + 1)
+
+    door = LiveDoor()
+    events = []
+
+    async def handle(record):
+        events.append(record.offset)
+
+    async def before(at):
+        pass
+
+    async def finish(at):
+        assert len(door.acked) == 3
+        events.append("complete")
+
+    ingest = _ingest(door, buffer, dispatch={"s": [handle]}, strict=True)
+    await ingest.run_window(10, before, finish)
+    assert events == [1, 2, 3, "complete"]

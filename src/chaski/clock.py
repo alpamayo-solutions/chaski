@@ -16,10 +16,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 from colca_data_contracts.payload import ClockDefinition, ClockSegment
+
+from ._wakeup import Wakeup
 
 
 def _current_task() -> asyncio.Task | None:
@@ -141,6 +143,9 @@ class Clock:
         self._wall = wall
         self._monotonic = monotonic
         self._lock = threading.RLock()
+        # Shared by the clock and its execution gate: authority or dependency
+        # updates can make scheduled work runnable.
+        self.changes = Wakeup()
         self._sync: tuple[float, float] | None = None
         self._definition: ClockDefinition | None = None
         self._previous_definition: ClockDefinition | None = None
@@ -165,6 +170,7 @@ class Clock:
         with self._lock:
             self._sync = None
             self._definition_available = not bool(self.definition_topic)
+            self.changes.notify()
 
     def apply_time(self, now_ms: float, *, retained: bool = False) -> None:
         if self.source != "mqtt":
@@ -175,8 +181,13 @@ class Clock:
             raise ValueError("time beacon must contain finite now_ms")
         with self._lock:
             self._sync = (now_ms / 1000, self._monotonic())
+            self.changes.notify()
 
     def apply_definition(self, definition: ClockDefinition) -> bool:
+        # Locally constructed definitions contain a ClockSegment; decoded MQTT
+        # payloads contain a dict. Compare the same representation on either path.
+        if isinstance(definition.previous, dict):
+            definition = replace(definition, previous=ClockSegment(**definition.previous))
         validate_definition(definition)
         if self.definition_topic and definition.id != self.definition_topic.rsplit("/", 1)[1]:
             raise ValueError("clock id does not match selected topic")
@@ -191,16 +202,19 @@ class Clock:
                     if definition != previous:
                         raise ValueError("conflicting clock definitions at the same revision")
                     self._definition_available = True
+                    self.changes.notify()
                     return False
             self._previous_definition = previous
             self._definition = deepcopy(definition)
             self._definition_available = True
+            self.changes.notify()
             return True
 
     def remove_definition(self) -> None:
         """A tombstone stops the timeline; it does not switch to wall time."""
         with self._lock:
             self._definition_available = False
+            self.changes.notify()
 
     def real_now(self) -> float:
         with self._lock:
@@ -263,6 +277,12 @@ class Clock:
             return deepcopy(self._definition)
 
     @property
+    def available_definition(self) -> ClockDefinition | None:
+        """Current retained definition, or None while absent/reconnecting."""
+        with self._lock:
+            return deepcopy(self._definition) if self._definition_available else None
+
+    @property
     def rate(self) -> float:
         with self._lock:
             real = self.real_now()
@@ -297,43 +317,72 @@ class Clock:
                 reason,
             )
 
+    def delay_until(self, timestamp: float) -> float | None:
+        """Real seconds to a factory deadline; None means wait for a change.
+
+        Scheduled definitions, pauses, catch-up and bounded windows are handled
+        without generating clock ticks. A wake always requires a fresh check.
+        """
+        if not math.isfinite(timestamp):
+            raise ValueError("timestamp must be finite")
+        with self._lock:
+            status = self.status()
+            if not status.ready and status.reason != "clock moved behind the last emitted timestamp":
+                return None
+            if not status.ready and self._last is not None:
+                timestamp = max(timestamp, self._last)
+            real = self.real_now()
+            if status.factory_now is not None and status.factory_now >= timestamp:
+                return 0.0
+            definition = self._active(real)
+            delay = None
+            if definition is None:
+                delay = timestamp - real
+            elif definition.rate > 0 and (definition.stop_at is None or timestamp <= definition.stop_at):
+                due = definition.real_anchor + (timestamp - definition.factory_anchor) / definition.rate
+                if definition.catch_up:
+                    due = max(due, timestamp)
+                delay = max(0.0, due - real)
+            # Re-evaluate when a future definition takes over a paused or
+            # slower previous segment, even if that segment cannot reach target.
+            if self._definition is not None and self._definition.real_anchor > real:
+                transition = self._definition.real_anchor - real
+                delay = transition if delay is None else min(delay, transition)
+            return delay
+
     def sleep(self, seconds: float, *, stop: threading.Event | None = None) -> None:
-        """Blocking factory-time wait for a worker thread; never a socket timeout."""
+        """Factory-time wait; clock changes wake it without periodic rechecks.
+
+        A supplied plain threading.Event is checked at a one-second shutdown
+        bound. Call changes.notify() after setting it for immediate shutdown.
+        """
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("seconds must be non-negative and finite")
         target = None
         while stop is None or not stop.is_set():
+            version = self.changes.version
             try:
-                now = self.now()
                 if target is None:
-                    target = now + seconds
-                remaining = target - now
-                if remaining <= 0:
+                    target = self.now() + seconds
+                delay = self.delay_until(target)
+                if delay == 0:
                     return
-                rate = self.rate
-                delay = min(0.1, remaining / rate) if rate else 0.1
             except ClockNotReady:
-                delay = 0.1
+                delay = None
             if stop is not None:
-                stop.wait(delay)
-            else:
-                time.sleep(delay)
+                delay = min(delay, 1.0) if delay is not None else 1.0
+            self.changes.wait(version, delay)
 
     async def sleep_until(self, timestamp: float, *, responsiveness: float = 0.1) -> None:
-        """Wait in factory seconds, responding to pause, speed and sync changes.
+        """Wait for the deadline or a pushed clock change, with cancellation.
 
-        Does not schedule network deadlines. Cancellation works while paused or
-        waiting for authority. A bounded real wait also avoids busy spinning.
+        responsiveness is retained for call compatibility; no polling is used.
         """
         if not math.isfinite(timestamp) or not math.isfinite(responsiveness) or responsiveness <= 0:
             raise ValueError("finite timestamp and positive responsiveness required")
         while True:
-            try:
-                remaining = timestamp - self.now()
-                if remaining <= 0:
-                    return
-                rate = self.rate
-                wait = min(responsiveness, remaining / rate) if rate else responsiveness
-            except ClockNotReady:
-                wait = responsiveness
-            await asyncio.sleep(wait)
+            version = self.changes.version
+            delay = self.delay_until(timestamp)
+            if delay == 0:
+                return
+            await self.changes.wait_async(version, delay)

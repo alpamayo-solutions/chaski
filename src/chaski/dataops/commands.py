@@ -51,8 +51,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import random
-import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -62,7 +60,7 @@ import httpx
 from colca_data_contracts import topic_prefix
 
 from chaski.command import lifetime_refusal
-from chaski.door import Page, Record, Stream
+from chaski.door import Page, Record, Stream, StreamGapError
 
 from . import resolve
 from .base import Producer
@@ -223,39 +221,25 @@ class CommandExecutor:
 
     # -- loop -----------------------------------------------------------------
 
-    def watch(self, loop: asyncio.AbstractEventLoop, stop: threading.Event) -> None:
-        """Wake a drain whenever the ``commands`` stream grows, until ``stop``.
-        Blocking, for a thread. A lost connection is opened again after a
-        backoff with jitter; the first hint of a new one names the stream, so a
-        command sent meanwhile is drained then."""
-        backoff = 0.5
-        while not stop.is_set():
-            try:
-                for _hint in self._door.watch([STREAM], interval_ms=WATCH_INTERVAL_MS):
-                    backoff = 0.5
-                    loop.call_soon_threadsafe(self.wake)
-                    if stop.is_set():
-                        return
-            except Exception as exc:
-                log.debug("commands: stream watch ended (%s), reconnecting in %.1fs", exc, backoff)
-            if stop.wait(backoff * random.uniform(1.0, 1.5)):  # noqa: S311 - jitter  # nosec B311
-                return
-            backoff = min(2 * backoff, _ERROR_BACKOFF_MAX_S)
-
     async def run_forever(self, stop: asyncio.Event) -> None:
-        """Drain now, then once per wake, until ``stop``. A door failure is
-        retried with backoff; the unacked page is read again."""
-        watching = threading.Event()
-        threading.Thread(
-            target=self.watch, args=(asyncio.get_running_loop(), watching), name="commands-watch", daemon=True
+        from chaski.stream_changes import StreamChanges
+
+        loop = asyncio.get_running_loop()
+        watch = StreamChanges(
+            self._door,
+            [STREAM],
+            contracts=contracts(self._handlers),
+            on_change=lambda: loop.call_soon_threadsafe(self.wake),
         ).start()
         try:
             await self._serve(stop)
         finally:
-            watching.set()
+            await asyncio.to_thread(watch.close)
 
     async def _serve(self, stop: asyncio.Event) -> None:
-        errors = 0
+        from chaski.retry import Backoff
+
+        retry = Backoff(minimum=0.5, maximum=_ERROR_BACKOFF_MAX_S)
         self._wake.set()
         while not stop.is_set():
             wake_task = asyncio.ensure_future(self._wake.wait())
@@ -271,11 +255,10 @@ class CommandExecutor:
             self._wake.clear()
             try:
                 await self.drain()
-                errors = 0
+                retry.reset()
             except httpx.HTTPError as exc:
-                errors += 1
-                backoff = min(0.5 * (2 ** (errors - 1)), _ERROR_BACKOFF_MAX_S)
-                log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", errors, exc, backoff)
+                backoff = retry.delay(exc)
+                log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", retry.failures, exc, backoff)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=backoff)
                 self._wake.set()
@@ -287,10 +270,8 @@ class CommandExecutor:
         while True:
             page: Page = await asyncio.to_thread(self._stream.fetch)
             if page.gap is not None:
-                log.warning(
-                    "commands: offsets %d..%d were pruned before this service read them",
-                    page.gap.from_offset,
-                    page.gap.to_offset,
+                raise StreamGapError(
+                    f"commands: offsets {page.gap.from_offset}..{page.gap.to_offset} were pruned; explicit recovery required"
                 )
             for record in page.records:
                 await self.handle(record)
@@ -299,6 +280,8 @@ class CommandExecutor:
             if ack_offset is None:
                 return seen
             await asyncio.to_thread(self._stream.ack, ack_offset)
+            if not page.records:
+                return seen
 
     async def handle(self, record: Record) -> None:
         """Execute one record if it is a declared command, and answer it."""

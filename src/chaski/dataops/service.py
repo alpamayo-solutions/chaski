@@ -31,8 +31,8 @@ producer runtime.
 Startup order inside :meth:`DataOpsService.serve`:
 
  1. ``start()``: connect, register, open the door, then open the buffer
- 2. instantiate every producer, attach it and run ``setup()``; a producer
-    whose ``setup()`` raises is skipped with a logged reason
+ 2. instantiate every producer, attach it and run ``setup()``; a failed
+    producer stops startup before intake can advance
  3. open the live resolution index (an unplaced local service: one KV read,
     then the node's retained ``_SystemElement``/``_Signal``/``_AnnotationType``
     records over MQTT), publish the ``SignalOutput`` catalogue if it changed,
@@ -79,7 +79,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
-from colca_data_contracts.root import topic_prefix
 
 from chaski.door import Door, Record, Stream
 from chaski.service import Service
@@ -89,7 +88,7 @@ from .base import Producer, Runtime, runtime_now
 from .buffer import Buffer
 from .ingest import Ingest
 from .inputs import Historian, declared_inputs, validate_windows
-from .outputs import bind_annotation_outputs, build_catalogue, resolved_outputs
+from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import run_due, run_periodic, timer_key
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
@@ -232,7 +231,7 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
         elif isinstance(spec, IntervalSpec):
             ap_trigger = IntervalTrigger(seconds=spec.seconds)
             kind = f"every({spec.seconds}s)"
-        elif isinstance(spec, (OnMetricSpec, OnConstantSpec, OnSignalSpec, OnCommandSpec)):
+        elif isinstance(spec, OnMetricSpec | OnConstantSpec | OnSignalSpec | OnCommandSpec):
             continue  # each owned and scheduled elsewhere (see docstring)
         else:
             log.warning("Unknown trigger spec %r on %s.%s — skipped", spec, instance.name, method_name)
@@ -263,8 +262,9 @@ def build_dispatch(
 ) -> tuple[dict[str, list], list[str], int]:
     """Resolve one pass's worth of names from a single KV read.
 
-    Nothing is kept between passes, so a rebound signal is picked up on the
-    next pass.
+    A live runtime reuses dispatch while its watched definition index is
+    unchanged. Definition events and reconnects force re-resolution. Runtimes
+    without a definition subscription retain fresh reads on every pass.
 
     `forget_resolved` runs only when this pass pinned a fresh snapshot. If the
     read fails, inputs keep the ids they resolved before and only inputs that
@@ -272,6 +272,12 @@ def build_dispatch(
     signal disappeared.
     """
     with resolve.one_pass(runtime.door) as pinned:
+        index = resolve._pinned_index() if pinned else None
+        cache_key = (index, tuple(instances))
+        previous = getattr(runtime, "_resolved_dispatch", None)
+        watched = getattr(runtime.door, "_dataops_definitions", None) is not None
+        if watched and previous is not None and previous[0][0] is index and previous[0][1] == cache_key[1]:
+            return previous[1]
         if pinned:
             forget_resolved(instances)
         else:
@@ -280,7 +286,14 @@ def build_dispatch(
                 "keeping every already-resolved input's id rather than risk "
                 "narrowing the fetch filter below what is actually bound."
             )
-        return _resolve_dispatch(instances)
+        result = _resolve_dispatch(instances)
+        for instance in instances:
+            for _name, output in declared_outputs(instance):
+                if isinstance(output, SignalOutput):
+                    output.flush()
+        if watched and pinned:
+            cast(Any, runtime)._resolved_dispatch = (cache_key, result)
+        return result
 
 
 def forget_resolved(instances: list[Producer]) -> None:
@@ -370,64 +383,30 @@ def _resolve_dispatch(
     return dispatch, list(signal_ids), unresolved
 
 
-def _set_threadsafe(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
-    loop.call_soon_threadsafe(event.set)
+async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> None:
+    """Rebind on definition updates, including reconnect and late commissioning."""
+    cache = getattr(runtime.door, "_dataops_definitions", None)
+    if cache is None:
+        raise RuntimeError("DataOps requires its subscribed definition cache")
+    from chaski.retry import Backoff
 
-
-def _bound_shape(dispatch: dict[str, list], signal_ids: list[str]) -> tuple:
-    """What a rebind changes: the fetch filter and how many handlers each
-    signal dispatches to. The handlers themselves are new closures every pass."""
-    return (tuple(sorted(signal_ids)), tuple(sorted((sid, len(h)) for sid, h in dispatch.items())))
-
-
-async def follow_index(
-    runtime: Runtime,
-    instances: list[Producer],
-    ingest,
-    stop: asyncio.Event,
-    ensure_running,
-    changed: asyncio.Event,
-    bound: tuple,
-    settle_s: float = INDEX_SETTLE_S,
-) -> None:
-    """Resolve again whenever ``changed`` is set, instead of on a timer: a
-    signal that is commissioned, moved, rebound or retired reaches the
-    dispatch table and the fetch filter within ``settle_s``.
-
-    ``changed`` is set by the live resolution index, and each pass reads the
-    index. A service without one (placed, external) sets it for every
-    ``_Signal`` record under it and after every reconnect, and each pass reads
-    KV. The ingest is rebound only when the fetch filter or the dispatch
-    table actually changed; ``bound`` is what it holds now
-    (:func:`_bound_shape`).
-    """
+    retry = Backoff()
+    active_dispatch = None
     while not stop.is_set():
-        waiters = [asyncio.ensure_future(changed.wait()), asyncio.ensure_future(stop.wait())]
+        version = cache.changes.version
         try:
-            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for waiter in waiters:
-                waiter.cancel()
-        if stop.is_set():
-            return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=settle_s)
-            return
-        changed.clear()
-        dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, runtime, instances)
-        shape = _bound_shape(dispatch, signal_ids)
-        if shape == bound or not signal_ids:
-            # No signal ids would fetch every metric on the node: keep the
-            # filter as it is until something resolves again.
-            continue
-        bound = shape
-        log.info(
-            "Resolution index changed — dispatch now covers %d signal(s), %d input(s) unresolved.",
-            len(dispatch),
-            unresolved,
-        )
-        ingest.rebind(dispatch, signal_ids)
-        ensure_running()
+            dispatch, signal_ids, _unresolved = await asyncio.to_thread(build_dispatch, runtime, instances)
+            if dispatch is not active_dispatch:
+                ingest.rebind(dispatch, signal_ids or [])
+                active_dispatch = dispatch
+                if signal_ids:
+                    ensure_running()
+            retry.reset()
+            await cache.changes.wait_async(version, stop=stop)
+        except Exception as exc:
+            log.exception("Could not refresh definition bindings; retrying")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=retry.delay(exc))
 
 
 def compute_trim_horizons(
@@ -481,7 +460,7 @@ def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float, c
             start = definition.start_at if definition.start_at is not None else definition.factory_anchor
             for instance in instances:
                 for method, spec in type(instance)._triggers:
-                    if isinstance(spec, (CronSpec, IntervalSpec)):
+                    if isinstance(spec, CronSpec | IntervalSpec):
                         progress = buffer.watermark(timer_key(instance, method, spec))
                         application_now = min(application_now, progress if progress is not None else start)
         deleted = buffer.trim(
@@ -508,8 +487,27 @@ def make_handler(method, *, time_domain="application"):
             if clock is not None and time_domain == "application"
             else contextlib.nullcontext()
         )
-        with method.__self__._lock, instant:
-            await method(metric)
+        instance = method.__self__
+        with instance._lock, instant:
+            checkpointed = instance.state_version is not None and record.offset >= 0
+            key = method.__name__
+            if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
+                return
+            previous = instance._state_copy() if checkpointed else None
+            try:
+                await method(metric)
+                if checkpointed:
+                    offsets = dict(instance._handled_offsets)
+                    instance._handled_offsets[key] = record.offset
+                    try:
+                        instance._save_checkpoint()
+                    except BaseException:
+                        instance._handled_offsets = offsets
+                        raise
+            except BaseException:
+                if checkpointed:
+                    instance.restore_state(previous)
+                raise
 
     return _handler
 
@@ -553,10 +551,9 @@ async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) 
     a replay happens once per change; a tick-only producer only gets its
     watermark reset.
 
-    A handler that raises is logged and skipped, as in live ingest, and the
-    watermark and hash are stored after the pass regardless, so a broken
-    producer replays once instead of on every restart. A pass with failures
-    ends with a warning that counts them.
+    A failed handler stops recovery. Its watermark and code hash are not marked
+    complete; startup fails visibly and the next start retries the replay.
+    Handlers must make repeated effects idempotent.
     """
     # One KV read for the whole sweep; the per-producer passes below reuse it.
     with resolve.one_pass(runtime.door):
@@ -569,12 +566,26 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
         cls = type(instance)
         new_hash = codehash.compute_code_hash(cls)
         old_hash = buffer.code_hash(instance.name)
-        if old_hash == new_hash:
+        restored = instance._restore_checkpoint()
+        if old_hash == new_hash and (instance.state_version is None or restored):
             continue
 
         mini_dispatch, mini_signal_ids, _ = build_dispatch(runtime, [instance])
         earliest = _earliest_across(buffer, mini_signal_ids)
         now = runtime_now(runtime)
+        if getattr(runtime, "step", None) is not None:
+            application_inputs = set()
+            for _, input_attr in declared_inputs(instance):
+                if input_attr.time_domain != "real":
+                    # Unresolved inputs have no buffered records.
+                    with contextlib.suppress(LookupError):
+                        application_inputs.add(input_attr.signal_id)
+            pending_start = buffer.pending_input_start(application_inputs)
+            if pending_start is not None:
+                # Reconstruct only the prefix before pending work. Otherwise a
+                # crash/code reload can recreate future producer state and then
+                # replay older inbox records against it (backwards intervals).
+                now = min(now, pending_start)
         start = earliest if earliest is not None else now
 
         log.info(
@@ -591,32 +602,18 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
             rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
         rows.sort(key=lambda r: r[0])
 
-        failures = 0
         for ts, signal_id, value in rows:
             record = synthetic_record(signal_id, ts, value)
             for handler in mini_dispatch.get(signal_id, []):
-                try:
-                    await handler(record)
-                except Exception:
-                    # Like live ingest: log a failing handler and move on.
-                    failures += 1
-                    log.exception(
-                        "%s: on_metric handler failed replaying signal_id=%s at ts=%.3f — continuing",
-                        instance.name,
-                        signal_id,
-                        ts,
-                    )
+                await handler(record)
 
-        # Stored even after handler failures, so the same window is not
-        # replayed on every restart.
         final_position = rows[-1][0] if rows else start
+        instance._save_checkpoint()
         buffer.set_watermark(instance.name, final_position, new_hash)
-        log_fn = log.warning if failures else log.info
-        log_fn(
-            "%s: replay complete (%d record(s), %d failure(s)) — watermark=%.3f",
+        log.info(
+            "%s: replay complete (%d record(s)) — watermark=%.3f",
             instance.name,
             len(rows),
-            failures,
             final_position,
         )
 
@@ -665,11 +662,10 @@ class DataOpsService(Service):
     directory, ``~/.colca/services/<name>``); ``retention`` is the broker's
     metrics retention in seconds, what a declared window is validated
     against; ``historian`` an optional read-only
-    :class:`~chaski.dataops.inputs.Historian`; ``trim_interval`` the
-    buffer-trim cadence;
-    ``health_port`` the health door (``0`` for an ephemeral port);
-    ``live_index=False`` resolves from a KV read per pass instead of the live
-    index (:meth:`_open_live_index`). Every other keyword is the base class's.
+    :class:`~chaski.dataops.inputs.Historian`; ``retry_min``/
+    ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
+    ``health_port`` the health door (``0`` for an ephemeral port). Every
+    other keyword is the base class's.
     """
 
     def __init__(
@@ -681,20 +677,16 @@ class DataOpsService(Service):
         data_dir: Path | None = None,
         retention: float | None = None,
         historian: Historian | None = None,
+        retry_min: float = 1.0,
         trim_interval: float = 3600.0,
         health_port: int = health.PORT_DEFAULT,
-        live_index: bool = True,
         **service_kw: Any,
     ) -> None:
         super().__init__(name, mount, node=node, **service_kw)
-        self._live_index_enabled = live_index
-        self._index: resolve.LiveIndex | None = None
-        self._index_failures = 0
-        self._index_retry: asyncio.TimerHandle | None = None
-        self._index_changed: asyncio.Event | None = None
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
         self._historian = historian
+        self._retry_min_s = retry_min
         self._trim_interval_s = trim_interval
         self._health_port = health_port
         self._producers: dict[str, type[Producer]] = {}
@@ -703,11 +695,33 @@ class DataOpsService(Service):
         self._wake_topics: set[str] = set()
         self._wake_pending = False
         self._wake_failures = 0
+        from ..retry import Backoff
+
+        self._wake_backoff = Backoff(minimum=min(WAKE_RETRY_S, WAKE_RETRY_MAX_S), maximum=WAKE_RETRY_MAX_S)
         self._wake_retry: asyncio.TimerHandle | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
         self._step_loop_last = time.monotonic()
+        self._step_waiting = False
+        self._definition_cache: resolve.LiveIndex | None = None
+
+    def _after_connect(self) -> None:
+        super()._after_connect()
+        self._definition_cache = resolve.DefinitionCache(
+            self.retained_view(
+                contracts=("_Signal", "_SystemElement", "_AnnotationType"),
+                streams=("entities", "definitions"),
+                cursor="dataops-definitions",
+                on_change=self.clock.changes.notify,
+            )
+        )
+        cast(Any, self.door)._dataops_definitions = self._definition_cache
+
+    def _placement_reannounced(self) -> None:
+        super()._placement_reannounced()
+        for topic in tuple(self._wake_topics):
+            self._started_client.subscribe(topic, qos=1)
 
     # -- the run list ----------------------------------------------------
 
@@ -803,10 +817,6 @@ class DataOpsService(Service):
 
     def close(self) -> None:
         self._cancel_wake_retry()
-        self._cancel_index_retry()
-        if self._index is not None and self._http is not None:
-            resolve.attach(self._http, None)
-        self._index = None
         super().close()
         if self._local_buffer is not None:
             self._local_buffer.close()
@@ -873,7 +883,7 @@ class DataOpsService(Service):
             topics = set(resolve.resolve_metric_topics(self.door, signal_ids).values())
         except httpx.HTTPError as exc:
             self._wake_failures += 1
-            delay = min(WAKE_RETRY_S * 2 ** (self._wake_failures - 1), WAKE_RETRY_MAX_S)
+            delay = self._wake_backoff.delay(exc)
             log.warning(
                 "Could not read the input topics to wake on (attempt %d): %s — keeping %d topic(s), retrying in %.0fs",
                 self._wake_failures,
@@ -885,6 +895,7 @@ class DataOpsService(Service):
                 self._wake_retry = self._loop.call_later(delay, self._wake_on_inputs, list(signal_ids))
             return
         self._wake_failures = 0
+        self._wake_backoff.reset()
         if len(topics) < len(signal_ids):
             log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
         added = sorted(topics - self._wake_topics)
@@ -921,106 +932,6 @@ class DataOpsService(Service):
         if self._ingest is not None:
             self._ingest.wake()
 
-    # -- the live resolution index ----------------------------------------
-
-    def _open_live_index(self) -> resolve.LiveIndex | None:
-        """Keep the resolution index current from the node's retained
-        records, so resolving reads no KV in steady state.
-
-        Only a service that may read the whole node can: an unplaced local
-        service. The node refuses a node-wide subscription to anyone else,
-        and a placed or external service may read records outside its own
-        subtree through grants it cannot see, so it keeps reading KV per pass.
-
-        ``_Signal`` arrives on the service's own node-wide subscription
-        (:meth:`_on_signal`); ``_SystemElement`` and ``_AnnotationType`` get
-        one each. The seed runs after they are made, so nothing written in
-        between is missed.
-        """
-        if not self._live_index_enabled or self._external or self._resolved_mount or self._system_element_id:
-            log.info("resolution reads KV per pass (live index needs an unplaced local service)")
-            return None
-        index = resolve.LiveIndex(self.door)
-        self._index = index
-        client = self._started_client
-        for contract in ("_SystemElement", "_AnnotationType"):
-            client.subscribe(f"{topic_prefix()}{contract}/{self._node_id}/#", qos=1, callback=self._on_index_record)
-        loop = self._loop
-        if loop is not None:
-            self._index_changed = asyncio.Event()
-            changed = self._index_changed
-            index.add_listener(lambda: _set_threadsafe(loop, changed))
-        resolve.attach(self.door, index)
-        return index
-
-    def _on_signal(self, message: Any) -> None:
-        index = self._index
-        if index is not None:
-            index.observe(str(message.topic), message.payload)
-        else:
-            self._resolution_changed()
-        super()._on_signal(message)
-
-    def _resolution_changed(self) -> None:
-        """Without a live index: resolve again (a ``_Signal`` changed, or the
-        broker link came back). Safe from any thread."""
-        loop, changed = self._loop, self._index_changed
-        if loop is not None and changed is not None:
-            _set_threadsafe(loop, changed)
-
-    def _on_index_record(self, message: Any) -> None:
-        index = self._index
-        if index is not None:
-            index.observe(str(message.topic), message.payload)
-
-    def _seed_index(self) -> None:
-        """Seed the live index off the loop; on a failure (a 429 at start),
-        resolution keeps reading KV and the seed is retried with backoff."""
-        index, loop = self._index, self._loop
-        if index is None or loop is None:
-            return
-        self._cancel_index_retry()
-
-        def _seed() -> None:
-            if self._resolved_mount or self._system_element_id:
-                # Placed on a reconnect: the node-wide view is no longer ours.
-                loop.call_soon_threadsafe(self._close_live_index)
-                return
-            try:
-                index.seed()
-            except Exception as exc:
-                loop.call_soon_threadsafe(self._index_seed_failed, exc)
-            else:
-                self._index_failures = 0
-
-        loop.run_in_executor(None, _seed)
-
-    def _index_seed_failed(self, exc: Exception) -> None:
-        self._index_failures += 1
-        delay = min(INDEX_RETRY_S * 2 ** (self._index_failures - 1), WAKE_RETRY_MAX_S)
-        log.warning(
-            "Could not seed the resolution index (attempt %d): %s — reading KV per pass, retrying in %.0fs",
-            self._index_failures,
-            exc,
-            delay,
-        )
-        if self._loop is not None and self._index is not None:
-            self._index_retry = self._loop.call_later(delay, self._seed_index)
-
-    def _close_live_index(self) -> None:
-        index = self._index
-        if index is None:
-            return
-        self._index = None
-        self._cancel_index_retry()
-        resolve.attach(self.door, None)
-        log.info("resolution reads KV per pass from now on: the service was placed below the node")
-
-    def _cancel_index_retry(self) -> None:
-        if self._index_retry is not None:
-            self._index_retry.cancel()
-            self._index_retry = None
-
     def _watch_constants_and_signals(self, instances: list[Producer]) -> None:
         """Subscribe every ``@on_constant``/``@on_signal`` trigger declared
         across ``instances`` — see :mod:`chaski.dataops.watch`. A no-op when
@@ -1051,34 +962,23 @@ class DataOpsService(Service):
             handlers,
             node_id,
         )
-        executor.subscribe(self._started_client, cast(asyncio.AbstractEventLoop, self._loop))
         return executor
 
     def _broker_state_changed(self, connected: bool) -> None:
         """Back on the broker: commands and input metrics sent while the link
         was down only rang a bell nobody heard, so drain both once."""
         super()._broker_state_changed(connected)
-        index, loop = self._index, self._loop
-        if index is not None and loop is not None:
-            # Down, changes can be missed; back, seed again before trusting it.
-            index.suspend()
-            if connected:
-                loop.call_soon_threadsafe(self._seed_index)
-        if connected and index is None:
-            self._resolution_changed()
-        loop, executor, ingest = self._loop, self._commands, self._ingest
+        loop, executor = self._loop, self._commands
+        if connected and loop is not None and self._ingest is not None:
+            loop.call_soon_threadsafe(self._ingest.wake)
         if connected and loop is not None and executor is not None:
             loop.call_soon_threadsafe(executor.wake)
-        if connected and ingest is not None:
-            # Wakes published while the link was down reached nobody.
-            ingest.wake()
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
         the blocking wrapper with signal handling."""
         stop = stop or asyncio.Event()
-        self.start()
         loop = asyncio.get_running_loop()
         self._loop = loop
 
@@ -1086,61 +986,67 @@ class DataOpsService(Service):
         # first timeline/beacon. Producer setup may read application time, so it
         # must not run in a different clock domain or be skipped at startup.
         health_state = health.HealthState(
-            generation=self.buffer.generation,
-            broker_connected=self.is_broker_connected,
-            cursor_lag=lambda: self.cursor_lag,
+            ready=False, broker_connected=self.is_broker_connected, cursor_lag=lambda: self.cursor_lag
         )
         health_server = None
         try:
             health_server = await health.serve(health_state, port=self._health_port)
-            while not self.clock.status().ready:
+            from ..retry import Backoff
+
+            startup_backoff = Backoff()
+            while not stop.is_set():
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=0.1)
-                    return
-                except TimeoutError:
-                    pass
+                    await asyncio.to_thread(self.start)
+                    health_state.generation = self.buffer.generation
+                    break
+                except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+                    log.warning("DataOps startup waiting for Colca (%s)", type(exc).__name__)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(stop.wait(), startup_backoff.delay(exc))
+            while not stop.is_set():
+                version = self.clock.changes.version
+                if self.clock.status().ready:
+                    break
+                await self.clock.changes.wait_async(version, stop=stop)
             if stop.is_set():
                 return
+            if self._definition_cache is None:
+                raise RuntimeError("DataOps definition subscription was not initialized")
+            while not stop.is_set():
+                version = self._definition_cache.changes.version
+                if self._definition_cache.view.available:
+                    break
+                await self._definition_cache.changes.wait_async(version, stop=stop)
+            if stop.is_set():
+                return
+            health_state.ready = True
             producers = self.producers
             if not producers:
                 log.warning("No producers added to %s — add() or discover() some before serve().", self.name)
             else:
                 log.info("Running %d producer(s): %s", len(producers), [p.name for p in producers])
 
-            # 2) Instantiate + run setup() — best-effort (see module docstring).
+            # Every configured producer must initialize before intake can advance.
             instances: list[Producer] = []
             for instance in self.instantiate():
-                try:
-                    await instance.setup()
-                except Exception:
-                    if self.step is not None:
-                        raise
-                    log.exception("Producer %s setup() failed — skipping", instance.name)
-                    continue
+                await instance.setup()
                 instances.append(instance)
             self.instances = instances
 
             # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
             #    after opening the live resolution index so the bindings the
             #    node writes for the catalogue arrive on it.
-            index = self._open_live_index()
-            if index is not None:
-                try:
-                    await asyncio.to_thread(index.seed)
-                except Exception as exc:
-                    self._index_seed_failed(exc)
             self.bind_outputs(instances)
+            # Catalogue publication commits new Signal bindings. Synchronize
+            # once at this causal boundary, before on_ready or durable ingest;
+            # ordinary per-signal lookups thereafter use the pushed cache.
+            await asyncio.to_thread(self._definition_cache.view.synchronize)
 
             # 4) Outputs are bound and no trigger has fired yet: producers do
             #    startup compute here instead of retrying publish() on the
             #    RuntimeError it raises before binding.
             for instance in instances:
-                try:
-                    await instance.on_ready()
-                except Exception:
-                    if self.step is not None:
-                        raise
-                    log.exception("Producer %s on_ready() failed — its triggers are still wired", instance.name)
+                await instance.on_ready()
 
             # 5) Refuse windows longer than the broker's retention without a historian.
             validate_windows(
@@ -1162,18 +1068,22 @@ class DataOpsService(Service):
                 self.buffer,
                 dispatch=dispatch,
                 signal_ids=signal_ids or None,
+                retry_min_s=self._retry_min_s,
                 # A lost buffer's generation cannot be recovered, so nothing knows
                 # the previous cursor yet and retiring it is a no-op.
                 previous_generation=None,
-                strict=self.step is not None,
             )
             ingest.retire_previous_generation()
             self._ingest = ingest
 
             # 9) Start ingest in the background and keep retrying unresolved inputs.
             health_state.producers = len(instances)
-            if self.step is not None:
-                health_state.last_drain_at = lambda: self._step_loop_last
+            health_state.last_drain_at = (
+                (lambda: self._step_loop_last) if self.step is not None else (lambda: ingest.last_drain_at)
+            )
+            health_state.stall_after_s = health.STALL_AFTER_MIN_S
+            health_state.waiting = (lambda: self._step_waiting) if self.step is not None else (lambda: ingest.waiting)
+            health_state.connected = self.is_broker_connected
             ingest_task: asyncio.Task | None = None
             if self.step is not None:
                 ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
@@ -1194,20 +1104,10 @@ class DataOpsService(Service):
                     log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
             reresolve_task: asyncio.Task | None = None
-            if self.step is None:
-                # Resolve again when the index or a _Signal changes, not on a timer.
-                if self._index_changed is None:
-                    self._index_changed = asyncio.Event()
+            if self.step is None and (unresolved or self._definition_cache is not None):
+                log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
                 reresolve_task = asyncio.ensure_future(
-                    follow_index(
-                        self,
-                        instances,
-                        ingest,
-                        stop,
-                        _ensure_ingest_running,
-                        self._index_changed,
-                        _bound_shape(dispatch, signal_ids),
-                    )
+                    reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
                 )
                 if unresolved:
                     log.info(
@@ -1231,7 +1131,7 @@ class DataOpsService(Service):
                     continue
                 if self.clock.definition_topic:
                     for method_name, spec in instance.__class__._triggers:
-                        if isinstance(spec, (CronSpec, IntervalSpec)):
+                        if isinstance(spec, CronSpec | IntervalSpec):
                             factory_tasks.append(
                                 asyncio.create_task(run_periodic(instance, method_name, spec, self.clock))
                             )
@@ -1270,9 +1170,13 @@ class DataOpsService(Service):
                         log.exception("Command executor did not shut down cleanly")
                     self._commands = None
                 if ingest_task is not None:
+                    if self.step is not None:
+                        ingest_task.cancel()
                     ingest.wake()
                     try:
                         await asyncio.wait_for(ingest_task, timeout=10.0)
+                    except asyncio.CancelledError:
+                        pass
                     except Exception:
                         log.exception("Ingest loop did not shut down cleanly")
                 for instance in instances:
@@ -1291,29 +1195,49 @@ class DataOpsService(Service):
     async def _run_steps(self, instances, ingest, stop):
         if self.step is None:
             return
+        from ..retry import Backoff
+
+        backoff = Backoff()
+        active_dispatch = None
         while not stop.is_set():
+            version = self.clock.changes.version
+            self._step_waiting = False
             try:
                 target = await asyncio.to_thread(self.step.ready)
                 if target is not None:
                     dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, self, instances)
                     if not unresolved:
-                        ingest.rebind(dispatch, signal_ids or None)
-                        # Previously sampled values stay in force before the
-                        # new sample at this boundary. Never run old timers
-                        # after ingesting the newer machine state.
-                        await run_due(instances, self.clock, target, inclusive=False)
+                        if dispatch is not active_dispatch:
+                            ingest.rebind(dispatch, signal_ids or None)
+                            active_dispatch = dispatch
+                        real_signals = {
+                            input_attr.signal_id
+                            for instance in instances
+                            for _, input_attr in declared_inputs(instance)
+                            if input_attr.time_domain == "real"
+                        }
+
+                        async def before_sample(at):
+                            await run_due(instances, self.clock, at, inclusive=False)
+
+                        async def finish_window(at):
+                            await run_due(instances, self.clock, at, inclusive=True)
+
                         if signal_ids:
-                            while await ingest.run_once():
-                                if stop.is_set():
-                                    return
-                        await run_due(instances, self.clock, target, inclusive=True)
+                            await ingest.run_window(
+                                target, before_sample, finish_window, real_signals=real_signals, clock=self.clock
+                            )
+                        else:
+                            await finish_window(target)
                         await asyncio.to_thread(self.step.complete, target)
-            except Exception:
+            except Exception as exc:
                 log.exception("Coordinated window failed; leaving its progress unacknowledged")
-                await asyncio.sleep(1)
+                await ingest._sleep_or_stop(backoff.delay(exc), stop)
+                continue
+            backoff.reset()
             self._step_loop_last = time.monotonic()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=0.01)
+            self._step_waiting = True
+            await self.clock.changes.wait_async(version, self.step.wait_delay())
 
     def run(self) -> None:
         """Block: :meth:`serve` on a fresh event loop until SIGINT/SIGTERM."""

@@ -1,10 +1,11 @@
 """SQLite-backed input buffer, a DataOps service's only local state.
 
-One file under the service's data directory with four tables: ``points`` (the
+One file under the service's data directory with five tables: ``points`` (the
 retained window per input signal), ``watermarks`` (replay progress per
 producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
 (the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
-its own).
+its own), and ``pending_outputs`` (computed samples waiting for a signal binding
+or a successful publish).
 
 :meth:`Buffer.append` is idempotent on ``(signal_id, ts)``, so a record
 processed again after a crash rewrites the same row. Cold start, recovery and
@@ -31,6 +32,21 @@ if TYPE_CHECKING:
 log = logging.getLogger("chaski.dataops.buffer")
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS producer_checkpoints (
+    producer TEXT PRIMARY KEY, code_hash TEXT NOT NULL,
+    version INTEGER NOT NULL, state TEXT NOT NULL, positions TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_inputs (
+    offset INTEGER PRIMARY KEY, ts REAL NOT NULL, record TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_inputs_time ON pending_inputs(ts, offset);
+
+CREATE TABLE IF NOT EXISTS pending_outputs (
+    source TEXT NOT NULL, ts REAL NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (source, ts)
+);
+
 CREATE TABLE IF NOT EXISTS points (
     signal_id TEXT NOT NULL,
     ts        REAL NOT NULL,
@@ -89,6 +105,125 @@ class Buffer:
         self._deferred = 0
         self.generation: str = self._load_or_mint_generation()
 
+    def checkpoint(self, producer: str):
+        """Return a producer's versioned JSON state and handled input offsets."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT code_hash, version, state, positions FROM producer_checkpoints WHERE producer=?",
+                (producer,),
+            ).fetchone()
+        return (row[0], row[1], json.loads(row[2]), json.loads(row[3])) if row else None
+
+    def save_checkpoint(self, producer, code_hash, version, state, positions):
+        """Persist state before input acknowledgement, in the enclosing batch commit."""
+        encoded = json.dumps(state, allow_nan=False)
+        offsets = json.dumps(positions, allow_nan=False)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO producer_checkpoints VALUES (?,?,?,?,?)",
+                (producer, code_hash, version, encoded, offsets),
+            )
+            if not self._deferred:
+                self._conn.commit()
+
+    def queue_inputs(self, records, scanned_to, *, limit=100000):
+        """Commit the coordinated inbox and intake offset before broker ack.
+
+        An acknowledgement retry cannot reinsert already dispatched records.
+        The separate processing watermark advances only after callbacks finish.
+        """
+        from dataclasses import asdict
+
+        from .ingest import Ingest
+
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT value FROM meta WHERE key='input_intake'").fetchone()
+            previous = int(row[0]) if row else 0
+            fresh = [r for r in records if r.offset > previous]
+            count = self._conn.execute("SELECT COUNT(*) FROM pending_inputs").fetchone()[0]
+            if count + len(fresh) > limit:
+                raise BufferError("coordinated input inbox reached its durable queue limit")
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO pending_inputs VALUES (?,?,?)",
+                [(r.offset, Ingest._timestamp_of(r), json.dumps(asdict(r), allow_nan=False)) for r in fresh],
+            )
+            self._conn.execute(
+                "INSERT INTO meta VALUES ('input_intake',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(max(previous, scanned_to)),),
+            )
+
+    def input_batch(self, through, *, real_signals=(), real=False, after=0, limit=1000):
+        """Read one bounded inbox batch in its declared clock domain."""
+        from chaski.door import Record
+
+        if real and not real_signals:
+            return []
+        query = (
+            "SELECT record FROM pending_inputs WHERE offset>? "
+            "AND json_extract(record,'$.payload.signal_id') IN (SELECT value FROM json_each(?)) "
+            "ORDER BY offset LIMIT ?"
+            if real
+            else "SELECT record FROM pending_inputs WHERE ts<=? "
+            "AND json_extract(record,'$.payload.signal_id') NOT IN (SELECT value FROM json_each(?)) "
+            "ORDER BY ts,offset LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                query,
+                (after if real else through, json.dumps(list(real_signals)), limit),
+            ).fetchall()
+            return [Record(**json.loads(row[0])) for row in rows]
+
+    def pending_input_start(self, signal_ids):
+        """Earliest queued event for these inputs, excluded from state replay."""
+        if not signal_ids:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts) FROM pending_inputs WHERE "
+                "json_extract(record,'$.payload.signal_id') IN (SELECT value FROM json_each(?))",
+                (json.dumps(list(signal_ids)),),
+            ).fetchone()
+            return row[0]
+
+    def finish_input(self, offset):
+        """Delete only after the callback's effects have completed durably."""
+        with self._lock:
+            self._conn.execute("DELETE FROM pending_inputs WHERE offset=?", (offset,))
+            if not self._deferred:
+                self._conn.commit()
+
+    def queue_output(self, source, timestamp, value, *, limit=10000):
+        """Persist unbound samples; backpressure instead of evicting history."""
+        encoded = json.dumps(value, allow_nan=False)
+        with self._lock, self._conn:
+            exists = self._conn.execute(
+                "SELECT 1 FROM pending_outputs WHERE source=? AND ts=?", (source, timestamp)
+            ).fetchone()
+            if (
+                not exists
+                and self._conn.execute("SELECT COUNT(*) FROM pending_outputs WHERE source=?", (source,)).fetchone()[0]
+                >= limit
+            ):
+                raise BufferError(f"unbound output {source!r} reached its durable queue limit")
+            self._conn.execute(
+                "INSERT INTO pending_outputs VALUES (?,?,?) ON CONFLICT(source,ts) DO UPDATE SET value=excluded.value",
+                (source, timestamp, encoded),
+            )
+
+    def pending_outputs(self, source, *, limit=1000):
+        with self._lock:
+            return [
+                (ts, json.loads(value))
+                for ts, value in self._conn.execute(
+                    "SELECT ts,value FROM pending_outputs WHERE source=? ORDER BY ts LIMIT ?", (source, limit)
+                )
+            ]
+
+    def output_sent(self, source, timestamp):
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM pending_outputs WHERE source=? AND ts=?", (source, timestamp))
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -145,6 +280,14 @@ class Buffer:
                 if not self._deferred:
                     self._conn.commit()
 
+    def append_many(self, points: list[tuple[str, float, Any]]) -> None:
+        """Commit adjacent input-only records together, before any handler runs."""
+        values = [(signal, ts, json.dumps(value)) for signal, ts, value in points]
+        if not values:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany("INSERT OR REPLACE INTO points (signal_id, ts, value) VALUES (?, ?, ?)", values)
+
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
         """Points for ``signal_id`` with ``start <= ts < end``, ordered by ts.
 
@@ -188,8 +331,10 @@ class Buffer:
         return row[0] if row and row[0] is not None else None
 
     def trim(self, horizons: dict[str, float], *, now: float | None = None) -> int:
-        """Delete points older than each signal's declared horizon (seconds).
+        """Trim history while retaining the value in force at each window start.
 
+        Keep the newest point before the cutoff as an anchor for latest-value
+        reads and change-only signals. That is at most one extra row per signal.
         Only signals present as keys in ``horizons`` are touched — a
         signal absent from the dict keeps every point it has. Never
         touches ``watermarks`` or ``meta``. Returns the total rows deleted.
@@ -199,7 +344,11 @@ class Buffer:
         with self._lock:
             for signal_id, horizon in horizons.items():
                 cutoff = now - horizon
-                cur = self._conn.execute("DELETE FROM points WHERE signal_id = ? AND ts < ?", (signal_id, cutoff))
+                cur = self._conn.execute(
+                    "DELETE FROM points WHERE signal_id = ? AND ts < "
+                    "(SELECT MAX(ts) FROM points WHERE signal_id = ? AND ts < ?)",
+                    (signal_id, signal_id, cutoff),
+                )
                 deleted += cur.rowcount
             self._conn.commit()
         return deleted

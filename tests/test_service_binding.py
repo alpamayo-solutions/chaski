@@ -15,6 +15,7 @@ import pytest
 from colca_data_contracts.local_service import LocalServiceIdentity
 from colca_data_contracts.payload import DataTags, Metric, Signal
 from franzmq import Topic
+from pending_helpers import drained
 
 from chaski.service import Service
 
@@ -102,6 +103,7 @@ def test_a_single_segment_path_binds_at_the_connectors_mount_not_at_the_source(t
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
     client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
 
+    drained(svc)
     metrics = [p for _t, p in client.published if isinstance(p, Metric)]
     assert len(metrics) == 1, client.published
     assert metrics[0].signal_id == "sig-1"
@@ -119,6 +121,7 @@ def test_a_multi_segment_path_binds_under_the_subscribed_mount_and_still_matches
     signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "press3", "temp"))
     client.deliver(signal_topic, Signal(id="sig-2", name="temp", data_tag=tag_id, is_published=True))
 
+    drained(svc)
     metrics = [p for _t, p in client.published if isinstance(p, Metric)]
     assert len(metrics) == 1, client.published
     assert metrics[0].signal_id == "sig-2"
@@ -133,6 +136,7 @@ def test_publish_after_binding_goes_straight_to_metric(tmp_path, monkeypatch):
 
     svc.publish("temp", 2.0)
 
+    drained(svc)
     metrics = [p for _t, p in client.published if isinstance(p, Metric)]
     assert [m.value for m in metrics] == [1.0, 2.0]
 
@@ -174,9 +178,71 @@ def test_a_signal_the_node_switched_off_is_bound_but_publishes_nothing(tmp_path,
     svc.publish("temp", 2.0)
 
     assert not [p for _t, p in client.published if isinstance(p, Metric)]
+    drained(svc)
     assert svc.pending() == [], "a bound path is not pending, published or not"
 
     # Denominator: switching it on publishes from then on.
     client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
     svc.publish("temp", 3.0)
     assert [m.value for _t, m in client.published if isinstance(m, Metric)] == [3.0]
+
+
+def test_unbound_output_backpressures_without_discarding_samples(tmp_path, monkeypatch):
+    import pytest
+
+    from chaski import service as module
+
+    svc, client = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "_MAX_BUFFERED_PER_PATH", 2)
+    svc.publish("temp", 1)
+    svc.publish("temp", 2)
+    with pytest.raises(BufferError, match="buffer is full"):
+        svc.publish("temp", 3)
+    tag_id = _minted_tag_id(client)
+    client.deliver(
+        Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp")),
+        Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True),
+    )
+    drained(svc)
+    assert [p.value for _, p in client.published if isinstance(p, Metric)] == [1, 2]
+
+
+def test_pending_samples_survive_restart_before_binding(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch)
+    svc.publish("temp", 41, timestamp=100)
+    svc.publish("temp", 42, timestamp=101)
+    svc.close()
+    resumed, client = _service(tmp_path, monkeypatch)
+    tag_id = _minted_tag_id(client)
+    client.deliver(
+        Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp")),
+        Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True),
+    )
+    drained(resumed)
+    assert [(m.value, m.timestamp) for _, m in client.published if isinstance(m, Metric)] == [(41, 100), (42, 101)]
+    resumed.close()
+
+
+def test_pending_publish_failure_keeps_samples_until_acknowledged(tmp_path, monkeypatch):
+    import threading
+
+    svc, client = _service(tmp_path, monkeypatch)
+    svc.publish("temp", 42, timestamp=100)
+    attempted = threading.Event()
+    original = svc._publish_metric
+
+    def fail(*args, **kwargs):
+        attempted.set()
+        raise ConnectionError("lost broker reply")
+
+    monkeypatch.setattr(svc, "_publish_metric", fail)
+    client.deliver(
+        Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp")),
+        Signal(id="sig-1", name="temp", data_tag=_minted_tag_id(client), is_published=True),
+    )
+    assert attempted.wait(2)
+    assert svc._pending_samples.page("temp")[0][1:3] == (42, 100)
+    monkeypatch.setattr(svc, "_publish_metric", original)
+    drained(svc)
+    assert [m.value for _, m in client.published if isinstance(m, Metric)] == [42]
+    svc.close()
