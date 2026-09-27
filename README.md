@@ -381,8 +381,8 @@ consumed page remains unacknowledged. With an external doorbell, ring it after
 setting stop to wake an idle follower.
 
 A failed handler is never acknowledged. This holds for `@on_metric`,
-`@on_constant`, `@on_signal`, factory-time `@every`/`@cron` callbacks and
-`Service.consume()`:
+`@on_constant`, `@on_signal`, factory-time `@every`/`@cron` callbacks,
+the replay after a producer's code changed, and `Service.consume()`:
 
 - The cursor moves only past the records before the failed one, so a restart
   resumes at it. No replay watermark is recorded for failed processing.
@@ -403,6 +403,13 @@ handler. The runner records the rejection durably, as the service's retained
 the `entities` stream), and acknowledges the input only after that. A rejection
 that cannot be recorded counts as a failure. `svc.clear_rejections()` retires
 the finding once the inputs were dealt with.
+
+The replay after a code change works the same way. A rejected buffered record
+is recorded and the replay goes on. Any other failure leaves the producer's
+watermark and code hash unwritten; the service stays up, reports the `replay`
+task degraded, then unhealthy, and retries the replay with backoff before
+intake starts. A `@every`/`@cron` callback that raises `Reject` has its tick
+recorded and passed.
 
 ```python
 @on_metric("panel_edge")

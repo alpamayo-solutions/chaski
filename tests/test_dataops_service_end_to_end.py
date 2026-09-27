@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -25,6 +26,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from dataops_fakes import run_async
 from paho.mqtt.client import topic_matches_sub
 
+from chaski import Reject
 from chaski.dataops import (
     DataOpsService,
     Producer,
@@ -695,3 +697,110 @@ async def test_delayed_clock_runs_setup_once_in_factory_time(tmp_path: Path, mon
     finally:
         stop.set()
         await asyncio.wait_for(task, 2)
+
+
+# ─── replay after a code change ──────────────────────────────────────────
+
+
+class Strict(Producer):
+    """Rejects negative temperatures; fails on the ones ``fail_below`` names."""
+
+    name = "strict"
+    system_element_name = "oven"
+    fail_below: ClassVar[float] = 0.0
+
+    temperature = SignalRangeInput("temperature", window="10m")
+    doubled = SignalOutput("doubled", "float", "temperature x 2")
+
+    @on_metric("temperature")
+    async def recompute(self, metric) -> None:
+        if metric.timestamp < Strict.fail_below:
+            raise RuntimeError("store unavailable")
+        if metric.value < 0:
+            raise Reject("negative temperature", detail={"value": metric.value})
+        self.doubled.publish(metric.value * 2, metric.timestamp)
+
+
+def _buffered_before_a_code_change(tmp_path: Path) -> None:
+    """A buffer from an earlier version of ``Strict``: its code hash differs,
+    and it holds one record the handler rejects between two it accepts."""
+    from chaski.dataops.buffer import Buffer
+
+    (tmp_path / "data").mkdir()
+    buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
+    try:
+        buffer.set_watermark("strict", 0.0, "earlier-code")
+        now = time.time()
+        buffer.append("sig-in", now - 30, 1.0)
+        buffer.append("sig-in", now - 20, -5.0)
+        buffer.append("sig-in", now - 10, 3.0)
+    finally:
+        buffer.close()
+
+
+@run_async
+async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_on(tmp_path: Path, monkeypatch):
+    from chaski.dataops import codehash
+    from chaski.dataops.buffer import Buffer
+
+    _buffered_before_a_code_change(tmp_path)
+    monkeypatch.setattr(Strict, "fail_below", 0.0)
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(Strict)
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        # The live record after the replay is handled too.
+        await _poll_until(lambda: any(p["value"] == 43.0 for _t, p in _door_metrics()))
+        assert not task.done()
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    assert sorted(p["value"] for _t, p in _door_metrics()) == [2.0, 6.0, 43.0]
+    (finding,) = [json.loads(p) for t, p in client.published if t.endswith("/rejected_input")]
+    assert finding["detail"]["consumer"] == "strict.recompute"
+    assert finding["detail"]["replay"] == "strict"
+    assert svc.handler_health.status == "ok"
+    buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
+    try:
+        assert buffer.code_hash("strict") == codehash.compute_code_hash(Strict)
+    finally:
+        buffer.close()
+
+
+@run_async
+async def test_a_failing_replay_is_retried_with_the_service_up_and_degraded(tmp_path: Path, monkeypatch):
+    from chaski.dataops.buffer import Buffer
+
+    _buffered_before_a_code_change(tmp_path)
+    monkeypatch.setattr(Strict, "fail_below", time.time())
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(Strict)
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: svc.handler_health.failing().get("task replay", None) is not None)
+        assert not task.done()
+        assert svc.handler_health.status == "degraded"
+        # The replay is not marked complete, and live intake waits for it.
+        assert svc._ingest is None
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+    buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
+    try:
+        assert buffer.code_hash("strict") == "earlier-code"
+    finally:
+        buffer.close()
+
+
+def _door_metrics() -> list[tuple[str, dict]]:
+    return _FakeNodeDoor.instances[0].metrics() if _FakeNodeDoor.instances else []
