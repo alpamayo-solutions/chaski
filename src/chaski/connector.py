@@ -619,6 +619,14 @@ class ConnectorService(Service):
                 delay = discovery if delay is None else min(delay, discovery)
             if step_target is not None and self.step is not None and self.step.completed_at != step_target:
                 delay = self.interval if delay is None else min(delay, self.interval)
+            if self.step is None and clock_status.ready and clock_status.factory_now is not None:
+                # A future definition can start without another message. Wake
+                # at that transition even when the next heartbeat is later
+                # (or no heartbeat is bound). A paused/completed clock without
+                # a scheduled transition returns None, so it stays event-driven.
+                clock_delay = self.clock.delay_until(clock_status.factory_now + max(self.interval, 1e-6))
+                if clock_delay is not None:
+                    delay = clock_delay if delay is None else min(delay, clock_delay)
             deadline = self.step.wait_delay(delay) if self.step is not None else delay
             await self.clock.changes.wait_async(change_version, deadline, stop=self._stopping)
             return
