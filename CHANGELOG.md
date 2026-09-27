@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/alpamayo-solutions/chaski/compare/v0.14.0...v0.14.1) (2026-09-27)
+
+
+### Fixes
+
+* retained view and command executor fetch only what wakes them, so other records do not count as unread ([#76](https://github.com/alpamayo-solutions/chaski/issues/76)) ([3270675](https://github.com/alpamayo-solutions/chaski/commit/32706759ccedf8e737afefbdb5e87aae709c12f3))
+
 ## [0.14.0](https://github.com/alpamayo-solutions/chaski/compare/v0.13.0...v0.14.0) (2026-09-27)
 
 
