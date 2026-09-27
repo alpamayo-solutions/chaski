@@ -105,6 +105,42 @@ Pass the same topics as `svc.stream(..., topics=[...])`. A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
 `svc.cursor_lag` follows and a `DataOpsService` health door fails on.
 
+### Push-driven consumer rules
+
+- Subscribe before hydrating state or draining history. On reconnect, rebuild
+  invalid caches and resume durable streams from their saved cursors.
+- Use `RetainedView` for live current state and `Stream` for durable history.
+  MQTT messages and watch hints wake consumers; they do not prove that every
+  record was processed. Do not use retained state as an event history.
+- Read only the contracts and paths you need. Hydrate on startup, reconnect or
+  explicit invalidation, then maintain the view from pushed changes. Avoid a
+  separate `/kv` lookup per message or a recurring refresh timer.
+- Capture the wakeup generation before draining. Continue through filtered
+  pages until the stream boundary, including short pages. Never acknowledge
+  retention gaps as successful processing.
+- Commit effects or a durable processing inbox before acknowledging input.
+  Make replay idempotent, bound queues and expose backpressure. Preserve
+  timestamped samples even when their values do not change.
+- Coalesce wakeups into bounded batches. Limit how often a batch starts without
+  sleeping between pages that still contain admitted work. A continuous stream
+  must not require reaching an empty queue before progress can be committed.
+- Retry failed operations with backoff and honor `Retry-After`. Do not add
+  periodic reads to hide a broken subscription. Expose connection health, last
+  completed drain and queue/processing lag separately.
+- Publish state/configuration when it changes; batch high-rate measurements.
+  Command acceptance, execution and projected visibility are different events.
+  An MQTT acknowledgement does not establish execution completion.
+- Use real monotonic time for transport deadlines, retries and pacing; use
+  factory/event time for simulated behavior. PLC acquisition, scheduled work,
+  alarm deadlines, batching, health checks and display clocks are legitimate
+  timers. Periodic reads to discover new Colca business records are not.
+- Test reconnect, lost acknowledgements, duplicate delivery, continuous input,
+  cancellation, retention gaps and restart with unchanged producer code.
+
+See [consumer failure and producer recovery](#consumer-failure-and-producer-recovery)
+for the state and acknowledgement contract, and [CONTRIBUTING](CONTRIBUTING.md#set-up)
+for broker-backed tests.
+
 ## Poll a source
 
 A driver implements four `async` methods: `connect()`, `discover()` (the tags
@@ -309,10 +345,9 @@ acknowledgement, and raises `BufferError` at its per-path limit. Replay after a
 lost reply can repeat a sample; consumers must remain idempotent. Signals
 explicitly marked unpublished suppress their queued samples.
 
-This development build requires the matching Colca source build for scoped watch,
-queue telemetry and embedded-node lifecycle events. Its sandbox deployment records
-source digests; it must not be substituted for a released wheel in a clean build
-until the corresponding SDK and broker releases have been published and pinned.
+Scoped watches, queue telemetry and embedded-node lifecycle events require
+Colca 0.20 or later. Upgrade the SDK and broker as a tested pair; the `node`
+extra constrains the supported broker version range for embedded deployments.
 
 
 ### Consumer failure and producer recovery
