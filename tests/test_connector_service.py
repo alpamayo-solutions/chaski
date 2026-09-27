@@ -366,6 +366,39 @@ def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver,
     assert 0 < svc.slept[-1] <= 1
 
 
+@pytest.mark.parametrize("heartbeat", [False, True])
+def test_future_start_wakes_acquisition_before_heartbeat(node, driver, monkeypatch, heartbeat):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock as ApplicationClock
+
+    real = Clock()
+    svc = started(node, driver, monkeypatch, clock=real)
+    svc.interval = 1
+    wait = svc.clock.changes.wait_async
+    svc.clock = ApplicationClock(wall=real)
+    svc.clock.changes.wait_async = wait
+    svc.clock.apply_definition(ClockDefinition("factory", "run", 1, 1001, 100, 100, stop_at=400))
+    bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
+    if heartbeat:
+        bind(node, svc, HEARTBEAT_TAG_SOURCE, path="heartbeat", signal_id="heartbeat")
+
+    poll(svc)
+    assert driver.reads == []
+    assert svc.slept[-1] == pytest.approx(1)
+    real.now += svc.slept[-1]
+    poll(svc)
+    assert len(driver.reads) == 1
+    assert next(m for _, m in node.metrics() if m.signal_id == "temp").timestamp == 100
+
+    # Once the bounded run is over, do not replace idle waiting with polling.
+    real.now += 3
+    svc.slept.clear()
+    poll(svc)
+    assert len(driver.reads) == 1
+    assert (svc.slept[-1] > 0) if heartbeat else not svc.slept
+
+
 def test_missing_clock_stops_sampling_without_stopping_health(node, driver, monkeypatch):
     from chaski.clock import Clock as ApplicationClock
 
