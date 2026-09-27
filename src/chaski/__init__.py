@@ -28,7 +28,7 @@ from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
 from .failures import HandlerHealth, Reject
 from .node import Node
-from .service import LocalDoor, NotEnrolled, Service
+from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
 
 __all__ = [
     "Clock",
@@ -48,6 +48,7 @@ __all__ = [
     "LocalDoor",
     "Node",
     "NotEnrolled",
+    "NotSent",
     "Page",
     "Reading",
     "Record",
@@ -59,6 +60,7 @@ __all__ = [
     "Target",
     "Telemetry",
     "lifetime_refusal",
+    "write_deadline",
 ]
 
 

@@ -181,6 +181,46 @@ def test_no_ack_in_time_raises_and_forgets_the_waiter(tmp_path, monkeypatch):
     assert svc._command_sender._waiters == {}
 
 
+def test_a_command_under_a_write_deadline_expires_and_is_waited_for_by_it(tmp_path, monkeypatch):
+    """A command sent from a command handler must not outlive the command
+    being handled."""
+    from chaski import write_deadline
+    from chaski.service import writes_until
+
+    client = _Client(answer=None)
+    client.is_connected = lambda: True
+    svc = _service(tmp_path, monkeypatch, client)
+    assert write_deadline() is None
+    deadline = time.time() + 0.3
+
+    with writes_until(deadline):
+        assert write_deadline() == deadline
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="_Ack"):
+            svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=30)
+        assert time.monotonic() - started < 2
+
+    payload = json.loads(client.of("publish")[-1][2])
+    assert payload["expires_at"] <= deadline * 1000
+
+
+def test_a_command_past_its_write_deadline_or_without_a_link_is_not_sent(tmp_path, monkeypatch):
+    from chaski import NotSent
+    from chaski.service import writes_until
+
+    client = _Client()
+    client.is_connected = lambda: True
+    svc = _service(tmp_path, monkeypatch, client)
+    sent = len(client.of("publish"))
+
+    with writes_until(time.time() - 1), pytest.raises(NotSent, match="deadline"):
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=5)
+    client.is_connected = lambda: False
+    with writes_until(time.time() + 30), pytest.raises(NotSent, match="link is down"):
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=5)
+    assert len(client.of("publish")) == sent
+
+
 def test_a_command_sender_works_on_any_session():
     client = _Client()
     sender = CommandSender(client, NODE)

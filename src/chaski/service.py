@@ -141,15 +141,24 @@ class NotSent(RuntimeError):
 
 @contextlib.contextmanager
 def writes_until(deadline: float | None) -> Iterator[None]:
-    """Refuse :meth:`Service.send`/:meth:`Service.retract` from this context
-    (tasks and ``asyncio.to_thread`` calls inherit it) once ``deadline``
-    (unix seconds) has passed or while the broker link is down, instead of
-    queueing the write for after a reconnect. ``None`` sets no deadline."""
+    """Refuse :meth:`Service.send`/:meth:`Service.retract`/:meth:`Service.command`
+    from this context (tasks and ``asyncio.to_thread`` calls inherit it) once
+    ``deadline`` (unix seconds) has passed or while the broker link is down,
+    instead of queueing the write for after a reconnect. A command sent
+    before then expires, and is waited for, no later than ``deadline``.
+    ``None`` sets no deadline."""
     token = _write_deadline.set(deadline)
     try:
         yield
     finally:
         _write_deadline.reset(token)
+
+
+def write_deadline() -> float | None:
+    """The deadline (unix seconds) writes from the current context must be
+    sent by, as :func:`writes_until` set it; ``None`` without one. In an
+    ``@on_command`` handler it is the command's ``expires_at``."""
+    return _write_deadline.get()
 
 
 class NotEnrolled(RuntimeError):
@@ -1263,8 +1272,16 @@ class Service:
         """Send one command to ``path`` on this service's node and return its
         ``_Ack`` as the executor wrote it (``result_code``, ``message``, and
         whatever else it carries, such as ``state_writes``). See
-        :meth:`chaski.command.CommandSender.command`."""
-        self._require_client("command")
+        :meth:`chaski.command.CommandSender.command`. Under
+        :func:`writes_until` the command expires, and is waited for, by the
+        deadline at the latest; past it or while the link is down it is not
+        sent and raises :class:`NotSent`."""
+        self._writable("command", f"{contract} {path}")
+        deadline = _write_deadline.get()
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.time())
+            if timeout <= 0:
+                raise NotSent(f"{contract} {path}: not sent, its deadline had passed")
         return cast(CommandSender, self._command_sender).command(contract, path, fields, timeout=timeout)
 
     # -- consuming ---------------------------------------------------------
