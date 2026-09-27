@@ -181,37 +181,6 @@ class Producer(ABC):
         """Replace in-memory state from snapshot_state; must not publish effects."""
         raise NotImplementedError
 
-    def _state_copy(self):
-        return json.loads(json.dumps(self.snapshot_state(), allow_nan=False))
-
-    def _restore_checkpoint(self) -> bool:
-        if self.state_version is None:
-            return False
-        from .codehash import compute_code_hash
-
-        self._checkpoint_hash = compute_code_hash(type(self))
-        saved = self.runtime.buffer.checkpoint(self.name)
-        if saved is None or saved[:2] != (self._checkpoint_hash, self.state_version):
-            return False
-        self.restore_state(saved[2])
-        self._handled_offsets = saved[3]
-        return True
-
-    def _save_checkpoint(self) -> None:
-        if self.state_version is None:
-            return
-        if self._checkpoint_hash is None:
-            from .codehash import compute_code_hash
-
-            self._checkpoint_hash = compute_code_hash(type(self))
-        self.runtime.buffer.save_checkpoint(
-            self.name,
-            self._checkpoint_hash,
-            self.state_version,
-            self.snapshot_state(),
-            self._handled_offsets,
-        )
-
     async def setup(self) -> None:  # noqa: B027 - optional hook
         """Override to load initial state (e.g. cursor from DB). Default no-op.
 
@@ -293,3 +262,46 @@ class Producer(ABC):
         buffer = self.runtime.buffer
         existing_hash = buffer.code_hash(self.name) or ""
         buffer.set_watermark(self.name, position, existing_hash)
+
+
+# The checkpoint machinery is chaski's, not the producer's: module functions,
+# so a producer's own method of the same name never replaces it.
+
+
+def state_copy(producer: Producer) -> Any:
+    """A detached copy of ``producer.snapshot_state()``."""
+    return json.loads(json.dumps(producer.snapshot_state(), allow_nan=False))
+
+
+def restore_checkpoint(producer: Producer) -> bool:
+    """Restore the saved checkpoint of ``producer`` if its code hash and
+    ``state_version`` match. Returns whether it was restored."""
+    if producer.state_version is None:
+        return False
+    from .codehash import compute_code_hash
+
+    producer._checkpoint_hash = compute_code_hash(type(producer))
+    saved = producer.runtime.buffer.checkpoint(producer.name)
+    if saved is None or saved[:2] != (producer._checkpoint_hash, producer.state_version):
+        return False
+    producer.restore_state(saved[2])
+    producer._handled_offsets = saved[3]
+    return True
+
+
+def save_checkpoint(producer: Producer) -> None:
+    """Save the state of ``producer`` and its handled offsets; nothing for a
+    producer without ``state_version``."""
+    if producer.state_version is None:
+        return
+    if producer._checkpoint_hash is None:
+        from .codehash import compute_code_hash
+
+        producer._checkpoint_hash = compute_code_hash(type(producer))
+    producer.runtime.buffer.save_checkpoint(
+        producer.name,
+        producer._checkpoint_hash,
+        producer.state_version,
+        producer.snapshot_state(),
+        producer._handled_offsets,
+    )

@@ -293,6 +293,50 @@ async def test_checkpoint_failure_restores_memory_and_preserves_retry(buffer, ru
     assert instance.received == [(100, "opened")]
 
 
+class OwnCheckpointProducer(CheckpointProducer):
+    """Keeps a checkpoint of its own under names chaski once used itself."""
+
+    name = "own-checkpoint"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.own_calls: list[str] = []
+
+    def _save_checkpoint(self):
+        self.own_calls.append("save")
+        return self._write()
+
+    async def _write(self) -> None:
+        pass
+
+    def _restore_checkpoint(self):
+        self.own_calls.append("restore")
+
+    def _state_copy(self):
+        self.own_calls.append("copy")
+
+
+@run_async
+async def test_a_producer_method_named_like_chaskis_checkpoint_is_not_called(buffer, runtime):
+    """A producer's own async ``_save_checkpoint`` was called without await
+    after a replay, and chaski's checkpoint was not saved."""
+    from dataclasses import replace
+
+    from chaski.dataops.service import make_handler, synthetic_record
+
+    buffer.append("sig-event", 100.0, "a")
+    first = OwnCheckpointProducer().attach(runtime)
+    await replay_changed_producers(runtime, [first])
+    assert buffer.checkpoint(first.name)[2] == [[100.0, "a"]]
+    await make_handler(first.on_event)(replace(synthetic_record("sig-event", 200, "b"), offset=5))
+    assert buffer.checkpoint(first.name)[2] == [[100.0, "a"], [200, "b"]]
+
+    second = OwnCheckpointProducer().attach(runtime)
+    await replay_changed_producers(runtime, [second])
+    assert second.received == [(100.0, "a"), (200, "b")]
+    assert first.own_calls == second.own_calls == []
+
+
 def test_checkpoint_requires_both_state_hooks():
     class Incomplete(Producer):
         state_version = 1
