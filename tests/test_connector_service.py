@@ -374,6 +374,7 @@ def test_future_start_wakes_acquisition_before_heartbeat(node, driver, monkeypat
 
     real = Clock()
     svc = started(node, driver, monkeypatch, clock=real)
+    svc._heartbeat_start = real.now
     svc.interval = 1
     wait = svc.clock.changes.wait_async
     svc.clock = ApplicationClock(wall=real)
