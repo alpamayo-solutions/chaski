@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/alpamayo-solutions/chaski/compare/v0.14.4...v0.14.5) (2026-09-27)
+
+
+### Fixes
+
+* command executor wakes on its own answers; checkpoint save and handler command deadline fixes ([#86](https://github.com/alpamayo-solutions/chaski/issues/86)) ([98f0bd4](https://github.com/alpamayo-solutions/chaski/commit/98f0bd4a64f10db853c96258336debcabd5bdbbd))
+
 ## [0.14.4](https://github.com/alpamayo-solutions/chaski/compare/v0.14.3...v0.14.4) (2026-09-27)
 
 
