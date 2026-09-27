@@ -20,7 +20,7 @@ class Door:
     def put(self, value):
         self.records.append(SimpleNamespace(topic=TOPIC, payload=value, offset=len(self.records) + 1, ts=0))
 
-    def fetch(self, stream, cursor, *, max, tail=False):
+    def fetch(self, stream, cursor, *, max, tail=False, contracts=None):
         if self.fail:
             raise ConnectionError("disconnected")
         if tail:
