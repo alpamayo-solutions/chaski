@@ -123,7 +123,32 @@ def test_metric_hint_does_not_read_unchanged_definition_streams():
     door.fetches.clear()
     current.watch["metrics"].notify()
     current._refresh_changed()
-    assert door.fetches == ["metrics"]
+    assert set(door.fetches) == {"metrics"}
     door.fetches.clear()
     current._refresh_changed()
     assert door.fetches == []
+
+
+def test_a_view_at_the_head_still_fetches_with_its_contracts():
+    """The node counts a cursor's unread records by its last fetch filter; a
+    tail read or an ack does not replace it, so a view that starts at the head
+    fetches once with its contracts anyway."""
+
+    class FilterDoor(Door):
+        def __init__(self):
+            super().__init__()
+            self.filtered = []
+
+        def fetch(self, stream, cursor, *, max, tail=False, contracts=None):
+            if not tail:
+                self.filtered.append((stream, contracts))
+            return super().fetch(stream, cursor, max=max, tail=tail, contracts=contracts)
+
+    door = FilterDoor()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    assert door.filtered == [("metrics", ["_Metric"])]
+    door.filtered.clear()
+    current.synchronize()
+    assert door.filtered == [("metrics", ["_Metric"])]

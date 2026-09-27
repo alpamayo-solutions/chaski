@@ -3,8 +3,8 @@
 Capture stream positions before the snapshot; catch up from those positions
 before exposing it. Per-topic offsets reject records older than the snapshot.
 Tombstones are applied too. This view is rebuildable, not a delivery ledger.
-It fetches only its contracts, so other records on the same stream never
-count as unread on its cursor.
+It fetches only its contracts, and fetches on every drain, so other records
+on the same stream never count as unread on its cursor.
 """
 
 import copy
@@ -104,9 +104,10 @@ class RetainedView:
                     self._bootstrap()
                 gap = False
                 for stream in selected:
+                    # Fetch at least once, also at the head: the node counts
+                    # unread records by the cursor's last fetch filter, and a
+                    # tail read or an ack does not replace an earlier one.
                     head = self.door.fetch(stream, self.cursor, max=1, tail=True).next - 1
-                    if head <= self.positions.get(stream, 0):
-                        continue
                     while not self.stop.is_set():
                         page = self.door.fetch(stream, self.cursor, max=1000, contracts=sorted(self.contracts))
                         if page.gap is not None:
