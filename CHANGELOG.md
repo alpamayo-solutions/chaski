@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.2](https://github.com/alpamayo-solutions/chaski/compare/v0.14.1...v0.14.2) (2026-09-27)
+
+
+### Fixes
+
+* a record rejected during the code-change replay is recorded and passed, and a failed replay is retried with the service up ([#79](https://github.com/alpamayo-solutions/chaski/issues/79)) ([7a8ee7a](https://github.com/alpamayo-solutions/chaski/commit/7a8ee7a0ef169e334f5a5fc3c3ea4426a456951d))
+* a retained view fetches with its contracts on every drain, so a cursor at the head does not keep an unfiltered read ([#78](https://github.com/alpamayo-solutions/chaski/issues/78)) ([91dbde0](https://github.com/alpamayo-solutions/chaski/commit/91dbde0578927534cbe34d30d094bde631c716a6))
+
 ## [0.14.1](https://github.com/alpamayo-solutions/chaski/compare/v0.14.0...v0.14.1) (2026-09-27)
 
 
