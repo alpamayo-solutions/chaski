@@ -61,3 +61,43 @@ def test_other_contracts_on_the_stream_are_not_unread_for_the_view(tmp_path, fas
         names = _wait(lagging)
         assert view.cursor not in names, names
         view.close()
+
+
+def test_a_restarted_view_replaces_the_filter_the_node_remembers_for_its_cursor(tmp_path, fast_lag_alarm):
+    """The node keeps a cursor's last fetch filter until the cursor fetches
+    again. A view that starts at the head must still fetch with its contracts,
+    or an earlier unfiltered read keeps counting other records as unread."""
+    if not os.environ.get("COLCAD_BINARY"):
+        pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
+    with chaski.Node("view-restart", data_dir=tmp_path / "node") as node, node.service("worker") as svc:
+        # An earlier consumer on the same cursor read every record.
+        list(svc.stream("entities", cursor="view"))
+        view = svc.retained_view(contracts=["_Signal"], streams=["entities"], cursor="view")
+        view.read()
+        control = svc.stream("entities", cursor="control")
+        list(control)
+        # The view's subscription is up and its first hint was handled, so no
+        # later wake-up refreshes it.
+        entities = view.watch["entities"]
+        _wait(
+            lambda: (
+                view.watch.connected and entities.version and view._stream_versions.get("entities") == entities.version
+            )
+        )
+
+        base = f"{topic_prefix()}_Finding/{svc.node_id}/{'/'.join(svc._hierarchy)}"
+        for i in range(20):
+            finding = {"reason": "test", "summary": str(i), "observed_at": time.time(), "suggested_severity": "info"}
+            svc.send(f"{base}/other-{i}", json.dumps(finding), retain=True)
+
+        def lagging():
+            for entry in svc.kv(contract="_Finding"):
+                if entry.path.endswith("cursor_lag"):
+                    names = {c["cursor"] for c in entry.payload["detail"]["cursors"]}
+                    if control.cursor in names:
+                        return names
+            return None
+
+        names = _wait(lagging)
+        assert view.cursor not in names, names
+        view.close()
