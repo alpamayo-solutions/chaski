@@ -9,6 +9,7 @@ import logging
 from apscheduler.triggers.cron import CronTrigger
 
 from chaski.clock import Clock, ClockNotReady
+from chaski.retry import Backoff
 
 from .base import Producer
 from .triggers import CronSpec, IntervalSpec
@@ -40,6 +41,7 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
     buffer = instance.runtime.buffer
     previous = buffer.watermark(key)
     while previous is None:
+        version = clock.changes.version
         try:
             definition = clock.definition
             previous = (
@@ -48,8 +50,9 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
                 else clock.now()
             )
         except ClockNotReady:
-            await asyncio.sleep(0.1)
+            await clock.changes.wait_async(version)
     method = getattr(instance, method_name)
+    retry = Backoff()
     while (due := next_tick(spec, previous)) is not None:
         await clock.sleep_until(due)
 
@@ -65,10 +68,11 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
             except asyncio.CancelledError:
                 await worker  # Finish/commit before the runtime closes SQLite.
                 raise
-        except Exception:
+        except Exception as exc:
             log.exception("Factory callback %s.%s failed at %.6f; will retry", instance.name, method_name, due)
-            await asyncio.sleep(1)
+            await asyncio.sleep(retry.delay(exc))
             continue
+        retry.reset()
         previous = due
         report = getattr(instance.runtime, "report_progress", None)
         if report is not None:

@@ -13,6 +13,7 @@ Nothing here is process-global except the discovery record.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -93,6 +94,10 @@ class Producer(ABC):
     # a code change does.
     config_keys: ClassVar[tuple[str, ...]] = ()
 
+    # Opt in for state changed by on_metric handlers. Both hooks are required.
+    # Timers/commands with state need their own explicit recovery transaction.
+    state_version: ClassVar[int | None] = None
+
     # Populated by __init_subclass__
     _triggers: ClassVar[list]  # actual type: list[TriggerSpec], avoiding circular import
 
@@ -104,6 +109,8 @@ class Producer(ABC):
     # Set on every instance in __new__.
     _lock: threading.RLock
     _runtime: Runtime | None
+    _handled_offsets: dict[str, int]
+    _checkpoint_hash: str | None
 
     @property
     def now(self) -> float:
@@ -156,9 +163,54 @@ class Producer(ABC):
         self = super().__new__(cls)
         self._lock = threading.RLock()
         self._runtime = None
+        self._handled_offsets = {}
+        self._checkpoint_hash = None
+        if cls.state_version is not None and (
+            cls.snapshot_state is Producer.snapshot_state or cls.restore_state is Producer.restore_state
+        ):
+            raise TypeError("state_version requires snapshot_state() and restore_state()")
         return self
 
     # ------------------------------------------------------------------ lifecycle
+
+    def snapshot_state(self) -> Any:
+        """Return JSON state sufficient to resume every on_metric handler."""
+        raise NotImplementedError
+
+    def restore_state(self, state: Any) -> None:
+        """Replace in-memory state from snapshot_state; must not publish effects."""
+        raise NotImplementedError
+
+    def _state_copy(self):
+        return json.loads(json.dumps(self.snapshot_state(), allow_nan=False))
+
+    def _restore_checkpoint(self) -> bool:
+        if self.state_version is None:
+            return False
+        from .codehash import compute_code_hash
+
+        self._checkpoint_hash = compute_code_hash(type(self))
+        saved = self.runtime.buffer.checkpoint(self.name)
+        if saved is None or saved[:2] != (self._checkpoint_hash, self.state_version):
+            return False
+        self.restore_state(saved[2])
+        self._handled_offsets = saved[3]
+        return True
+
+    def _save_checkpoint(self) -> None:
+        if self.state_version is None:
+            return
+        if self._checkpoint_hash is None:
+            from .codehash import compute_code_hash
+
+            self._checkpoint_hash = compute_code_hash(type(self))
+        self.runtime.buffer.save_checkpoint(
+            self.name,
+            self._checkpoint_hash,
+            self.state_version,
+            self.snapshot_state(),
+            self._handled_offsets,
+        )
 
     async def setup(self) -> None:  # noqa: B027 - optional hook
         """Override to load initial state (e.g. cursor from DB). Default no-op.

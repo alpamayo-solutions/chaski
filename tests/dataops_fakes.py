@@ -11,6 +11,7 @@ historian stand-in.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import functools
 import json
 from typing import Any
@@ -77,7 +78,11 @@ class FakeDoor:
     def queue(self, page: Page) -> None:
         self._pages.append(page)
 
-    def fetch(self, stream, cursor, *, max=1000, signal_ids=None, contracts=None, topics=None, from_offset=None):
+    def fetch(
+        self, stream, cursor, *, max=1000, signal_ids=None, contracts=None, topics=None, from_offset=None, tail=False
+    ):
+        if tail:
+            return Page(records=[], next=builtins.max((p.next for p in self._pages), default=1))
         call = {"stream": stream, "cursor": cursor, "max": max, "signal_ids": signal_ids}
         if contracts is not None:
             call["contracts"] = contracts
@@ -90,7 +95,7 @@ class FakeDoor:
             return self._pages.pop(0)
         return Page(records=[], next=1)
 
-    def watch(self, streams, *, interval_ms=None):
+    def watch(self, streams, *, interval_ms=None, contracts=(), stop=None):
         """No hints: the connection ends at once (tests ring by hand)."""
         return iter(())
 

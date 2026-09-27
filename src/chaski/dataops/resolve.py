@@ -5,26 +5,18 @@ to Signal ULID, a signal's node-local path to its ULID, element name to ULID,
 annotation type name to ULID, and a catalogue tag id to the ``_Signal`` bound
 to it (:func:`resolve_output_binding`). There is no database access here.
 
-Two sources answer a lookup:
-
-* a :class:`LiveIndex`, when the service keeps one: one KV read at start and
-  after a reconnect, then kept current by the node's retained
-  ``_SystemElement``, ``_Signal`` and ``_AnnotationType`` records over MQTT.
-  A lookup then reads nothing, and a signal that moves or rebinds resolves to
-  its new id as soon as the node says so.
-* otherwise a KV read of those three contracts. :func:`one_pass` lets a
-  caller resolving many names share one read for the length of a block;
-  ``/kv`` is rate-limited, and one read per lookup ran into 429s.
+Services resolve through one push-maintained :class:`LiveIndex`, backed by
+:class:`chaski.retained_view.RetainedView`. Direct one-shot utilities may read a
+scoped snapshot; a service never switches to HTTP lookup while recovering.
 """
 
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import threading
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -43,14 +35,6 @@ INDEX_CONTRACTS = ("_SystemElement", "_Signal", "_AnnotationType")
 _SIGNAL_TOPIC = "/_Signal/"
 _SYSTEM_ELEMENT_TOPIC = "/_SystemElement/"
 _ANNOTATION_TYPE_TOPIC = "/_AnnotationType/"
-
-#: What an index reads of each record. A live index keeps only these fields,
-#: so a record rewritten with the same values is not a change.
-_FIELDS = {
-    "_SystemElement": ("id", "name"),
-    "_Signal": ("id", "name", "system_element_id", "data_tag", "is_published"),
-    "_AnnotationType": ("id", "name"),
-}
 
 
 def _payload_of(entry: Any) -> dict[str, Any] | None:
@@ -77,6 +61,7 @@ class _Index:
     metric_topic_by_signal_id: dict[str, str]
     element_path_by_id: dict[str, str]
     signal_path_by_id: dict[str, str]
+    disabled_tags: set[str]
     signal_id_by_path: dict[str, str]
 
 
@@ -93,6 +78,7 @@ def _index_of(records: Iterable[tuple[str, dict[str, Any] | None]]) -> _Index:
     metric_topics: dict[str, str] = {}
     element_paths: dict[str, str] = {}
     signal_paths: dict[str, str] = {}
+    disabled_tags: set[str] = set()
     signal_ids: dict[str, str] = {}
 
     for topic, payload in records:
@@ -120,10 +106,22 @@ def _index_of(records: Iterable[tuple[str, dict[str, Any] | None]]) -> _Index:
                 metric_topics[identifier] = _metric_topic_for(topic)
                 signal_paths[identifier] = _path_of(topic)
                 signal_ids.setdefault(_path_of(topic), identifier)
+            if tag and not payload.get("is_published", False):
+                disabled_tags.add(tag)
             if tag and identifier and payload.get("is_published", False) and tag not in bindings:
                 bindings[tag] = (_metric_topic_for(topic), identifier)
 
-    return _Index(elements, annotation_types, signals, bindings, metric_topics, element_paths, signal_paths, signal_ids)
+    return _Index(
+        elements,
+        annotation_types,
+        signals,
+        bindings,
+        metric_topics,
+        element_paths,
+        signal_paths,
+        disabled_tags - bindings.keys(),
+        signal_ids,
+    )
 
 
 def _read(door: Door) -> _Index:
@@ -134,159 +132,86 @@ def _read(door: Door) -> _Index:
 # ─── the live index ──────────────────────────────────────────────────────────
 
 
-def _contract_of(topic: str) -> str | None:
-    """``colca/v1/{contract}/{node}/{path…}`` -> ``{contract}``."""
-    parts = topic.split("/", 3)
-    return parts[2] if len(parts) > 3 else None
-
-
-def _as_dict(payload: Any) -> dict[str, Any] | None:
-    """A record's payload as a dict, from KV (a dict) or MQTT (a decoded
-    contract, or raw bytes when franzmq could not decode it); ``None`` for a
-    tombstone or something that is not a record."""
-    if payload is None:
-        return None
-    if isinstance(payload, dict):
-        return payload or None
-    try:
-        if isinstance(payload, (bytes, bytearray, str)):
-            decoded = json.loads(payload) if payload else None
-        else:
-            decoded = json.loads(payload.encode())
-    except (ValueError, TypeError, AttributeError):
-        return None
-    return decoded if isinstance(decoded, dict) and decoded else None
-
-
-def _projection(contract: str, payload: Any) -> dict[str, Any] | None:
-    record = _as_dict(payload)
-    if record is None:
-        return None
-    kept = {name: record.get(name) for name in _FIELDS[contract]}
-    if "is_published" in kept:
-        kept["is_published"] = bool(kept["is_published"])
-    return kept
-
-
 class LiveIndex:
-    """The resolution index, kept current by the node's retained records.
+    """Resolution over the SDK's ordered retained view, with no HTTP fallback.
 
-    :meth:`seed` reads KV once; :meth:`observe` applies every retained
-    ``_SystemElement``, ``_Signal`` and ``_AnnotationType`` record the service
-    receives over MQTT from then on, tombstones included. Until the first seed
-    succeeds, and from :meth:`suspend` (the broker link dropped, so changes may
-    be missed) until the next one, :meth:`current` is ``None`` and resolution
-    reads KV as it would without an index.
-
-    Records received while a seed is outstanding are applied after it, in the
-    order they arrived, so a write that lands during the read is not lost.
-
-    ``on_change`` listeners run on the thread that applied the change, outside
-    the lock, whenever what the index answers changed; a retained record
-    delivered again with the same fields is not a change.
+    Subscription starts before hydration. Reconnects and retention gaps recover
+    through the same durable view; lookups wait while that view is unavailable.
+    A revision change rebuilds the lookup maps once, shared by every resolver.
     """
 
-    #: Records held while a seed is outstanding; past this the seed is redone.
-    MAX_PENDING = 100_000
+    def __init__(self, door_or_view):
+        from chaski.retained_view import RetainedView
 
-    def __init__(self, door: Door) -> None:
-        self._door = door
-        self._lock = threading.Lock()
-        self._records: dict[str, dict[str, Any]] = {}
-        self._pending: list[tuple[str, dict[str, Any] | None]] | None = []
-        self._overflowed = False
-        self._index: _Index | None = None
-        self._listeners: list[Callable[[], None]] = []
+        self._owns_view = not hasattr(door_or_view, "snapshot")
+        self.view = (
+            RetainedView(door_or_view, INDEX_CONTRACTS, ("entities", "definitions"), "dataops-definitions")
+            if self._owns_view
+            else door_or_view
+        )
+        self.changes = self.view.changes
+        self._read_lock = threading.Lock()
+        self._revision = None
+        self._index = None
+        self._listeners = []
+        prior = getattr(self.view, "on_change", None)
+
+        def changed():
+            if prior is not None:
+                prior()
+            for listener in tuple(self._listeners):
+                listener()
+
+        self.view.on_change = changed
+        self._started = not self._owns_view
 
     @property
-    def live(self) -> bool:
-        with self._lock:
-            return self._pending is None
+    def live(self):
+        return self.view.available
 
-    def add_listener(self, listener: Callable[[], None]) -> None:
+    def add_listener(self, listener):
         self._listeners.append(listener)
 
-    def observe(self, topic: str, payload: Any) -> None:
-        """Apply one retained record as MQTT delivered it (``None`` is a
-        tombstone). Records of other contracts are ignored."""
-        topic = str(topic)
-        contract = _contract_of(topic)
-        if contract not in _FIELDS:
-            return
-        record = _projection(contract, payload)
-        with self._lock:
-            if self._pending is not None:
-                if len(self._pending) >= self.MAX_PENDING:
-                    self._pending.clear()
-                    self._overflowed = True
-                self._pending.append((topic, record))
-                return
-            changed = _apply(self._records, topic, record)
-            if changed:
-                self._index = None
-        if changed:
-            self._notify()
+    def seed(self):
+        if not self._started:
+            self.view.start()
+            self._started = True
+        self.view.synchronize()
 
-    def seed(self) -> None:
-        """Read KV and go live. Raises what the read raised; the index then
-        stays as it was (not live) and resolution keeps reading KV."""
-        while True:
-            entries = self._door.kv("", contract=list(INDEX_CONTRACTS))
-            records: dict[str, dict[str, Any]] = {}
-            for entry in entries:
-                contract = _contract_of(entry.topic)
-                if contract in _FIELDS:
-                    _apply(records, entry.topic, _projection(contract, entry.payload))
-            with self._lock:
-                if self._overflowed:
-                    # Records were dropped while the read ran: read again.
-                    self._overflowed = False
-                    self._pending = []
-                    continue
-                for topic, record in self._pending or ():
-                    _apply(records, topic, record)
-                changed = records != self._records
-                self._records = records
-                self._pending = None
-                self._index = None
-            log.info("resolution index live: %d record(s)", len(records))
-            if changed:
-                self._notify()
-            return
+    def suspend(self):
+        self.view._unavailable()
 
-    def suspend(self) -> None:
-        """Stop answering until the next :meth:`seed`, and hold what arrives
-        meanwhile for it."""
-        with self._lock:
-            if self._pending is None:
-                self._pending = []
-            self._index = None
+    def observe(self, topic, payload):
+        # MQTT values have no durable offset: they may wake, never overwrite
+        # a newer snapshot. The common view drains the authoritative records.
+        for signal in self.view.watch.signals.values():
+            signal.notify()
+        self.view.watch.changes.notify()
 
-    def current(self) -> _Index | None:
-        """The index as it stands, or ``None`` while it is not live."""
-        with self._lock:
-            if self._pending is not None:
-                return None
-            if self._index is None:
-                self._index = _index_of(self._records.items())
+    def current(self):
+        return self.index() if self.view.available else None
+
+    def index(self):
+        with self._read_lock:
+            if self.view.available and self._index is not None and self._revision == self.view.revision:
+                return self._index
+            revision, entries = self.view.snapshot()
+            self._index = _build_index(entries)
+            self._revision = revision
             return self._index
 
-    def _notify(self) -> None:
-        for listener in list(self._listeners):
-            try:
-                listener()
-            except Exception:
-                log.exception("resolution index listener failed")
+    def close(self):
+        if self._owns_view and self._started:
+            self.view.close()
 
 
-def _apply(records: dict[str, dict[str, Any]], topic: str, record: dict[str, Any] | None) -> bool:
-    """Set or retire one record; whether anything changed."""
-    if record is None:
-        return records.pop(topic, None) is not None
-    if records.get(topic) == record:
-        return False
-    records[topic] = record
-    return True
+# Compatibility with callers that already supply their shared retained view.
+DefinitionCache = LiveIndex
+
+
+def _read_index(door):
+    cache = getattr(door, "_dataops_definitions", None)
+    return cache.index() if cache is not None else _read(door)
 
 
 _live: weakref.WeakKeyDictionary[Any, LiveIndex] = weakref.WeakKeyDictionary()
@@ -305,7 +230,12 @@ def _live_index(door: Door) -> _Index | None:
         index = _live.get(door)
     except TypeError:  # a door that cannot be weakly referenced has no index
         return None
-    return index.current() if index is not None else None
+    if index is None:
+        return None
+    current = index.current()
+    if current is None:
+        raise RuntimeError("Resolution index unavailable; waiting for subscription recovery")
+    return current
 
 
 # ─── one read per pass ──────────────────────────────────────────────────────
@@ -329,8 +259,10 @@ class Snapshot:
                 self._index = live
                 return live
             try:
-                self._index = _read(self._door)
+                self._index = _read_index(self._door)
             except Exception as exc:
+                if getattr(self._door, "_dataops_definitions", None) is not None:
+                    raise
                 self._failed = True
                 log.debug("could not pin a KV snapshot for this pass (%s); resolving one at a time", exc)
         return self._index
@@ -386,13 +318,13 @@ def _snapshot(door: Door) -> _Index:
     if pinned is not None:
         return pinned
     live = _live_index(door)
-    return live if live is not None else _read(door)
+    return live if live is not None else _read_index(door)
 
 
 def resolve_metric_topics(door: Door, signal_ids: list[str]) -> dict[str, str]:
     """``{signal_id: its _Metric topic}`` for the ids a snapshot knows.
     Without a pass or a live index, only the ``_Signal`` records are read."""
-    index = _pinned_index() or _live_index(door) or _build_index(door.kv("", contract="_Signal"))
+    index = _pinned_index() or _live_index(door) or _read_index(door)
     known = index.metric_topic_by_signal_id
     return {sid: known[sid] for sid in signal_ids if sid in known}
 
@@ -455,6 +387,11 @@ def signals_outside_element(door: Door, system_element_id: str, signal_ids: Iter
 def resolve_annotation_type(door: Door, name: str) -> str | None:
     """Return an AnnotationType's ULID by exact name match, or ``None``."""
     return _snapshot(door).annotation_type_id_by_name.get(name)
+
+
+def output_disabled(door: Door, tag_id: str) -> bool:
+    """Explicit operator publication setting, distinct from late commissioning."""
+    return tag_id in _snapshot(door).disabled_tags
 
 
 def resolve_output_binding(door: Door, tag_id: str) -> tuple[str, str] | None:

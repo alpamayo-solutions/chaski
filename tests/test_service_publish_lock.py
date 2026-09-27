@@ -16,8 +16,9 @@ from pathlib import Path
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import pytest
 from colca_data_contracts.local_service import LocalServiceIdentity
-from colca_data_contracts.payload import DataTag, DataTags, Metric, Signal
+from colca_data_contracts.payload import DataTag, DataTags, Signal
 from franzmq import Topic
+from pending_helpers import drained
 
 from chaski.catalogue import Catalogue
 from chaski.door import KvEntry
@@ -156,8 +157,12 @@ def test_close_completes_when_a_signal_lands_on_the_network_thread(service):
 
     svc.close()  # raises through the fake if the lock is held across a publish
 
-    metrics = [p for _t, p in client.published if isinstance(p, Metric)]
-    assert [m.value for m in metrics] == [42], client.published
+    # Shutdown keeps the not-yet-acknowledged sample for the next start.
+    from chaski.pending import PendingSamples
+
+    pending = PendingSamples(svc._state_dir / "pending-samples.sqlite3")
+    assert pending.page("orders")[0][1] == 42
+    pending.close()
 
 
 def test_publish_completes_when_a_signal_lands_on_the_network_thread(service):
@@ -179,6 +184,7 @@ def test_status_completes_when_a_signal_lands_on_the_network_thread(service):
 
     svc.status(ok=False, detail="plc unreachable")
 
+    drained(svc)
     assert svc.pending() == [], svc.pending()
 
 

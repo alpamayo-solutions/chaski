@@ -49,7 +49,10 @@ class HealthState:
     ingest_task: asyncio.Task | None = None
     #: Monotonic time of the last finished drain, from the ingest loop.
     last_drain_at: Callable[[], float] | None = None
+    waiting: Callable[[], bool] | None = None
+    connected: Callable[[], bool] | None = None
     stall_after_s: float = STALL_AFTER_MIN_S
+    ready: bool = True
     producers: int = 0
     generation: str = ""
     broker_connected: Callable[[], bool] | None = None
@@ -59,11 +62,17 @@ class HealthState:
     _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
+        if not self.ready:
+            return "starting"
         task = self.ingest_task
         if task is None:
             return "not-started"
         if task.done():
             return "dead"
+        if self.connected is not None and not self.connected():
+            return "disconnected"
+        if self.waiting is not None and self.waiting():
+            return "running"
         if self._since_drain() > self.stall_after_s:
             return "stalled"
         return "running"

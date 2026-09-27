@@ -7,10 +7,13 @@ Progress uses the existing service metadata; no second clock or OS adjustment.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import math
 import os
 import threading
+import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,7 +43,9 @@ class StepGate:
     Dependencies are exact topics: duplicate names on different nodes are safe.
     """
 
-    def __init__(self, service: Service, dependencies: list[str], path: Path):
+    def __init__(
+        self, service: Service, dependencies: list[str], path: Path, *, asynchronous=False, monotonic=time.monotonic
+    ):
         for topic in dependencies:
             if topic.startswith("./") and len(topic) > 2 and not any(c in topic for c in "+#"):
                 continue
@@ -53,10 +58,16 @@ class StepGate:
             ):
                 raise ValueError("step dependencies must be exact _ServiceDetails topics")
         self.service, self.dependencies, self.path = service, frozenset(dependencies), path
+        self.asynchronous = asynchronous
+        self._monotonic = monotonic
+        self._health_received: dict[str, tuple[float, float]] = {}
+        self._issued: dict[float, str] = {}
         self._lock = threading.RLock()
+        self.changes = service.clock.changes
         self._records: dict[str, dict] = {}
         self._barriers: dict[str, dict] = {}
         self._record_topics: dict[str, str] = {}
+        self._ignored_topics: set[str] = set()
         self.completed_at: float | None = None
         self.run_id: str | None = None
         if path.exists():
@@ -77,8 +88,11 @@ class StepGate:
     def reconnect(self) -> None:
         with self._lock:
             self._records.clear()
+            self._health_received.clear()
             self._barriers.clear()
             self._record_topics.clear()
+            self._ignored_topics.clear()
+            self.changes.notify()
 
     def observe(self, message) -> None:
         topic, data = str(message.topic), message.payload
@@ -89,41 +103,86 @@ class StepGate:
         if "/_ClockProgress/" in topic:
             details_topic = topic.replace("/_ClockProgress/", "/_ServiceDetails/", 1)
             with self._lock:
+                relevant = details_topic in self.dependencies or details_topic in self._record_topics.values()
+                # Wildcard local aliases can receive a marker before identity.
+                if not relevant and (
+                    details_topic in self._ignored_topics
+                    or not any(dep.startswith("./") for dep in self.dependencies)
+                    or not details_topic.startswith(f"{topic_prefix()}_ServiceDetails/{self.service.node_id}/")
+                ):
+                    return
+                if self._barriers.get(details_topic) == data:
+                    return
                 if isinstance(data, dict):
                     self._barriers[details_topic] = data
                 else:
                     self._barriers.pop(details_topic, None)
+                if relevant:
+                    self.changes.notify()
             return
-        key = topic
+        key: str | None = topic
         if key not in self.dependencies:
-            if not isinstance(data, dict) or not topic.startswith(
-                f"{topic_prefix()}_ServiceDetails/{self.service.node_id}/"
-            ):
-                return
-            key = "./" + str(data.get("name", ""))
-            if key not in self.dependencies:
-                return
+            with self._lock:
+                key = next((key for key, value in self._record_topics.items() if value == topic), None)
+                if key is None:
+                    if not isinstance(data, dict) or not topic.startswith(
+                        f"{topic_prefix()}_ServiceDetails/{self.service.node_id}/"
+                    ):
+                        return
+                    key = "./" + str(data.get("name", ""))
+                    if key not in self.dependencies:
+                        self._ignored_topics.add(topic)
+                        self._barriers.pop(topic, None)
+                        return
         with self._lock:
             if isinstance(data, dict):
                 self._records[key] = data
                 self._record_topics[key] = topic
+                observed = ((data.get("metadata") or {}).get("application_clock") or {}).get("observed_at")
+                previous = self._health_received.get(key)
+                if (
+                    not getattr(message, "retain", False)
+                    and isinstance(observed, (int, float))
+                    and (previous is None or observed != previous[1])
+                ):
+                    self._health_received[key] = (self._monotonic(), observed)
             else:
                 self._records.pop(key, None)
+                self._health_received.pop(key, None)
+                self._record_topics.pop(key, None)
+                self._barriers.pop(topic, None)
+            self.changes.notify()
 
-    def records(self) -> dict[str, dict]:
-        """Current upstream service records, copied for controller status views."""
+    def records(self, *, progress_only=False) -> dict[str, dict]:
+        """Copy progress without catalogues on high-frequency controller paths."""
         with self._lock:
-            records = json.loads(json.dumps(self._records))
+            if progress_only:
+                records = {
+                    key: {
+                        "id": row.get("id"),
+                        "name": row.get("name"),
+                        "is_active": row.get("is_active"),
+                        "metadata": {
+                            "application_clock": copy.deepcopy((row.get("metadata") or {}).get("application_clock"))
+                        },
+                    }
+                    for key, row in self._records.items()
+                }
+            else:
+                records = copy.deepcopy(self._records)
             for key, row in records.items():
                 progress = (row.get("metadata") or {}).get("application_clock")
                 if not isinstance(progress, dict):
                     continue
+                received = self._health_received.get(key)
+                progress["age_s"] = self._monotonic() - received[0] if received else None
                 barrier = self._barriers.get(self._record_topics.get(key, ""), {})
                 done = barrier.get("processed_at")
                 if barrier.get("run_id") != progress.get("run_id") or not isinstance(done, (int, float)):
                     progress["processed_at"] = None
-                elif isinstance(progress.get("processed_at"), (int, float)):
-                    progress["processed_at"] = min(done, progress["processed_at"])
+                else:
+                    # The ordered marker owns completion; details are liveness.
+                    progress["processed_at"] = done
             return records
 
     def boundary(self) -> float | None:
@@ -137,44 +196,115 @@ class StepGate:
             return None
         return definition.stop_at
 
+    def _progress(self) -> dict[str, dict]:
+        """Copy only dependency health and committed positions for readiness.
+
+        Service records can include large catalogues. A wakeup must not decode
+        and copy that metadata merely to compare a few progress fields.
+        """
+        with self._lock:
+            result = {}
+            for key, row in self._records.items():
+                progress = (row.get("metadata") or {}).get("application_clock") or {}
+                barrier = self._barriers.get(self._record_topics.get(key, ""), {})
+                result[key] = {
+                    "active": row.get("is_active"),
+                    "ready": progress.get("ready"),
+                    "run_id": progress.get("run_id"),
+                    "age_s": self._monotonic() - self._health_received[key][0]
+                    if key in self._health_received
+                    else None,
+                    "processed_at": barrier.get("processed_at")
+                    if barrier.get("run_id") == progress.get("run_id")
+                    else None,
+                }
+            return result
+
     def ready(self) -> float | None:
         target = self.boundary()
+        rows = self._progress()
+        if self.asynchronous and self.dependencies:
+            definition = self.service.clock.definition
+            status = self.service.clock.status()
+            progress = [rows.get(dep, {}) for dep in self.dependencies]
+            if (
+                definition
+                and status.ready
+                and all(
+                    p.get("run_id") == definition.run_id and isinstance(p.get("processed_at"), (int, float))
+                    for p in progress
+                )
+            ):
+                target = min(definition.stop_at or status.factory_now, *(p["processed_at"] for p in progress))
+                if status.factory_now < target:
+                    return None
         if target is None:
             return None
         if self.completed_at is not None and self.completed_at >= target:
             # Restore liveness after a process restart without redoing effects.
             self.service.report_progress(self.completed_at)
             return None
-        if not self.dependencies:
-            return target
         clock = self.service.clock
         definition = clock.definition
         if definition is None:
             return None
-        rows = self.records()
+        if not self.dependencies:
+            self._issued[target] = definition.run_id
+            return target
         remaining = set(self.dependencies)
-        now = clock.real_now()
         for topic, data in rows.items():
             if topic not in remaining:
                 continue
-            progress = (data.get("metadata") or {}).get("application_clock") or {}
-            observed, done = progress.get("observed_at"), progress.get("processed_at")
+            age, done = data.get("age_s"), data.get("processed_at")
             if (
-                data.get("is_active")
-                and progress.get("ready")
-                and progress.get("run_id") == definition.run_id
-                and isinstance(observed, (int, float))
-                and 0 <= now - observed <= 15
+                data.get("active")
+                and data.get("ready")
+                and data.get("run_id") == definition.run_id
+                and isinstance(age, (int, float))
+                and 0 <= age <= 15
                 and isinstance(done, (int, float))
                 and done >= target
             ):
                 remaining.remove(topic)
-        return None if remaining else target
+        if remaining:
+            return None
+        self._issued[target] = definition.run_id
+        return target
+
+    def wait_delay(self, maximum: float | None = None) -> float | None:
+        """Next scheduled boundary, otherwise only an incoming event can help."""
+        definition = self.service.clock.definition
+        delay = None
+        if definition is not None and definition.stop_at is not None:
+            delay = self.service.clock.delay_until(definition.stop_at)
+            # At the boundary we need an upstream commit or a new grant.
+            if delay == 0:
+                delay = None
+        return (
+            min(delay, maximum) if delay is not None and maximum is not None else (maximum if delay is None else delay)
+        )
+
+    async def wait_ready(self) -> float:
+        """Wait for a grant and upstream commits; cancellation stops the wait."""
+        while True:
+            version = self.changes.version
+            target = await asyncio.to_thread(self.ready)
+            if target is not None:
+                return target
+            await self.changes.wait_async(version, self.wait_delay())
 
     def complete(self, timestamp: float) -> None:
-        if self.boundary() != timestamp:
-            raise ValueError("only the granted clock boundary can be completed")
         definition = self.service.clock.definition
+        valid_async = (
+            self.asynchronous
+            and definition is not None
+            and self._issued.get(timestamp) == definition.run_id
+            and timestamp <= self.service.clock.now()
+        )
+        if self.boundary() != timestamp and not valid_async:
+            raise ValueError("only an issued clock boundary can be completed")
+        if self.completed_at is not None and timestamp < self.completed_at:
+            raise ValueError("completion cannot move backwards")
         if definition is None:
             raise ValueError("clock definition disappeared before completion")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -185,4 +315,5 @@ class StepGate:
             os.fsync(output.fileno())
         temporary.replace(self.path)
         self.completed_at, self.run_id = timestamp, definition.run_id
+        self._issued = {t: run for t, run in self._issued.items() if t > timestamp}
         self.service.report_progress(timestamp, force=True)

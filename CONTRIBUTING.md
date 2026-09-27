@@ -16,9 +16,13 @@ cd chaski
 uv run --extra test pytest
 ```
 
-The tests need no running node. The ones about `Node` use a fake colcad
-process; set `COLCAD_BINARY` to a real binary (`make build` in the colca
-checkout) to try the real one by hand.
+Unit tests need no running node. CI also builds Colca and runs real-broker
+reconnect and recovery tests. To run those locally, build `colcad` and the
+contracts bundle from the matching Colca checkout, then set `COLCAD_BINARY`
+and `COLCAD_CONTRACTS_BUNDLE` before running pytest. Without those variables,
+the two broker-backed tests are skipped; that is not full release validation.
+Consumer and producer recovery contracts are documented in the
+[README](README.md#consumer-failure-and-producer-recovery).
 
 CI also runs the linters, and so can you:
 

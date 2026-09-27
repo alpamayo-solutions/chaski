@@ -105,6 +105,42 @@ Pass the same topics as `svc.stream(..., topics=[...])`. A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
 `svc.cursor_lag` follows and a `DataOpsService` health door fails on.
 
+### Push-driven consumer rules
+
+- Subscribe before hydrating state or draining history. On reconnect, rebuild
+  invalid caches and resume durable streams from their saved cursors.
+- Use `RetainedView` for live current state and `Stream` for durable history.
+  MQTT messages and watch hints wake consumers; they do not prove that every
+  record was processed. Do not use retained state as an event history.
+- Read only the contracts and paths you need. Hydrate on startup, reconnect or
+  explicit invalidation, then maintain the view from pushed changes. Avoid a
+  separate `/kv` lookup per message or a recurring refresh timer.
+- Capture the wakeup generation before draining. Continue through filtered
+  pages until the stream boundary, including short pages. Never acknowledge
+  retention gaps as successful processing.
+- Commit effects or a durable processing inbox before acknowledging input.
+  Make replay idempotent, bound queues and expose backpressure. Preserve
+  timestamped samples even when their values do not change.
+- Coalesce wakeups into bounded batches. Limit how often a batch starts without
+  sleeping between pages that still contain admitted work. A continuous stream
+  must not require reaching an empty queue before progress can be committed.
+- Retry failed operations with backoff and honor `Retry-After`. Do not add
+  periodic reads to hide a broken subscription. Expose connection health, last
+  completed drain and queue/processing lag separately.
+- Publish state/configuration when it changes; batch high-rate measurements.
+  Command acceptance, execution and projected visibility are different events.
+  An MQTT acknowledgement does not establish execution completion.
+- Use real monotonic time for transport deadlines, retries and pacing; use
+  factory/event time for simulated behavior. PLC acquisition, scheduled work,
+  alarm deadlines, batching, health checks and display clocks are legitimate
+  timers. Periodic reads to discover new Colca business records are not.
+- Test reconnect, lost acknowledgements, duplicate delivery, continuous input,
+  cancellation, retention gaps and restart with unchanged producer code.
+
+See [consumer failure and producer recovery](#consumer-failure-and-producer-recovery)
+for the state and acknowledgement contract, and [CONTRIBUTING](CONTRIBUTING.md#set-up)
+for broker-backed tests.
+
 ## Poll a source
 
 A driver implements four `async` methods: `connect()`, `discover()` (the tags
@@ -273,7 +309,7 @@ independent of placement). The deployment helper `dependencies_from_env()` in
 `chaski.coordination` reads the optional JSON `FACTORY_STEP_DEPENDENCIES` list.
 
 The controller grants a bounded window with `ClockDefinition.stop_at`. A worker
-waits for `service.step.ready()`, completes the work, commits its effects, then
+awaits `service.step.wait_ready()`, completes the work, commits its effects, then
 calls `service.step.complete(boundary)`. Connectors wait for their sources,
 acquire and publish the boundary sample, then acknowledge it; DataOps drains
 upstream samples and due callbacks before acknowledging. Failed reads, publishes
@@ -288,3 +324,64 @@ Missing, inactive, stale or wrong-run dependency progress holds the window.
 `service.report_progress(processed_at)` is available for continuous workers;
 report committed work, never the target clock. Its liveness heartbeat uses real
 time and continues while a run is paused.
+
+The execution gate and clock waits wake on MQTT changes rather than checking on
+an interval. `clock.sleep_until()` schedules a real timer for the factory deadline
+and reschedules it when time or configuration changes. Synchronous workers can
+capture `step.changes.version`, check `step.ready()`, then call
+`step.changes.wait(version, step.wait_delay(1.0))`. Capturing the version first
+prevents a completion arriving between the check and wait from being lost. The
+optional maximum timeout is for shutdown/health/retry housekeeping; it does not
+pace normal work. After setting a thread's stop event, notify `clock.changes` to
+wake it immediately. Async waits support normal task cancellation.
+
+
+### Durable publication and build compatibility
+
+`Service.publish()` persists samples that are waiting for a signal binding under
+`state_dir/pending-samples.sqlite3`. Keep `state_dir` on a persistent volume.
+Publication resumes on binding/restart, removes samples only after broker
+acknowledgement, and raises `BufferError` at its per-path limit. Replay after a
+lost reply can repeat a sample; consumers must remain idempotent. Signals
+explicitly marked unpublished suppress their queued samples.
+
+Scoped watches, queue telemetry and embedded-node lifecycle events require
+Colca 0.20 or later. Upgrade the SDK and broker as a tested pair; the `node`
+extra constrains the supported broker version range for embedded deployments.
+
+
+### Consumer failure and producer recovery
+
+`Stream.drain()` captures a finite head, processes and acknowledges complete pages,
+and returns even if writers remain active. The final page may include newer
+records. `Stream.follow()` subscribes before draining and coalesces notifications;
+it does not poll. Pass a stop event for cancellation during a page. A partially
+consumed page remains unacknowledged. With an external doorbell, ring it after
+setting stop to wake an idle follower.
+
+DataOps no longer skips failed handlers or failed producer startup. An ordinary
+handler error stops processing and makes service health fail; transport/backpressure
+errors use the existing retry path. No successful cursor or replay watermark is
+recorded for failed processing. Remove `strict=False` if you previously passed it.
+Correct invalid inputs explicitly or route them through your own durable rejection
+workflow; logging and returning is not recovery.
+
+An `on_metric` producer with in-memory state can set `state_version = 1` and
+implement `snapshot_state()` and `restore_state(state)`. Snapshots must be JSON
+values and must include all state needed to continue its metric handlers. Restore
+must replace state without publishing. Chaski saves snapshots plus per-handler
+input offsets before acknowledgement, restores matching code/version checkpoints
+at startup, and skips already checkpointed redelivery. Missing or incompatible
+checkpoints reconstruct from retained inputs; provision sufficient history for
+that reconstruction. A retained input window cannot recover an arbitrarily old
+open interval, so preserve the buffer volume.
+
+Effects must still be idempotent: a crash after publication but before saving a
+checkpoint can repeat them. Chaski does not promise a transaction spanning a
+remote system and local SQLite. State changed by timers or commands still needs an
+explicit durable recovery design; metric checkpoints do not cover those callbacks.
+Existing producers with external recovery may keep their own implementation and
+leave `state_version` unset. Do not enable both recovery owners for the same state.
+
+The CI suite runs broker-backed reconnect and retained-view recovery tests as well
+as finite-drain, cancellation, failed-handler, checkpoint and redelivery tests.

@@ -476,17 +476,91 @@ def test_the_client_tolerates_undecodable_messages_before_its_loop_starts(tmp_pa
     assert guarded == [True]
 
 
-def test_the_service_follows_the_nodes_cursor_lag_finding_about_itself(tmp_path, monkeypatch):
-    """The node writes a cursor_lag finding next to the service's own record
-    while records it reads wait unread; the service holds the summary for its
-    health check, and a tombstone clears it."""
+def test_coordinated_progress_does_not_republish_details_for_every_window(tmp_path, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+
+    clock = Clock(wall=lambda: 10001.0)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 1020))
+    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
+    client.published.clear()
+    assert svc.report_progress(1010, force=True)
+    assert svc.report_progress(1020, force=True)
+    topics = [str(row[0]) for row in client.published]
+    assert sum("/_ClockProgress/" in topic for topic in topics) == 2
+    assert sum("/_ServiceDetails/" in topic for topic in topics) == 1
+    svc.close()
+
+
+def test_mqtt_disables_nagle_on_initial_connection_and_reconnect(tmp_path, monkeypatch):
+    import socket
+    from types import SimpleNamespace
+
     svc, client = _local_service(tmp_path, monkeypatch)
-    topic = "colca/v1/_Finding/n-edge1/line1/svc1/cursor_lag"
-    assert topic in client.subscriptions
-    assert svc.cursor_lag == ""
+    options = []
+    client.socket = lambda: SimpleNamespace(setsockopt=lambda *args: options.append(args))
+    monkeypatch.setattr(svc, "_reannounce", lambda _: None)
+    svc._connected_event.clear()
+    svc._on_connect(client, None, None, 0)
+    svc._on_connect(client, None, None, 0)
+    assert options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)] * 2
+    svc.close()
 
-    client.subscriptions[topic](_Message({"reason": "cursor_lag", "summary": "svc1 has records waiting 75 s"}))
-    assert svc.cursor_lag == "svc1 has records waiting 75 s"
 
-    client.subscriptions[topic](_Message(None))
-    assert svc.cursor_lag == ""
+def test_clock_health_coalesces_while_every_completion_marker_is_delivered(tmp_path, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    import chaski.service as module
+    from chaski.clock import Clock
+
+    clock = Clock(wall=lambda: 10001.0)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 2000))
+    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
+    tick = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
+    svc._last_clock_report = float("-inf")
+    client.published.clear()
+    for i in range(60):
+        tick[0] = 100 + i / 10
+        svc.report_progress(1000 + i * 10, force=True)
+    topics = [str(row[0]) for row in client.published]
+    assert sum("/_ClockProgress/" in topic for topic in topics) == 60
+    assert sum("/_ServiceDetails/" in topic for topic in topics) == 2
+    svc.close()
+
+
+def test_failed_reconnect_registration_retries_then_stops(tmp_path, monkeypatch):
+    import threading
+
+    svc, client = _local_service(tmp_path, monkeypatch)
+    recovered = threading.Event()
+    original = svc._reannounce
+    calls = []
+
+    def reannounce(c, fresh=False):
+        calls.append(c)
+        if len(calls) == 1:
+            raise ConnectionError("HTTP registration not listening yet")
+        original(c, fresh)
+        recovered.set()
+
+    monkeypatch.setattr(svc, "_reannounce", reannounce)
+    svc._on_connect(client, None, None, 0)
+    assert recovered.wait(3), "registration never recovered without another MQTT reconnect"
+    assert len(calls) == 2
+    assert client.subscriptions
+    svc.close()
+
+
+def test_registration_retry_is_cancelled_on_disconnect_and_close(tmp_path, monkeypatch):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    cancelled = svc._reannounce_stop
+    svc._on_disconnect()
+    assert cancelled.is_set()
+    calls = []
+    monkeypatch.setattr(svc, "_reannounce", lambda c: calls.append(c))
+    svc._retry_reannounce(client, cancelled)
+    assert not calls
+    svc.close()
+    assert svc._reannounce_stop.is_set()

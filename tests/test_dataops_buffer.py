@@ -201,6 +201,7 @@ def test_trim_removes_only_past_horizon_rows(buffer):
     import time
 
     now = time.time()
+    buffer.append("sig-1", now - 200.0, "obsolete")
     buffer.append("sig-1", now - 100.0, "old")
     buffer.append("sig-1", now - 1.0, "recent")
 
@@ -208,7 +209,8 @@ def test_trim_removes_only_past_horizon_rows(buffer):
 
     assert deleted == 1
     df = buffer.window("sig-1", 0.0, now + 1.0)
-    assert list(df["value"]) == ["recent"]
+    assert list(df["value"]) == ["old", "recent"]
+    assert buffer.latest_before("sig-1", now - 10)[1] == "old"
 
 
 def test_trim_leaves_signals_absent_from_horizons_untouched(buffer):
@@ -220,8 +222,8 @@ def test_trim_leaves_signals_absent_from_horizons_untouched(buffer):
 
     deleted = buffer.trim({"sig-1": 10.0})
 
-    assert deleted == 1
-    assert len(buffer.window("sig-1", 0.0, now + 1.0)) == 0
+    assert deleted == 0
+    assert len(buffer.window("sig-1", 0.0, now + 1.0)) == 1
     assert len(buffer.window("sig-2", 0.0, now + 1.0)) == 1
 
 
@@ -256,3 +258,14 @@ def test_one_commit_writes_the_block_at_its_end_and_reads_see_it_before(db_path)
     finally:
         other.close()
         buffer.close()
+
+
+def test_change_only_plan_survives_many_retention_intervals(buffer):
+    plan = {"planned_work_order": "WO-1", "planned_job_card": "JC-1"}
+    buffer.append("plan", 100, plan)
+    for now in (1000, 2000, 10000):
+        buffer.trim({"plan": 900}, now=now)
+        assert buffer.latest_before("plan", now) == (100, plan)
+    buffer.append("plan", 10100, {"planned_work_order": "WO-2"})
+    buffer.trim({"plan": 900}, now=12000)
+    assert buffer.points("plan", 0, 12001) == [(10100, {"planned_work_order": "WO-2"})]

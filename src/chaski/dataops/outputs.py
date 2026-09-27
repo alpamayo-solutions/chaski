@@ -8,7 +8,7 @@ Both publish over the runtime's MQTT session (``runtime.send``), never to a data
   (``signal/autobind`` or an editor). The node writes the ``_Signal`` and mints
   its id, which the output finds by its ``data_tag``
   (:func:`chaski.dataops.resolve.resolve_output_binding`). Until then
-  ``publish`` idles with a rate-limited log.
+  ``publish`` persists samples in the runtime buffer until commissioning.
 
 * ``AnnotationOutput``: publishes ``_Annotation`` records on the
   ``annotations`` stream. ``write_interval`` derives the id from
@@ -161,10 +161,12 @@ class SignalOutput(_PerInstance):
         """Publish one ``Metric`` at the position this output is bound to.
 
         The binding is a published ``_Signal`` whose ``data_tag`` is
-        ``self.tag_id``. Until one exists this is a no-op with a rate-limited
-        log.
+        ``self.tag_id``. Until one exists samples are durably queued with a
+        bounded capacity; definition updates flush them without another sample.
         """
-        door = self._runtime().door
+        runtime = self._runtime()
+        timestamp = runtime_now(runtime) if timestamp is None else _epoch(timestamp)
+        door = runtime.door
         # A found binding is kept until the next pass calls forget(). A miss is
         # not kept: binding happens elsewhere and nothing notifies us.
         try:
@@ -172,14 +174,16 @@ class SignalOutput(_PerInstance):
         except httpx.HTTPStatusError as refused:
             if refused.response.status_code != 429:
                 raise
-            # A 429 means ask again later: skip this value and try on the next
-            # publish instead of failing the producer's tick.
-            self._log_unbound()
-            return
+            # The sample is durable before its input may be acknowledged.
+            self._queue(value, timestamp)
+            raise
         if binding is None:
-            self._log_unbound()
+            if resolve.output_disabled(door, self.tag_id):
+                return  # Explicit publication disablement is not a missing binding.
+            self._queue(value, timestamp)
             return
         self._binding = binding
+        self.flush()
         topic, signal_id = binding
 
         metric = Metric(
@@ -190,13 +194,40 @@ class SignalOutput(_PerInstance):
         self._runtime().send(topic, metric.encode())
         log.debug("SignalOutput[%s]: published %r @ %s on %s", self.signal_name, value, metric.timestamp, topic)
 
+    def _queue(self, value, timestamp):
+        buffer = self._runtime().buffer
+        if buffer is None:
+            raise RuntimeError("Unbound SignalOutput requires a durable runtime buffer")
+        buffer.queue_output(self.source, timestamp, value)
+        self._log_unbound()
+
+    def flush(self):
+        """Drain samples preserved during commissioning after a binding update."""
+        buffer = self._runtime().buffer
+        if buffer is None:
+            return
+        pending = buffer.pending_outputs(self.source)
+        if not pending:
+            return
+        binding = self._binding or resolve.resolve_output_binding(self._runtime().door, self.tag_id)
+        if binding is None:
+            return
+        self._binding = binding
+        topic, signal_id = binding
+        while pending:
+            for timestamp, value in pending:
+                metric = Metric(value=value, timestamp=timestamp, signal_id=signal_id)
+                self._runtime().send(topic, metric.encode())
+                buffer.output_sent(self.source, timestamp)
+            pending = buffer.pending_outputs(self.source)
+
     def _log_unbound(self) -> None:
         now = time.time()
         if now - self._last_unbound_log_ts < _UNBOUND_LOG_INTERVAL_S:
             return
         self._last_unbound_log_ts = now
         log.warning(
-            "SignalOutput[%s] (source=%s, tag=%s) has no bound _Signal yet — publish is idle until it is commissioned",
+            "SignalOutput[%s] (source=%s, tag=%s) has no bound _Signal yet — samples are durably queued until it is commissioned",
             self.signal_name,
             self._source,
             self._tag_id,

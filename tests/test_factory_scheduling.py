@@ -54,9 +54,11 @@ def test_cron_uses_factory_utc_calendar():
 
 def test_buffer_retains_historical_application_window(tmp_path):
     buffer = Buffer(tmp_path / "buffer.db")
+    buffer.append("signal", 900, 0)
     buffer.append("signal", 1000, 1)
     buffer.append("signal", 1100, 2)
     assert buffer.trim({"signal": 100}, now=1150) == 1
+    assert buffer.latest_before("signal", 1050) == (1000, 1)
     assert buffer.latest_before("signal", 1150) == (1100, 2)
     buffer.close()
 

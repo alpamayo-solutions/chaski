@@ -405,7 +405,7 @@ def _rec(offset: int) -> dict:
     return {"offset": offset, "origin_offset": offset, "topic": "t", "payload": {}, "ts": 0.0}
 
 
-def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server, door):
+def test_page_ack_offset_includes_filtered_records(stub_server, door):
     """Ack the last record; with no record past the low-water mark, the gap's
     bound; for an empty page, nothing."""
     _, handler_cls = stub_server
@@ -413,7 +413,7 @@ def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server
     handler_cls.responses["/fetch"] = [
         (200, {"records": [_rec(41), _rec(42)], "next": 43, "gap": gap}),
         (200, {"records": [], "next": 41, "gap": gap}),
-        (200, {"records": [], "next": 43}),
+        (200, {"records": [], "next": 43, "from": 1}),
     ]
 
     with_records = door.fetch("metrics", "c/svc/x")
@@ -422,7 +422,7 @@ def test_page_ack_offset_is_the_last_record_the_gap_bound_or_nothing(stub_server
 
     assert with_records.ack_offset == 42, "records win over the gap they arrived beside"
     assert gap_only.ack_offset == 40
-    assert empty.ack_offset is None
+    assert empty.ack_offset == 42
 
 
 def test_a_filtered_page_acks_everything_the_node_scanned(stub_server, door):

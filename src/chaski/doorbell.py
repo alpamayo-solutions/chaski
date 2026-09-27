@@ -37,7 +37,8 @@ class Doorbell:
             self._cond.notify_all()
             waiters, self._async = self._async, []
         for loop, future in waiters:
-            loop.call_soon_threadsafe(_resolve, future)
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(_resolve, future)
 
     def wait_after(self, since: int, timeout: float | None = None) -> bool:
         """Block until the bell rang after ``since`` was taken (at once when it
@@ -53,7 +54,12 @@ class Doorbell:
                 return
             future: asyncio.Future[None] = loop.create_future()
             self._async.append((loop, future))
-        await future
+        try:
+            await future
+        finally:
+            with self._cond:
+                if (loop, future) in self._async:
+                    self._async.remove((loop, future))
 
 
 def _resolve(future: asyncio.Future[None]) -> None:

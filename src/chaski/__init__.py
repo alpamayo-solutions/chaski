@@ -24,7 +24,7 @@ from .connector import (
     Target,
     Telemetry,
 )
-from .door import Door, Gap, KvEntry, Page, Record, Stream
+from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
 from .node import Node
 from .service import LocalDoor, NotEnrolled, Service
@@ -52,6 +52,7 @@ __all__ = [
     "Service",
     "SourceDisconnectedError",
     "Stream",
+    "StreamGapError",
     "Target",
     "Telemetry",
     "lifetime_refusal",
