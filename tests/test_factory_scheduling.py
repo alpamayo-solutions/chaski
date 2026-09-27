@@ -90,3 +90,42 @@ def test_coordinated_callbacks_use_old_state_before_new_boundary_sample(tmp_path
         buffer.close()
 
     asyncio.run(run())
+
+
+def test_a_rejected_factory_tick_is_recorded_and_passed(tmp_path):
+    from chaski import Reject
+
+    async def run():
+        clock = Clock(wall=lambda: 10005)
+        clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 10))
+        buffer = Buffer(tmp_path / "state.db")
+        called, rejected = [], []
+
+        class Producer:
+            name = "scheduled"
+            _lock = threading.RLock()
+            runtime = SimpleNamespace(
+                buffer=buffer, reject=lambda consumer, subject, r: rejected.append((consumer, subject, r.reason))
+            )
+
+            async def tick(self):
+                called.append(clock.now())
+                if clock.now() == 1010:
+                    raise Reject("no input for this tick")
+
+        task = asyncio.create_task(run_periodic(Producer(), "tick", IntervalSpec(10), clock))
+        while len(called) < 3:
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert called[:3] == [1010, 1020, 1030]
+        assert rejected == [
+            (
+                "scheduled.tick",
+                {"timer": "__clock__:scheduled:tick:IntervalSpec(seconds=10)", "due": 1010},
+                "no input for this tick",
+            )
+        ]
+        buffer.close()
+
+    asyncio.run(asyncio.wait_for(run(), 3))

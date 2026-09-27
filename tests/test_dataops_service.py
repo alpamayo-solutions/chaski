@@ -14,6 +14,7 @@ import asyncio
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -549,6 +550,30 @@ def test_a_periodic_tick_is_scheduled_as_a_plain_function_not_a_coroutine():
         assert "tick failed" in str(exc)
     else:
         raise AssertionError("a failing tick must propagate, not vanish")
+
+
+def test_a_rejected_wall_clock_tick_is_recorded_and_does_not_degrade_health():
+    from chaski import Reject
+    from chaski.failures import HandlerHealth
+
+    class _RejectingTick(Producer):
+        name = "off_loop_reject_test"
+        system_element_name = "SE-OffLoop"
+
+        @every("10s")
+        async def tick(self):
+            raise Reject("nothing to compute", detail={"why": "no input"})
+
+    rejected = []
+    inst = _RejectingTick()
+    inst._runtime = SimpleNamespace(
+        handler_health=HandlerHealth(), reject=lambda consumer, subject, r: rejected.append((consumer, r.reason))
+    )
+
+    off_loop(inst.tick)()
+
+    assert rejected == [("off_loop_reject_test.tick", "nothing to compute")]
+    assert inst._runtime.handler_health.status == "ok"
 
 
 def test_schedule_periodic_ignores_on_constant_and_on_signal_specs_without_warning(caplog):

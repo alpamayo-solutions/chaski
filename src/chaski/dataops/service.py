@@ -45,7 +45,7 @@ Startup order inside :meth:`DataOpsService.serve`:
  7. replay every producer whose code hash changed, a new one included: reset
     its watermark to the earliest buffered point of its inputs and feed the
     buffered records through the live handlers. Unchanged producers are left
-    alone
+    alone. A failed replay is retried under :func:`supervise`
  8. retire the previous generation's ingest cursor, if one is known
  9. start the ingest task, and resolve again whenever the live index changes
     (:func:`follow_index`); without one, whenever a ``_Signal`` record under
@@ -57,7 +57,8 @@ Startup order inside :meth:`DataOpsService.serve`:
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 
-Every background task of steps 9 to 11 runs under :func:`supervise`: a task
+The replay of step 7 and every background task of steps 9 to 11 run under
+:func:`supervise`: a task
 that raises is logged at once, counted in ``handler_health`` (degraded, then
 unhealthy) and restarted with jittered backoff. None dies silently.
 """
@@ -85,16 +86,16 @@ from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
-from chaski.failures import HandlerHealth
+from chaski.failures import HandlerHealth, Reject
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
 from .base import Producer, Runtime, runtime_now
 from .buffer import Buffer
-from .ingest import Ingest
+from .ingest import Ingest, consumer_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
-from .scheduling import run_due, run_periodic, timer_key
+from .scheduling import record_rejection, run_due, run_periodic, timer_key
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
@@ -217,7 +218,10 @@ def off_loop(method):
         health = getattr(instance._runtime, "handler_health", None)
         try:
             with instance._lock:
-                asyncio.run(method())
+                try:
+                    asyncio.run(method())
+                except Reject as rejected:
+                    record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
         except Exception as exc:
             # APScheduler logs it; the next tick runs the method again.
             if health is not None:
@@ -626,8 +630,11 @@ async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) 
     a replay happens once per change; a tick-only producer only gets its
     watermark reset.
 
-    A failed handler stops recovery. Its watermark and code hash are not marked
-    complete; startup fails visibly and the next start retries the replay.
+    A handler that raises :class:`chaski.Reject` has the record recorded as
+    rejected (the runtime's ``reject``), as live ingest does, and the replay
+    goes on. Any other failure stops recovery: the producer's watermark and
+    code hash are not marked complete, a checkpointed producer's state is put
+    back, and the exception propagates, so the caller retries the replay.
     Handlers must make repeated effects idempotent.
     """
     # One KV read for the whole sweep; the per-producer passes below reuse it.
@@ -677,10 +684,20 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
             rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
         rows.sort(key=lambda r: r[0])
 
-        for ts, signal_id, value in rows:
-            record = synthetic_record(signal_id, ts, value)
-            for handler in mini_dispatch.get(signal_id, []):
-                await handler(record)
+        previous = instance._state_copy() if instance.state_version is not None else None
+        try:
+            for ts, signal_id, value in rows:
+                record = synthetic_record(signal_id, ts, value)
+                for handler in mini_dispatch.get(signal_id, []):
+                    try:
+                        await handler(record)
+                    except Reject as rejected:
+                        subject = {"replay": instance.name, "signal_id": signal_id, "ts": ts}
+                        await asyncio.to_thread(record_rejection, runtime, consumer_name(handler), subject, rejected)
+        except BaseException:
+            if previous is not None:
+                instance.restore_state(previous)
+            raise
 
         final_position = rows[-1][0] if rows else start
         instance._save_checkpoint()
@@ -1144,8 +1161,12 @@ class DataOpsService(Service):
             # 6) The on_metric dispatch table and the declared input signal ids.
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
-            # 7) Replay producers whose code changed.
-            await replay_changed_producers(self, instances)
+            # 7) Replay producers whose code changed. A failure is counted in
+            #    handler_health and the replay retried; the health door stays up.
+            health_state.handlers = self.handler_health
+            await supervise("replay", lambda: replay_changed_producers(self, instances), stop, self.handler_health)
+            if stop.is_set():
+                return
 
             # 8) Retire the previous generation's cursor (if any) and build the
             #    ingest loop over this service's own consume lane.
@@ -1172,7 +1193,6 @@ class DataOpsService(Service):
             health_state.stall_after_s = health.STALL_AFTER_MIN_S
             health_state.waiting = (lambda: self._step_waiting) if self.step is not None else (lambda: ingest.waiting)
             health_state.connected = self.is_broker_connected
-            health_state.handlers = self.handler_health
             ingest_task: asyncio.Task | None = None
             tasks_health = self.handler_health
 

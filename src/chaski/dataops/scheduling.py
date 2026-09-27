@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
 
 from chaski.clock import Clock, ClockNotReady
+from chaski.failures import Reject
 from chaski.retry import Backoff
 
 from .base import Producer
@@ -30,11 +32,32 @@ def next_tick(spec: CronSpec | IntervalSpec, previous: float) -> float | None:
     return value.timestamp() if value else None
 
 
+def record_rejection(runtime: Any, consumer: str, subject: dict[str, Any], rejected: Reject) -> None:
+    """Record ``rejected`` through the runtime's ``reject``; a runtime without
+    one cannot pass the input, so the rejection counts as a failure."""
+    reject = getattr(runtime, "reject", None)
+    if reject is None:
+        raise RuntimeError(f"{consumer} rejected an input, but this runtime has nowhere to record it") from rejected
+    reject(consumer, subject, rejected)
+
+
+def _call(instance: Producer, method_name: str, key: str, due: float) -> None:
+    """Run one tick's callback and commit its progress; a rejected tick is
+    recorded and passed."""
+    try:
+        asyncio.run(getattr(instance, method_name)())
+    except Reject as rejected:
+        record_rejection(instance.runtime, f"{instance.name}.{method_name}", {"timer": key, "due": due}, rejected)
+    instance.runtime.buffer.set_watermark(key, due, "clock-v1")
+
+
 async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | IntervalSpec, clock: Clock) -> None:
     """One sequential loop per trigger; shutdown cancellation stays real-time.
 
     A callback failure retries the same tick with bounded, jittered backoff and
-    counts against the runtime's ``handler_health``. Callbacks must use idempotent
+    counts against the runtime's ``handler_health``. A callback that raises
+    :class:`chaski.Reject` has the tick recorded as rejected (the runtime's
+    ``reject``) and passed. Callbacks must use idempotent
     output identities: a crash after output but before progress commits replays
     that tick. A bounded yield gives ingest and health work CPU even at 1000x.
     """
@@ -52,7 +75,6 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
             )
         except ClockNotReady:
             await clock.changes.wait_async(version)
-    method = getattr(instance, method_name)
     consumer = f"{instance.name}.{method_name}"
     health = getattr(instance.runtime, "handler_health", None)
     retry = Backoff()
@@ -61,8 +83,7 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
 
         def invoke() -> None:
             with instance._lock, clock.at(due):
-                asyncio.run(method())
-                buffer.set_watermark(key, due, "clock-v1")
+                _call(instance, method_name, key, due)
 
         try:
             worker = asyncio.create_task(asyncio.to_thread(invoke))
@@ -120,8 +141,7 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
 
         def invoke(instance=instance, due=due, method_name=method_name, key=key) -> None:
             with instance._lock, clock.at(due):
-                asyncio.run(getattr(instance, method_name)())
-                instance.runtime.buffer.set_watermark(key, due, "clock-v1")
+                _call(instance, method_name, key, due)
 
         worker = asyncio.create_task(asyncio.to_thread(invoke))
         try:

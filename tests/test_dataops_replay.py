@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from dataops_fakes import FakeDoor, FakeRuntime, run_async, signal_entry
 
+from chaski import Reject
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.inputs import SignalRangeInput
@@ -298,3 +299,84 @@ def test_checkpoint_requires_both_state_hooks():
 
     with pytest.raises(TypeError, match="requires snapshot_state"):
         Incomplete()
+
+
+# ─── a handler that rejects or fails during replay ─────────────────────────
+
+
+class RejectingProducer(Producer):
+    """Sets negative values aside on purpose; fails on ``None``."""
+
+    name = "rejecting"
+    system_element_name = "SE-1"
+
+    event_input = SignalRangeInput("on_metric_signal", window="1h")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[tuple[float, object]] = []
+
+    @on_metric("event_input")
+    async def on_event(self, metric) -> None:
+        if metric.value is None:
+            raise RuntimeError("store unavailable")
+        if metric.value < 0:
+            raise Reject("negative", detail={"value": metric.value})
+        self.received.append((metric.timestamp, metric.value))
+
+
+class RecordingRuntime(FakeRuntime):
+    def __init__(self, door, buffer) -> None:
+        super().__init__(door, buffer)
+        self.rejected: list[tuple[str, dict, str]] = []
+
+    def reject(self, consumer: str, subject: dict, rejected: Reject) -> None:
+        self.rejected.append((consumer, subject, rejected.reason))
+
+
+@run_async
+async def test_a_rejected_record_is_recorded_and_the_replay_completes(buffer, runtime):
+    from chaski.dataops import codehash
+
+    runtime = RecordingRuntime(runtime.door, buffer)
+    buffer.set_watermark("rejecting", 0.0, "old-hash")
+    buffer.append("sig-event", 100.0, 1)
+    buffer.append("sig-event", 200.0, -1)
+    buffer.append("sig-event", 300.0, 3)
+
+    instance = RejectingProducer().attach(runtime)
+    await replay_changed_producers(runtime, [instance])
+
+    assert instance.received == [(100.0, 1), (300.0, 3)]
+    assert runtime.rejected == [
+        ("rejecting.on_event", {"replay": "rejecting", "signal_id": "sig-event", "ts": 200.0}, "negative")
+    ]
+    assert buffer.code_hash("rejecting") == codehash.compute_code_hash(RejectingProducer)
+    assert buffer.watermark("rejecting") == 300.0
+
+
+@run_async
+async def test_a_rejection_that_cannot_be_recorded_stops_the_replay(buffer, runtime):
+    buffer.set_watermark("rejecting", 0.0, "old-hash")
+    buffer.append("sig-event", 100.0, -1)
+
+    instance = RejectingProducer().attach(runtime)
+    with pytest.raises(RuntimeError, match="nowhere to record"):
+        await replay_changed_producers(runtime, [instance])
+
+    assert buffer.code_hash("rejecting") == "old-hash"
+
+
+@run_async
+async def test_a_failed_replay_leaves_the_code_hash_unwritten(buffer, runtime):
+    runtime = RecordingRuntime(runtime.door, buffer)
+    buffer.set_watermark("rejecting", 0.0, "old-hash")
+    buffer.append("sig-event", 100.0, 1)
+    buffer.append("sig-event", 200.0, None)
+
+    instance = RejectingProducer().attach(runtime)
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        await replay_changed_producers(runtime, [instance])
+
+    assert buffer.code_hash("rejecting") == "old-hash"
+    assert buffer.watermark("rejecting") == 0.0
