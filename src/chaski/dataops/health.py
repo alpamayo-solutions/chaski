@@ -18,6 +18,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from chaski.failures import UNHEALTHY, HandlerHealth
+
 log = logging.getLogger("chaski.dataops.health")
 
 PORT_DEFAULT = 8888
@@ -43,6 +45,10 @@ class HealthState:
     ``broker_grace_s`` fails the probe too: without it no command, wake-up or
     watched record arrives. In coordinated step mode ``last_drain_at`` is the
     step loop's, and ``stall_after_s`` without a step is a stall.
+
+    ``handlers`` counts failing handlers: while one is retried the answer
+    says ``degraded`` and names it; once one failed ``unhealthy_after`` times
+    in a row it is a 503.
     """
 
     started_at: float = field(default_factory=time.time)
@@ -59,6 +65,7 @@ class HealthState:
     broker_grace_s: float = BROKER_GRACE_S
     #: The node's cursor_lag finding about this service, "" while none stands.
     cursor_lag: Callable[[], str] | None = None
+    handlers: HandlerHealth | None = None
     _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
@@ -94,17 +101,27 @@ class HealthState:
     def _lag(self) -> str:
         return self.cursor_lag() if self.cursor_lag is not None else ""
 
+    def _handlers(self) -> str:
+        return self.handlers.status if self.handlers is not None else "ok"
+
     def healthy(self) -> bool:
-        return self._ingest() in ("not-started", "running") and self._broker() != "down" and not self._lag()
+        return (
+            self._ingest() in ("not-started", "running")
+            and self._broker() != "down"
+            and not self._lag()
+            and self._handlers() != UNHEALTHY
+        )
 
     def snapshot(self) -> dict:
         ingest = self._ingest()
         broker = self._broker()
         lag = self._lag()
+        handlers = self._handlers()
         body = {
-            "ok": ingest in ("not-started", "running") and broker != "down" and not lag,
+            "ok": ingest in ("not-started", "running") and broker != "down" and not lag and handlers != UNHEALTHY,
             "ingest": ingest,
             "broker": broker,
+            "handlers": handlers,
             "producers": self.producers,
             "generation": self.generation,
             "uptime_s": round(time.time() - self.started_at, 1),
@@ -113,6 +130,11 @@ class HealthState:
             body["since_drain_s"] = round(self._since_drain(), 1)
         if lag:
             body["cursor_lag"] = lag
+        if self.handlers is not None and handlers != "ok":
+            body["failing"] = {
+                name: {"failures": f.failures, "error": f.error, "since": round(f.since, 3)}
+                for name, f in self.handlers.failing().items()
+            }
         return body
 
 

@@ -204,10 +204,22 @@ def off_loop(method):
     :func:`make_handler`).
     """
 
+    instance = method.__self__
+    consumer = f"{instance.name}.{method.__name__}"
+
     @functools.wraps(method)
     def job() -> None:
-        with method.__self__._lock:
-            asyncio.run(method())
+        health = getattr(instance._runtime, "handler_health", None)
+        try:
+            with instance._lock:
+                asyncio.run(method())
+        except Exception as exc:
+            # APScheduler logs it; the next tick runs the method again.
+            if health is not None:
+                health.failed(consumer, exc)
+            raise
+        if health is not None:
+            health.succeeded(consumer)
 
     return job
 
@@ -509,6 +521,7 @@ def make_handler(method, *, time_domain="application"):
                     instance.restore_state(previous)
                 raise
 
+    _handler.consumer = f"{method.__self__.name}.{method.__name__}"
     return _handler
 
 
@@ -944,6 +957,8 @@ class DataOpsService(Service):
             cast(asyncio.AbstractEventLoop, self._loop),
             constant_triggers,
             signal_triggers,
+            health=self.handler_health,
+            reject=self.reject,
         )
 
     def _execute_commands(self, instances: list[Producer]) -> commands.CommandExecutor | None:
@@ -1069,6 +1084,8 @@ class DataOpsService(Service):
                 dispatch=dispatch,
                 signal_ids=signal_ids or None,
                 retry_min_s=self._retry_min_s,
+                health=self.handler_health,
+                reject=self.reject,
                 # A lost buffer's generation cannot be recovered, so nothing knows
                 # the previous cursor yet and retiring it is a no-op.
                 previous_generation=None,
@@ -1084,6 +1101,7 @@ class DataOpsService(Service):
             health_state.stall_after_s = health.STALL_AFTER_MIN_S
             health_state.waiting = (lambda: self._step_waiting) if self.step is not None else (lambda: ingest.waiting)
             health_state.connected = self.is_broker_connected
+            health_state.handlers = self.handler_health
             ingest_task: asyncio.Task | None = None
             if self.step is not None:
                 ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
@@ -1231,9 +1249,20 @@ class DataOpsService(Service):
                             await finish_window(target)
                         await asyncio.to_thread(self.step.complete, target)
             except Exception as exc:
-                log.exception("Coordinated window failed; leaving its progress unacknowledged")
-                await ingest._sleep_or_stop(backoff.delay(exc), stop)
+                failed = ingest.take_failure()
+                name = failed[0] if failed is not None else "coordinated window"
+                count = self.handler_health.failed(name, exc)
+                delay = backoff.delay(exc)
+                log.error(
+                    "Coordinated window failed in %s (%d in a row); progress not acknowledged, retrying in %.1fs",
+                    name,
+                    count,
+                    delay,
+                    exc_info=exc,
+                )
+                await ingest._sleep_or_stop(delay, stop)
                 continue
+            self.handler_health.succeeded("coordinated window")
             backoff.reset()
             self._step_loop_last = time.monotonic()
             self._step_waiting = True

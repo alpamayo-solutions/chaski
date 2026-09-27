@@ -11,6 +11,8 @@ the base SDK; it needs no database driver (the historian is a port, see
 node sees one more local service, not a kind of its own.
 """
 
+from chaski.failures import Reject
+
 from .base import Producer, Runtime
 from .buffer import Buffer
 from .commands import Command, CommandRejected
@@ -29,6 +31,7 @@ __all__ = [
     "Historian",
     "Ingest",
     "Producer",
+    "Reject",
     "Runtime",
     "SignalOutput",
     "SignalRangeInput",

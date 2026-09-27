@@ -15,6 +15,13 @@ uses. The loop opens it again whenever the signal filter changes
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
 
+**A failed handler is not acknowledged.** The cursor moves only past the
+records before it, and :meth:`Ingest.run_forever` retries the same record
+with bounded, jittered backoff, reporting the handler to
+:class:`chaski.failures.HandlerHealth` (degraded, then unhealthy) and logging
+each failure. A handler that raises :class:`chaski.Reject` has the record
+recorded as rejected (``reject``) and the page goes on.
+
 **Pacing.** :meth:`Ingest.run_forever` fetches again at once after a full
 page, as the loop is behind. After a partial page it waits until
 :data:`MIN_FETCH_INTERVAL_S` has passed since the previous fetch, so a busy
@@ -56,6 +63,7 @@ import httpx
 
 from chaski.door import Gap, Page, Record, Stream, StreamGapError
 from chaski.doorbell import Doorbell
+from chaski.failures import HandlerHealth, Reject, record_subject
 from chaski.retry import Backoff
 
 from .buffer import Buffer
@@ -75,6 +83,15 @@ Handler = Callable[[Record], Awaitable[None]]
 #: ``stream("metrics", cursor=cursor, signal_ids=signal_ids)``, which puts
 #: the cursor inside the identity's namespace (``Service.cursor_prefix``).
 OpenStream = Callable[[str, "list[str] | None"], Stream]
+
+#: ``reject(consumer, subject, rejection)``: records a rejection durably and
+#: returns only then (:meth:`chaski.Service.reject`).
+RejectFn = Callable[[str, "dict[str, Any]", Reject], None]
+
+
+def consumer_name(handler: Any) -> str:
+    """How health and logs name a handler: ``Producer.method`` where known."""
+    return getattr(handler, "consumer", None) or getattr(handler, "__qualname__", None) or repr(handler)
 
 
 #: While pages come back partial, fetches are at least this far apart, so a
@@ -108,8 +125,14 @@ class Ingest:
         strict: bool = True,
         min_fetch_interval_s: float = MIN_FETCH_INTERVAL_S,
         retry_min_s: float = 1.0,
+        health: HandlerHealth | None = None,
+        reject: RejectFn | None = None,
     ) -> None:
         self._retry_min_s = retry_min_s
+        self._health = health or HandlerHealth()
+        self._reject = reject
+        # (handler, record) of the handler failure that ended the last step.
+        self._failed: tuple[str, Record] | None = None
         self.waiting = False
         if not strict:
             raise ValueError("DataOps cannot skip failed handlers; strict=False is no longer supported")
@@ -265,6 +288,7 @@ class Ingest:
         if page.gap is not None:
             raise StreamGapError(f"input stream has a retention gap: {page.gap}")
 
+        self._failed = None
         # One commit per page: the page is acked only after it, and a crash
         # before the ack appends the page again.
         with self._buffer.one_commit():
@@ -388,15 +412,58 @@ class Ingest:
 
     async def _handle(self, signal_id: str, record: Record) -> None:
         for handler in self._dispatch.get(signal_id, []):
+            name = consumer_name(handler)
             try:
-                await handler(record)
+                try:
+                    await handler(record)
+                except Reject as rejected:
+                    subject = {
+                        "stream": STREAM,
+                        "cursor": self.cursor,
+                        "signal_id": signal_id,
+                        **record_subject(record),
+                    }
+                    await asyncio.to_thread(self._record_rejection, name, subject, rejected)
             except Exception:
-                log.exception(
-                    "on_metric handler failed for signal_id=%s at offset=%d; input remains pending",
-                    signal_id,
-                    record.offset,
-                )
+                self._failed = (name, record)
                 raise
+            self._health.succeeded(name)
+
+    def _record_rejection(self, name: str, subject: dict[str, Any], rejected: Reject) -> None:
+        if self._reject is None:
+            raise RuntimeError(f"{name} rejected a record, but this ingest has nowhere to record it") from rejected
+        self._reject(name, subject, rejected)
+
+    def take_failure(self) -> tuple[str, Record] | None:
+        """The ``(handler, record)`` whose failure ended the last drain, once."""
+        failed, self._failed = self._failed, None
+        return failed
+
+    async def _handler_failed(self, exc: Exception, retry: Backoff, stop: asyncio.Event) -> bool:
+        """Account for a handler failure that ended a step; False when it was not one."""
+        failed = self.take_failure()
+        if failed is None:
+            return False
+        name, record = failed
+        await self._restart_from_cursor()
+        # The records before the failed one were handled: a restart resumes at it.
+        if record.offset > 1:
+            try:
+                await asyncio.to_thread(self._stream.ack, record.offset - 1)
+            except (httpx.HTTPError, BufferError) as ack_error:
+                log.warning("Could not acknowledge up to offset=%d: %s", record.offset - 1, ack_error)
+        count = self._health.failed(name, exc)
+        backoff = retry.delay(exc)
+        log.error(
+            "on_metric handler %s failed at offset=%d (%d in a row); not acknowledged, retrying in %.1fs",
+            name,
+            record.offset,
+            count,
+            backoff,
+            exc_info=exc,
+        )
+        await self._sleep_or_stop(backoff, stop)
+        return True
 
     @staticmethod
     def _signal_id_of(record: Record) -> str | None:
@@ -497,10 +564,12 @@ class Ingest:
         says, then waits for :meth:`wake`. Where the node supports it, the page
         after a full one is read ahead while the full one is processed.
 
-        ``httpx.HTTPError`` (colca restarting, a timeout, 429, 5xx) is logged
-        and retried with backoff; the unacked page is simply fetched again. Any
-        other exception propagates, ends the task and turns the health door
-        to 503.
+        A failed handler is retried at its record with backoff, never
+        acknowledged (see the module docstring). ``httpx.HTTPError`` (colca
+        restarting, a timeout, 429, 5xx) is logged and retried with backoff;
+        the unacked page is simply fetched again. Any other exception, a
+        retention gap included, propagates, ends the task and turns the health
+        door to 503.
         """
         stop = stop or asyncio.Event()
         try:
@@ -518,7 +587,11 @@ class Ingest:
             self.waiting = False
             try:
                 processed = await self._step()
-            except (httpx.HTTPError, BufferError) as exc:
+            except Exception as exc:
+                if await self._handler_failed(exc, retry, stop):
+                    continue
+                if not isinstance(exc, (httpx.HTTPError, BufferError)):
+                    raise
                 await self._restart_from_cursor()
                 backoff = retry.delay(exc)
                 log.warning(
