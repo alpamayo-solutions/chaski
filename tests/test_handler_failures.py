@@ -145,10 +145,10 @@ async def test_a_failed_metric_handler_is_retried_at_its_record_and_never_acked(
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
     try:
-        await _until(lambda: attempts.count(2) >= 3)
+        await _until(lambda: health.status == UNHEALTHY)
         # Everything before the failed record is acknowledged, the failed one never.
         assert max(offset for _s, _c, offset in door.acked) == 1
-        assert health.status == UNHEALTHY
+        assert attempts.count(2) >= 3
         assert attempts[:1] == [1] and 3 not in attempts
         healthy.set()
         ingest.wake()
@@ -345,8 +345,8 @@ async def test_a_failed_constant_handler_is_retried_until_it_succeeds(_isolate_r
     instance, client, health = _watching("flaky-retry")
     instance.fail_on.add(5.0)
     _deliver(client, TOPIC, 5.0)
-    await _until(lambda: instance.calls.count(5.0) >= 3)
-    assert health.status == UNHEALTHY
+    await _until(lambda: health.status == UNHEALTHY)
+    assert instance.calls.count(5.0) >= 3
     instance.fail_on.clear()
     await _until(lambda: instance.done == [5.0])
     assert health.status == OK
