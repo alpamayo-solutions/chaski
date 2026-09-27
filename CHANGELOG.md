@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.13.0](https://github.com/alpamayo-solutions/chaski/compare/v0.12.0...v0.13.0) (2026-09-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* a handler that raises on input it can never process now blocks its stream (retried with backoff, service unhealthy after five failures) instead of being skipped. Raise chaski.Reject for such input; the rejection is recorded as the service's rejected_input _Finding before the ack. Handlers must be idempotent.
+* enforce durable push-driven consumer recovery
+
+### Features
+
+* enforce durable push-driven consumer recovery ([c30a0c0](https://github.com/alpamayo-solutions/chaski/commit/c30a0c0dc25c52d81e34913057586a4ab62da010))
+* retry failed handlers instead of skipping them; Reject sets input aside durably ([#72](https://github.com/alpamayo-solutions/chaski/issues/72)) ([bd50688](https://github.com/alpamayo-solutions/chaski/commit/bd50688710949bed11ae0af8fb13c60c6419d8e9))
+
+
+### Documentation
+
+* publish push-driven usage rules and broker compatibility ([e13faa2](https://github.com/alpamayo-solutions/chaski/commit/e13faa21f129db12e347e906bfc4faffadbc3b51))
+
 ## [0.12.0](https://github.com/alpamayo-solutions/chaski/compare/v0.11.1...v0.12.0) (2026-09-26)
 
 
