@@ -109,7 +109,6 @@ class Executor:
         )
         self.loop = asyncio.new_event_loop()
         self.stop = asyncio.Event()
-        self.executor.subscribe(svc._started_client, self.loop)
         self.thread = threading.Thread(
             target=self.loop.run_until_complete, args=(self.executor.run_forever(self.stop),)
         )
@@ -339,6 +338,47 @@ def test_answers_at_other_paths_do_not_leave_the_executor_cursor_unread(tmp_path
             assert runner.executor._stream.cursor not in names, names
         finally:
             press.close()
+            runner.close()
+
+
+def test_the_executors_own_answer_does_not_leave_its_cursor_unread(tmp_path, fast_lag_alarm):
+    """The executor answers a command and nothing else arrives. Its answer
+    lands after the head its drain captured; the answer must still wake it,
+    or the answer stands unread on its cursor and raises cursor_lag."""
+    Operator.runs = []
+    with (
+        chaski.Node("cmd-own-ack", data_dir=tmp_path / "node") as node,
+        node.service("executor") as svc,
+        _sender(node, svc, tmp_path) as sender,
+    ):
+        runner = Executor(svc, svc.send, Buffer(tmp_path / "ledger.sqlite"))
+        try:
+            # A reader of every _Ack at the node, at the head: the control.
+            control = svc.stream(commands.STREAM, cursor="control", contracts=["_Ack"])
+            list(control)
+            _wait(lambda: control.fetch().ack_offset is None)
+
+            result: dict = {}
+            _command(sender, PATH, result, value=1).join(timeout=50)
+            assert result.get("result_code") == 200, result
+
+            def lagging():
+                for entry in svc.kv(contract="_Finding"):
+                    if entry.path.endswith("cursor_lag") and entry.payload:
+                        names = {c["cursor"] for c in entry.payload["detail"]["cursors"]}
+                        if control.cursor in names:
+                            return names
+                return None
+
+            deadline = time.monotonic() + 20
+            while (names := lagging()) is None:
+                assert time.monotonic() < deadline, "the control cursor was never reported"
+                time.sleep(0.5)
+            assert runner.executor._stream.cursor not in names, names
+            # Longer than the lag threshold again, still with no traffic.
+            time.sleep(3.0)
+            assert runner.executor._stream.cursor not in (lagging() or set())
+        finally:
             runner.close()
 
 

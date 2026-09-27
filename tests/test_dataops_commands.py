@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import ClassVar
 
 import colca_data_contracts  # noqa: F401 - installs the UNS "prefix=colca" patch
 import httpx
@@ -117,29 +118,31 @@ def test_parse_topic():
     assert parse_topic("colca/v1/_CmdParam/n-1") is None
 
 
-def test_command_topics_and_subscription():
-    ex, _producer, _door = executor()
+@run_async
+async def test_the_watch_wakes_on_every_contract_the_stream_reads():
+    """The node counts what the fetch filter matches as unread on the cursor,
+    so each of those records must wake a drain: the executor's own answers
+    land after the head a drain captured."""
+    ex, _producer, door = executor()
+    watched: list[list[str]] = []
 
-    class Client:
-        def __init__(self) -> None:
-            self.subscribed: list[tuple[str, int]] = []
+    def watch(streams, *, contracts=(), **kwargs):
+        watched.append(list(contracts))
+        return iter(())
 
-        def message_callback_add(self, topic, callback) -> None:
-            pass
-
-        def subscribe(self, topic, qos):
-            self.subscribed.append((topic, qos))
-            return 0, len(self.subscribed)
-
-    client = Client()
-    assert ex.subscribe(client, asyncio.new_event_loop()) == 2
-    assert client.subscribed == [
-        (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setProduct", 1),
-        (f"colca/v1/_CmdParam/{NODE_ID}/line1/operator/setRecipe", 1),
-        (f"colca/v1/_Ack/{NODE_ID}/line1/operator/setProduct", 1),
-        (f"colca/v1/_Ack/{NODE_ID}/line1/operator/setRecipe", 1),
-    ]
-    assert sorted(t for t, _ in client.subscribed) == commands.stream_topics(ex._handlers, NODE_ID)
+    door.watch = watch
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if watched:
+            break
+    stop.set()
+    ex.wake()
+    await asyncio.wait_for(task, timeout=1.0)
+    read = {parse_topic(topic)[0] for topic in commands.stream_topics(ex._handlers, NODE_ID)}
+    assert read == {"_CmdParam", "_Ack"}
+    assert read <= set(watched[0])
 
 
 # ─── execution ───────────────────────────────────────────────────────────
@@ -632,6 +635,33 @@ def test_a_write_under_a_deadline_is_refused_once_it_passed_or_while_the_link_is
     client.connected = False
     svc.send("t/5", "{}")
     assert client.published == ["t/1", "t/5"]
+
+
+class DeadlineReader(Producer):
+    name = "deadline_reader"
+    system_element_name = "line1"
+    seen: ClassVar[list] = []
+
+    @on_command("line1/operator/setSpeed")
+    async def set_speed(self, command: Command) -> str:
+        from chaski import write_deadline
+
+        DeadlineReader.seen.append((write_deadline(), command.expires_at))
+        return "ok"
+
+
+@run_async
+async def test_a_handler_reads_its_commands_deadline():
+    from chaski import write_deadline
+
+    door = FakeDoor()
+    producer = DeadlineReader().attach(FakeRuntime(door, buffer=None))
+    door.queue(Page(records=[record("line1/operator/setSpeed")], next=2))
+    ex = CommandExecutor(door, producer.runtime.send, Stream(door, "commands", CURSOR), gather([producer]), NODE_ID)
+    await ex.drain()
+    ((deadline, expires_at),) = DeadlineReader.seen
+    assert deadline == expires_at / 1000.0
+    assert write_deadline() is None
 
 
 class LateWriter(Producer):

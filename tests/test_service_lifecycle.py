@@ -301,7 +301,7 @@ def test_a_reconnect_subscribes_everything_again_unless_the_broker_kept_the_sess
 ):
     svc, client = _local_service(tmp_path, monkeypatch)
     command = "colca/v1/_CmdParam/n-edge1/line1/operator/setProduct"
-    client.subscribe(command, qos=1)  # what a dataops command executor subscribes
+    client.subscribe(command, qos=1)
     held = set(client.subscriptions)
     again: list[str] = []
     monkeypatch.setattr(client, "subscribe", lambda topic, *a, **k: again.append(str(topic)))

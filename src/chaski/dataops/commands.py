@@ -11,20 +11,20 @@ executor reads commands from the node's ``commands`` stream through a durable
 cursor of its own (``commands`` in the service's namespace) and hands the
 record's ``actor_id``/``actor_label``/``actor_kind`` to the handler.
 
-**MQTT only rings the bell.** Each declared command topic is subscribed at
-QoS 1; a message wakes a drain of the stream and is not read itself. The
-executor drains once at startup, once per wake and once after the broker link
+**The stream rings the bell.** The ``commands`` stream carries every command
+at the node. The executor follows its growth over ``GET /watch``
+(:meth:`CommandExecutor.run_forever`), filtered by :func:`stream_contracts`,
+and drains once at startup, once per hint and once after the broker link
 comes back. There is no timed poll.
 
-**The stream rings it too.** The ``commands`` stream carries every command at
-the node, and the cursor must pass the ones this service does not execute, or
-it stands behind them, counted as unread, until the next command of its own
-comes. The executor follows the stream's growth over ``GET /watch``
-(:meth:`CommandExecutor.watch`) and reads only its own command and ``_Ack``
-topics (:func:`stream_topics`), which are also what wakes it: answers at other
-paths would otherwise count as unread on its cursor with nothing to wake it.
-A drain ends at the head it captured; the cursor is acked to the end of what
-the node scanned (:attr:`Page.ack_offset`).
+**It wakes on everything it reads.** A drain reads only the executor's own
+command and ``_Ack`` topics (:func:`stream_topics`); the node counts records
+matching that filter as unread on its cursor. Its own answers land after the
+head a drain captured, so the watch includes ``_Ack``: otherwise the answer
+would stay unread with nothing to wake the executor past it. Answers at other
+paths wake a drain that reads nothing and moves the cursor to the end of what
+the node scanned (:attr:`Page.ack_offset`). A drain ends at the head it
+captured.
 
 **Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
 with ``{correlation_id, result_code, message, performed_at}``:
@@ -120,8 +120,6 @@ ANSWER_BACKOFF_MAX_S = 5.0
 ANSWER_CONSUMER = "commands: answer"
 #: How many answered correlation ids the executor remembers in memory.
 _ANSWERED_LIMIT = 4096
-#: QoS 1: a lost wake would leave a command waiting for the next one.
-_QOS = 1
 #: Upper bound on the retry backoff after the door failed.
 _ERROR_BACKOFF_MAX_S = 30.0
 #: How far apart the node sends stream-growth hints at most; what grows in
@@ -130,19 +128,19 @@ WATCH_INTERVAL_MS = 1000
 
 
 def contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
-    """The command contracts ``handlers`` execute: what wakes the executor."""
+    """The command contracts ``handlers`` execute."""
     return sorted({contract for contract, _path in handlers})
 
 
 def stream_contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
-    """What the executor's stream reads: its command contracts and ``_Ack``,
-    so it sees which of its commands were answered already."""
+    """What the executor's stream reads and what wakes it: its command
+    contracts and ``_Ack``, so it sees which of its commands were answered
+    already and is woken past its own answers."""
     return sorted({*contracts(handlers), ACK_CONTRACT})
 
 
 def stream_topics(handlers: dict[tuple[str, str], Callable], node_id: str) -> list[str]:
-    """The topics the executor's stream reads, and what wakes it: its commands
-    and their answers. ``_Ack`` records at other paths are not its business
+    """The topics the executor's stream reads: its commands and their answers. ``_Ack`` records at other paths are not its business
     and must not count as unread on its cursor."""
     prefix = topic_prefix()
     return sorted(
@@ -309,27 +307,8 @@ class CommandExecutor:
 
     # -- topics -------------------------------------------------------------
 
-    def command_topics(self) -> list[str]:
-        return sorted(f"{topic_prefix()}{contract}/{self._node_id}/{path}" for contract, path in self._handlers)
-
     def ack_topic(self, path: str) -> str:
         return f"{topic_prefix()}_Ack/{self._node_id}/{path}"
-
-    def subscribe(self, client: Any, loop: asyncio.AbstractEventLoop) -> int:
-        """Subscribe every declared command topic as a wake-up. The payload
-        is not decoded: the stream record is what gets executed. A refused
-        SUBACK is retried by the service's :class:`chaski.subscriptions.Subscriptions`."""
-
-        def _ring(_client: Any, _userdata: Any, _message: Any) -> None:
-            loop.call_soon_threadsafe(self.wake)
-
-        topics = self.command_topics()
-        # Its own answers wake it too: they land after the head a drain captured.
-        for topic in (*topics, *sorted(self._ack_topics)):
-            client.message_callback_add(topic, _ring)
-            client.subscribe(topic, qos=_QOS)
-        log.info("commands: executing %d command(s) on node=%s", len(topics), self._node_id)
-        return len(topics)
 
     def wake(self) -> None:
         """New commands may be waiting. From another thread, call it through
@@ -354,7 +333,7 @@ class CommandExecutor:
         watch = StreamChanges(
             self._door,
             [STREAM],
-            contracts=contracts(self._handlers),
+            contracts=stream_contracts(self._handlers),
             on_change=lambda: loop.call_soon_threadsafe(self.wake),
         ).start()
         try:
