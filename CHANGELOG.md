@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.3](https://github.com/alpamayo-solutions/chaski/compare/v0.14.2...v0.14.3) (2026-09-27)
+
+
+### Fixes
+
+* a command runs only while the executor's broker link is up, and its writes are not queued past its deadline ([#82](https://github.com/alpamayo-solutions/chaski/issues/82)) ([a37774a](https://github.com/alpamayo-solutions/chaski/commit/a37774ae0f1418d6baacb0a673134c1880745027))
+
 ## [0.14.2](https://github.com/alpamayo-solutions/chaski/compare/v0.14.1...v0.14.2) (2026-09-27)
 
 
