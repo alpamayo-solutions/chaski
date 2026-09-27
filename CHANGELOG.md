@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/alpamayo-solutions/chaski/compare/v0.11.1...v0.12.0) (2026-09-26)
+
+
+### Features
+
+* consumers read when woken, never on a timer, and report the node's cursor_lag ([#67](https://github.com/alpamayo-solutions/chaski/issues/67)) ([899bff5](https://github.com/alpamayo-solutions/chaski/commit/899bff524962de5d1ed47e95f7e20fcf015a2089))
+
+
+### Fixes
+
+* move cursors past the records a filtered page skipped; commands follow the stream ([#68](https://github.com/alpamayo-solutions/chaski/issues/68)) ([657ce9b](https://github.com/alpamayo-solutions/chaski/commit/657ce9b0fbeb2dbc2cdc4b324ad3746a900479ea))
+
 ## [0.11.1](https://github.com/alpamayo-solutions/chaski/compare/v0.11.0...v0.11.1) (2026-09-26)
 
 
