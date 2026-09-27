@@ -1035,7 +1035,12 @@ class DataOpsService(Service):
         executor = commands.CommandExecutor(
             self.door,
             self.send,
-            self.stream(commands.STREAM, cursor=commands.CURSOR, contracts=commands.stream_contracts(handlers)),
+            self.stream(
+                commands.STREAM,
+                cursor=commands.CURSOR,
+                contracts=commands.stream_contracts(handlers),
+                topics=commands.stream_topics(handlers, node_id),
+            ),
             handlers,
             node_id,
             ledger=self.buffer,

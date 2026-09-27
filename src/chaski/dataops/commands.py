@@ -20,8 +20,11 @@ comes back. There is no timed poll.
 the node, and the cursor must pass the ones this service does not execute, or
 it stands behind them, counted as unread, until the next command of its own
 comes. The executor follows the stream's growth over ``GET /watch``
-(:meth:`CommandExecutor.watch`) and reads only its declared contracts; the
-cursor is acked to the end of what the node scanned (:attr:`Page.ack_offset`).
+(:meth:`CommandExecutor.watch`) and reads only its own command and ``_Ack``
+topics (:func:`stream_topics`), which are also what wakes it: answers at other
+paths would otherwise count as unread on its cursor with nothing to wake it.
+A drain ends at the head it captured; the cursor is acked to the end of what
+the node scanned (:attr:`Page.ack_offset`).
 
 **Answers.** Each command is answered over MQTT at ``_Ack/<node>/<path>``
 with ``{correlation_id, result_code, message, performed_at}``:
@@ -125,6 +128,17 @@ def stream_contracts(handlers: dict[tuple[str, str], Callable]) -> list[str]:
     """What the executor's stream reads: its command contracts and ``_Ack``,
     so it sees which of its commands were answered already."""
     return sorted({*contracts(handlers), ACK_CONTRACT})
+
+
+def stream_topics(handlers: dict[tuple[str, str], Callable], node_id: str) -> list[str]:
+    """The topics the executor's stream reads, and what wakes it: its commands
+    and their answers. ``_Ack`` records at other paths are not its business
+    and must not count as unread on its cursor."""
+    prefix = topic_prefix()
+    return sorted(
+        {f"{prefix}{contract}/{node_id}/{path}" for contract, path in handlers}
+        | {f"{prefix}{ACK_CONTRACT}/{node_id}/{path}" for _contract, path in handlers}
+    )
 
 
 class MemoryLedger:
@@ -298,7 +312,8 @@ class CommandExecutor:
             loop.call_soon_threadsafe(self.wake)
 
         topics = self.command_topics()
-        for topic in topics:
+        # Its own answers wake it too: they land after the head a drain captured.
+        for topic in (*topics, *sorted(self._ack_topics)):
             client.message_callback_add(topic, _ring)
             client.subscribe(topic, qos=_QOS)
         log.info("commands: executing %d command(s) on node=%s", len(topics), self._node_id)
@@ -375,6 +390,7 @@ class CommandExecutor:
         page once every answer on the page is published. Returns how many
         records were read."""
         seen = 0
+        head = await asyncio.to_thread(self._stream.head)
         while True:
             page: Page = await asyncio.to_thread(self._stream.fetch)
             if page.gap is not None:
@@ -391,9 +407,11 @@ class CommandExecutor:
             seen += len(page.records)
             ack_offset = page.ack_offset
             if ack_offset is None:
+                if page.next <= head:
+                    raise RuntimeError(f"commands: the stream stopped at {page.next} before its head {head}")
                 return seen
             await asyncio.to_thread(self._stream.ack, ack_offset)
-            if not page.records:
+            if ack_offset >= head:
                 return seen
 
     # -- answered commands ----------------------------------------------------

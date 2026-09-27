@@ -26,6 +26,7 @@ from chaski.failures import HandlerHealth
 
 PATH = "line1/operator/setDensity"
 UNKNOWN = "line1/operator/setSandoff"
+ELSEWHERE = "line1/press/setForce"
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("COLCAD_BINARY"), reason="requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE"
@@ -74,16 +75,32 @@ class Operator(Producer):
         raise RuntimeError("sandoff not stored") from PublishTimeout("colca/v1/_Metric/x", 10.0)
 
 
+class Press(Producer):
+    """Executes commands at another path, on another service."""
+
+    name = "press"
+    system_element_name = "line1"
+
+    @on_command(ELSEWHERE, contract="_CmdOperate")
+    async def set_force(self, command: Command) -> str:
+        return "force set"
+
+
 class Executor:
     """A CommandExecutor on its own event loop thread, as the service runs it."""
 
-    def __init__(self, svc, send, ledger, health=None, cursor=commands.CURSOR) -> None:
-        producer = Operator().attach(FakeRuntime(svc._require_http("door"), buffer=None))
+    def __init__(self, svc, send, ledger, health=None, cursor=commands.CURSOR, producer_type=Operator) -> None:
+        producer = producer_type().attach(FakeRuntime(svc._require_http("door"), buffer=None))
         handlers = commands.gather([producer])
         self.executor = commands.CommandExecutor(
             svc._require_http("door"),
             send,
-            svc.stream(commands.STREAM, cursor=cursor, contracts=commands.stream_contracts(handlers)),
+            svc.stream(
+                commands.STREAM,
+                cursor=cursor,
+                contracts=commands.stream_contracts(handlers),
+                topics=commands.stream_topics(handlers, svc.node_id),
+            ),
             handlers,
             svc.node_id,
             ledger=ledger,
@@ -120,7 +137,7 @@ def _sender(node, svc, tmp_path):
         "pubkey": sender.pubkey,
         "kind": "external",
         "element": element,
-        "grants": ["cmd:#:param", f"write:{element}/#"],
+        "grants": ["cmd:#:param", "cmd:#:operate", f"write:{element}/#"],
     }
     context = ssl.create_default_context()
     context.check_hostname = False
@@ -139,10 +156,10 @@ def _sender(node, svc, tmp_path):
         sender.close()
 
 
-def _command(sender, path: str, result: dict, **fields) -> threading.Thread:
+def _command(sender, path: str, result: dict, contract: str = "_CmdParam", **fields) -> threading.Thread:
     def send() -> None:
         try:
-            result.update(sender.command("_CmdParam", path, {"command": fields}, timeout=45))
+            result.update(sender.command(contract, path, {"command": fields}, timeout=45))
         except TimeoutError as exc:
             result["error"] = str(exc)
 
@@ -276,4 +293,49 @@ def test_a_command_right_after_a_broker_blip_is_answered(tmp_path):
             assert len(Operator.runs) == 1
         finally:
             Operator.before_return = None
+            runner.close()
+
+
+def test_answers_at_other_paths_do_not_leave_the_executor_cursor_unread(tmp_path, fast_lag_alarm):
+    """Another service answers commands of another contract at its own path.
+    Nothing there wakes this executor, so those _Ack records must not count
+    as unread on its cursor."""
+    Operator.runs = []
+    with (
+        chaski.Node("cmd-lag", data_dir=tmp_path / "node") as node,
+        node.service("executor") as svc,
+        node.service("press") as press_svc,
+        _sender(node, svc, tmp_path) as sender,
+    ):
+        runner = Executor(svc, svc.send, Buffer(tmp_path / "ledger.sqlite"))
+        press = Executor(press_svc, press_svc.send, commands.MemoryLedger(), producer_type=Press)
+        try:
+            result: dict = {}
+            _command(sender, PATH, result, value=1).join(timeout=50)
+            assert result.get("result_code") == 200, result
+
+            # A reader of every _Ack at the node, at the head: the control.
+            control = svc.stream(commands.STREAM, cursor="control", contracts=["_Ack"])
+            _wait(lambda: not list(control) and control.fetch().ack_offset is None)
+
+            for value in range(3):
+                answer: dict = {}
+                _command(sender, ELSEWHERE, answer, contract="_CmdOperate", value=value).join(timeout=50)
+                assert answer.get("result_code") == 200, answer
+
+            def lagging():
+                for entry in svc.kv(contract="_Finding"):
+                    if entry.path.endswith("cursor_lag"):
+                        names = {c["cursor"] for c in entry.payload["detail"]["cursors"]}
+                        if control.cursor in names:
+                            return names
+                return None
+
+            deadline = time.monotonic() + 20
+            while (names := lagging()) is None:
+                assert time.monotonic() < deadline, "the control cursor was never reported"
+                time.sleep(0.5)
+            assert runner.executor._stream.cursor not in names, names
+        finally:
+            press.close()
             runner.close()

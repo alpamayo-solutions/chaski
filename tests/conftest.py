@@ -36,3 +36,21 @@ class _NoNodeDoor:
 @pytest.fixture(autouse=True)
 def _no_node_door(monkeypatch):
     monkeypatch.setattr("chaski.service.Door", _NoNodeDoor)
+
+
+@pytest.fixture
+def fast_lag_alarm(monkeypatch):
+    """Let an embedded node's cursor watchdog report unread records after one second."""
+    import json
+
+    from chaski.node import Node
+
+    original = Node._write_config
+
+    def write_config(self):
+        original(self)
+        doc = self._load_existing()
+        doc["cursors"] = {"lag_alarm_after": "1s"}
+        self._config_path().write_text(json.dumps(doc), encoding="utf-8")
+
+    monkeypatch.setattr(Node, "_write_config", write_config)

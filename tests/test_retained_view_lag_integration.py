@@ -9,7 +9,6 @@ import pytest
 from colca_data_contracts.root import topic_prefix
 
 import chaski
-from chaski.node import Node
 
 
 @pytest.fixture(autouse=True)
@@ -22,21 +21,6 @@ def _contracts_bundle_env():
     """The integration caller supplies the bundle matching its binary."""
 
 
-@pytest.fixture
-def _fast_lag_alarm(monkeypatch):
-    """Let the node's cursor watchdog report unread records after one second."""
-    original = Node._write_config
-
-    def write_config(self):
-        original(self)
-        path = self._config_path()
-        doc = self._load_existing()
-        doc["cursors"] = {"lag_alarm_after": "1s"}
-        path.write_text(json.dumps(doc), encoding="utf-8")
-
-    monkeypatch.setattr(Node, "_write_config", write_config)
-
-
 def _wait(predicate, timeout: float = 20.0):
     deadline = time.monotonic() + timeout
     while not (result := predicate()):
@@ -45,7 +29,7 @@ def _wait(predicate, timeout: float = 20.0):
     return result
 
 
-def test_other_contracts_on_the_stream_are_not_unread_for_the_view(tmp_path, _fast_lag_alarm):
+def test_other_contracts_on_the_stream_are_not_unread_for_the_view(tmp_path, fast_lag_alarm):
     if not os.environ.get("COLCAD_BINARY"):
         pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
     with chaski.Node("view-lag", data_dir=tmp_path / "node") as node, node.service("worker") as svc:
