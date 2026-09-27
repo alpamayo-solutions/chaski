@@ -56,6 +56,10 @@ Startup order inside :meth:`DataOpsService.serve`:
  11. schedule cron and interval ticks, and the periodic buffer trim
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
+
+Every background task of steps 9 to 11 runs under :func:`supervise`: a task
+that raises is logged at once, counted in ``handler_health`` (degraded, then
+unhealthy) and restarted with jittered backoff. None dies silently.
 """
 
 from __future__ import annotations
@@ -69,7 +73,7 @@ import pkgutil
 import signal
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, cast
@@ -81,6 +85,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
+from chaski.failures import HandlerHealth
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
@@ -393,6 +398,63 @@ def _resolve_dispatch(
             )
 
     return dispatch, list(signal_ids), unresolved
+
+
+#: A restarted task that runs this long without failing counts as recovered.
+TASK_STABLE_S = 30.0
+#: Upper bound on the backoff before a crashed task is restarted.
+TASK_BACKOFF_MAX_S = 30.0
+
+
+async def supervise(
+    name: str,
+    start: Callable[[], Awaitable[Any]],
+    stop: asyncio.Event,
+    health: HandlerHealth,
+    *,
+    stable_s: float = TASK_STABLE_S,
+    backoff_max_s: float = TASK_BACKOFF_MAX_S,
+) -> None:
+    """Run the coroutine ``start()`` makes until it returns or ``stop`` is set.
+
+    When it raises, the exception is logged at once, ``health`` counts it as
+    ``task <name>`` (degraded; unhealthy after repeated crashes), and a new
+    coroutine starts after a jittered backoff. A restarted task that runs
+    ``stable_s`` without failing clears the count. Cancelling the supervisor
+    cancels the task.
+    """
+    from chaski.retry import Backoff
+
+    consumer = f"task {name}"
+    retry = Backoff(minimum=0.5, maximum=backoff_max_s)
+    while True:
+        task = asyncio.ensure_future(start())
+        try:
+            if retry.failures:
+                done, _pending = await asyncio.wait({task}, timeout=stable_s)
+                if not done:
+                    health.succeeded(consumer)
+                    retry.reset()
+            await task
+            if retry.failures:
+                health.succeeded(consumer)
+            return
+        except asyncio.CancelledError:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            raise
+        except Exception as exc:
+            if stop.is_set():
+                log.error("%s failed while stopping", name, exc_info=exc)
+                return
+            count = health.failed(consumer, exc)
+            delay = retry.delay(exc)
+            log.error("%s crashed (%d in a row); restarting it in %.1fs", name, count, delay, exc_info=exc)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            if stop.is_set():
+                return
 
 
 async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> None:
@@ -973,10 +1035,14 @@ class DataOpsService(Service):
         executor = commands.CommandExecutor(
             self.door,
             self.send,
-            self.stream(commands.STREAM, cursor=commands.CURSOR, contracts=commands.contracts(handlers)),
+            self.stream(commands.STREAM, cursor=commands.CURSOR, contracts=commands.stream_contracts(handlers)),
             handlers,
             node_id,
+            ledger=self.buffer,
+            health=self.handler_health,
         )
+        if not self.is_broker_connected():
+            executor.link_changed(False)
         return executor
 
     def _broker_state_changed(self, connected: bool) -> None:
@@ -986,8 +1052,8 @@ class DataOpsService(Service):
         loop, executor = self._loop, self._commands
         if connected and loop is not None and self._ingest is not None:
             loop.call_soon_threadsafe(self._ingest.wake)
-        if connected and loop is not None and executor is not None:
-            loop.call_soon_threadsafe(executor.wake)
+        if loop is not None and executor is not None:
+            loop.call_soon_threadsafe(executor.link_changed, connected)
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
@@ -1103,11 +1169,16 @@ class DataOpsService(Service):
             health_state.connected = self.is_broker_connected
             health_state.handlers = self.handler_health
             ingest_task: asyncio.Task | None = None
+            tasks_health = self.handler_health
+
+            def supervised(name: str, start: Callable[[], Awaitable[Any]]) -> asyncio.Task:
+                return asyncio.ensure_future(supervise(name, start, stop, tasks_health))
+
             if self.step is not None:
-                ingest_task = asyncio.create_task(self._run_steps(instances, ingest, stop))
+                ingest_task = supervised("step loop", lambda: self._run_steps(instances, ingest, stop))
                 health_state.ingest_task = ingest_task
             elif signal_ids:
-                ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
+                ingest_task = supervised("ingest", lambda: ingest.run_forever(stop))
                 health_state.ingest_task = ingest_task
                 log.info("Ingest loop started: cursor=%s signal_ids=%d", ingest.cursor, len(signal_ids))
             else:
@@ -1117,15 +1188,15 @@ class DataOpsService(Service):
                 """Start the loop if nothing resolved at startup and something has now."""
                 nonlocal ingest_task
                 if ingest_task is None:
-                    ingest_task = asyncio.ensure_future(ingest.run_forever(stop))
+                    ingest_task = supervised("ingest", lambda: ingest.run_forever(stop))
                     health_state.ingest_task = ingest_task
                     log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
             reresolve_task: asyncio.Task | None = None
             if self.step is None and (unresolved or self._definition_cache is not None):
                 log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
-                reresolve_task = asyncio.ensure_future(
-                    reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
+                reresolve_task = supervised(
+                    "re-resolve", lambda: reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
                 )
                 if unresolved:
                     log.info(
@@ -1137,8 +1208,9 @@ class DataOpsService(Service):
             self._watch_constants_and_signals(instances)
             self._commands = self._execute_commands(instances)
             commands_task: asyncio.Task | None = None
-            if self._commands is not None:
-                commands_task = asyncio.ensure_future(self._commands.run_forever(stop))
+            executor = self._commands
+            if executor is not None:
+                commands_task = supervised("command executor", lambda: executor.run_forever(stop))
 
             # 11) Schedule cron/interval triggers (everything except @on_metric),
             #     plus the service's own periodic buffer trim.
@@ -1151,7 +1223,10 @@ class DataOpsService(Service):
                     for method_name, spec in instance.__class__._triggers:
                         if isinstance(spec, CronSpec | IntervalSpec):
                             factory_tasks.append(
-                                asyncio.create_task(run_periodic(instance, method_name, spec, self.clock))
+                                supervised(
+                                    f"{instance.name}.{method_name}",
+                                    functools.partial(run_periodic, instance, method_name, spec, self.clock),
+                                )
                             )
                 else:
                     schedule_periodic(scheduler, instance)

@@ -249,8 +249,28 @@ running the handler, and so is a deadline more than 60 s after the command
 arrived or was `created_at` (`400`): the sender's deadline is capped, not
 trusted. A receiver of its own checks the same rule with
 `chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`: that
-answer is the command's durable rejection, and the command is not retried. A page of commands is acked after it was handled, so a
-restart can deliver a command twice: handlers must be idempotent.
+answer is the command's durable rejection, and the command is not retried.
+
+A handler whose write got no PUBACK (`franzmq.errors.PublishTimeout`, also as
+the cause of what it raised) is answered `504`, outcome unknown: the MQTT
+client keeps the write queued and may deliver it after a reconnect, so `500`
+("nothing changed") would be false. A sender that gets `504` reads the state
+back before it relies on either outcome.
+
+Each command runs once and gets one answer. The answer is recorded in the
+service's buffer before it is published, and the command before its handler
+runs. A failed `_Ack` publish is sent again once the broker link is back, with
+jittered backoff of at most 5 s, and the cursor passes the command only after
+the node confirmed its answer. The same answer can therefore arrive twice; it
+is identical both times. After a restart a recorded answer is published again
+unchanged, a command that was started but not answered is answered `504`, and a
+command whose `_Ack` is already in the `commands` stream is skipped.
+
+Every background task of a `DataOpsService` (ingest, command executor,
+re-resolution, clock-driven ticks) runs supervised: an exception is logged at
+once, reported in `handler_health` (degraded, then unhealthy) and the task is
+restarted with backoff. The MQTT client reconnects at most 5 s (jittered) after
+the broker is back.
 
 ## Run a node
 
@@ -394,8 +414,8 @@ async def on_edge(self, metric) -> None:
 
 A plain stream consumer gets the same through `svc.consume(stream, handler,
 bell=bell, stop=stop)`. `@on_command` handlers keep their answer: a failure is
-answered `500` in the command's `_Ack`, which the sender reads, and the command
-is not run again.
+answered `500` (`504` when a write is unconfirmed) in the command's `_Ack`,
+which the sender reads, and the command is not run again.
 
 Handlers must be idempotent, because a retry runs the same input again.
 Remove `strict=False` if you previously passed it.
