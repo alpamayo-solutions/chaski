@@ -92,9 +92,17 @@ def test_failed_record_is_not_acked_restart_resumes_there_and_rejection_is_durab
 
         stop, bell = threading.Event(), chaski.Doorbell()
         worker = _run(svc, svc.stream("entities", cursor="consume-test", contracts=["_Finding"]), fixed, stop, bell)
+
+        def unread():
+            page = svc.stream("entities", cursor="consume-test", contracts=["_Finding"]).fetch()
+            return [n for n in map(name_of, page.records) if n]
+
         try:
             _wait(lambda: handled == ["a", "b"])
             _wait(lambda: any(e.path.endswith("rejected_input") for e in svc.kv(contract="_Finding")))
+            # The page is acked after its rejection was recorded; stopping
+            # before that leaves it for the next start, by design.
+            _wait(lambda: not unread())
         finally:
             _stop(worker, stop, bell)
         assert svc.handler_health.status == "ok"
@@ -104,8 +112,7 @@ def test_failed_record_is_not_acked_restart_resumes_there_and_rejection_is_durab
         assert rejection.payload["detail"]["topic"] == f"{base}/case-c"
         assert rejection.payload["detail"]["reject"] == {"why": "test"}
 
-        rest = svc.stream("entities", cursor="consume-test", contracts=["_Finding"]).fetch()
-        assert not [n for n in map(name_of, rest.records) if n], "c was acknowledged after its rejection"
+        assert not unread(), "c was acknowledged after its rejection"
 
         svc.clear_rejections()
         _wait(lambda: not any(e.path.endswith("rejected_input") for e in svc.kv(contract="_Finding")))
