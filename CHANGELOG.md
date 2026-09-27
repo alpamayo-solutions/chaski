@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/alpamayo-solutions/chaski/compare/v0.14.3...v0.14.4) (2026-09-27)
+
+
+### Fixes
+
+* **connector:** wake acquisition at scheduled factory-clock starts ([#84](https://github.com/alpamayo-solutions/chaski/issues/84)) ([04143bf](https://github.com/alpamayo-solutions/chaski/commit/04143bff19d76cfccf58a5af583b1b3d887caf06))
+
 ## [0.14.3](https://github.com/alpamayo-solutions/chaski/compare/v0.14.2...v0.14.3) (2026-09-27)
 
 
