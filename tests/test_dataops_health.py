@@ -156,3 +156,26 @@ async def test_the_nodes_cursor_lag_finding_turns_the_probe_503_and_an_idle_stre
         state.ingest_task.cancel()
         server.close()
         await server.wait_closed()
+
+
+@run_async
+async def test_an_identity_conflict_turns_the_probe_503():
+    """Another process uses this service's identity: the broker hands the
+    session back and forth and consumers stop being woken."""
+    conflict = ["another process is connected as svc1"]
+    state = HealthState(identity_conflict=lambda: conflict[0])
+    port = _free_port()
+    server = await serve(state, port=port)
+    try:
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 503, body
+        assert body["ok"] is False
+        assert body["identity_conflict"] == conflict[0]
+
+        conflict[0] = ""
+        status, body = await asyncio.to_thread(_get, port)
+        assert status == 200, body
+        assert "identity_conflict" not in body
+    finally:
+        server.close()
+        await server.wait_closed()

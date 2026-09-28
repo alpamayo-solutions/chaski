@@ -564,3 +564,79 @@ def test_registration_retry_is_cancelled_on_disconnect_and_close(tmp_path, monke
     assert not calls
     svc.close()
     assert svc._reannounce_stop.is_set()
+
+
+def _taken_over():
+    from paho.mqtt.packettypes import PacketTypes
+    from paho.mqtt.reasoncodes import ReasonCode
+
+    return ReasonCode(PacketTypes.DISCONNECT, "Session taken over")
+
+
+def test_a_session_takeover_is_an_error_and_makes_the_service_unhealthy(tmp_path, monkeypatch, caplog):
+    """Another process connected with this service's identity: the broker
+    hands it the session (MQTT 5 reason 0x8E). Both keep displacing each
+    other and their subscriptions, so it must not pass as a reconnect."""
+    import logging
+
+    svc, client = _local_service(tmp_path, monkeypatch)
+    assert svc.identity_conflict == ""
+    with caplog.at_level(logging.WARNING, logger="chaski.service"):
+        svc._on_disconnect(client, None, None, _taken_over(), None)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "svc1" in errors[0].getMessage() and "another process" in errors[0].getMessage()
+    assert "another process" in svc.identity_conflict
+
+    # The reconnect announces the conflict in the service's own record.
+    svc._on_connect(client, None, None, _FakeReasonCode())
+    latest = _details(client)[-1]
+    assert latest.is_active is True
+    assert latest.architecture_metadata["status"] == "unhealthy"
+    assert "another process" in latest.architecture_metadata["detail"]
+
+    # status() cannot report healthy over it.
+    svc.status(True)
+    assert _details(client)[-1].architecture_metadata["status"] == "unhealthy"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="chaski.service"):
+        svc._on_disconnect(client, None, None, _taken_over(), None)
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1, "one error per takeover"
+    svc.close()
+
+
+def test_an_ordinary_disconnect_is_not_an_identity_conflict(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from paho.mqtt.packettypes import PacketTypes
+    from paho.mqtt.reasoncodes import ReasonCode
+
+    svc, client = _local_service(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="chaski.service"):
+        svc._on_disconnect(client, None, None, ReasonCode(PacketTypes.DISCONNECT, "Unspecified error"), None)
+        svc._on_disconnect()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert svc.identity_conflict == ""
+    svc.status(True)
+    assert _details(client)[-1].architecture_metadata == {"status": "healthy"}
+    svc.close()
+
+
+def test_the_identity_conflict_clears_once_no_takeover_follows(tmp_path, monkeypatch):
+    import time
+
+    import chaski.service as module
+
+    monkeypatch.setattr(module, "IDENTITY_CONFLICT_HOLD_S", 0.2)
+    svc, client = _local_service(tmp_path, monkeypatch)
+    client.is_connected = lambda: True
+    svc._on_disconnect(client, None, None, _taken_over(), None)
+    svc._on_connect(client, None, None, _FakeReasonCode())
+    assert _details(client)[-1].architecture_metadata["status"] == "unhealthy"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _details(client)[-1].architecture_metadata["status"] != "healthy":
+        time.sleep(0.02)
+    assert svc.identity_conflict == ""
+    assert _details(client)[-1].architecture_metadata == {"status": "healthy"}
+    svc.close()

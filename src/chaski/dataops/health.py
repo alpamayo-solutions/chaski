@@ -44,7 +44,9 @@ class HealthState:
     waiting to be commissioned. A broker link that stays down for
     ``broker_grace_s`` fails the probe too: without it no command, wake-up or
     watched record arrives. In coordinated step mode ``last_drain_at`` is the
-    step loop's, and ``stall_after_s`` without a step is a stall.
+    step loop's, and ``stall_after_s`` without a step is a stall. So does
+    another process running as this service (``identity_conflict``): the
+    broker hands their one session back and forth and wake-ups get lost.
 
     ``handlers`` counts failing handlers: while one is retried the answer
     says ``degraded`` and names it; once one failed ``unhealthy_after`` times
@@ -65,6 +67,8 @@ class HealthState:
     broker_grace_s: float = BROKER_GRACE_S
     #: The node's cursor_lag finding about this service, "" while none stands.
     cursor_lag: Callable[[], str] | None = None
+    #: Another process runs as this service, "" while none does.
+    identity_conflict: Callable[[], str] | None = None
     handlers: HandlerHealth | None = None
     _broker_down_since: float | None = field(default=None, repr=False)
 
@@ -101,6 +105,9 @@ class HealthState:
     def _lag(self) -> str:
         return self.cursor_lag() if self.cursor_lag is not None else ""
 
+    def _conflict(self) -> str:
+        return self.identity_conflict() if self.identity_conflict is not None else ""
+
     def _handlers(self) -> str:
         return self.handlers.status if self.handlers is not None else "ok"
 
@@ -109,6 +116,7 @@ class HealthState:
             self._ingest() in ("not-started", "running")
             and self._broker() != "down"
             and not self._lag()
+            and not self._conflict()
             and self._handlers() != UNHEALTHY
         )
 
@@ -116,9 +124,14 @@ class HealthState:
         ingest = self._ingest()
         broker = self._broker()
         lag = self._lag()
+        conflict = self._conflict()
         handlers = self._handlers()
         body = {
-            "ok": ingest in ("not-started", "running") and broker != "down" and not lag and handlers != UNHEALTHY,
+            "ok": ingest in ("not-started", "running")
+            and broker != "down"
+            and not lag
+            and not conflict
+            and handlers != UNHEALTHY,
             "ingest": ingest,
             "broker": broker,
             "handlers": handlers,
@@ -130,6 +143,8 @@ class HealthState:
             body["since_drain_s"] = round(self._since_drain(), 1)
         if lag:
             body["cursor_lag"] = lag
+        if conflict:
+            body["identity_conflict"] = conflict
         if self.handlers is not None and handlers != "ok":
             body["failing"] = {
                 name: {"failures": f.failures, "error": f.error, "since": round(f.since, 3)}
