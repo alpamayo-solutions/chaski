@@ -1088,7 +1088,10 @@ class DataOpsService(Service):
         # first timeline/beacon. Producer setup may read application time, so it
         # must not run in a different clock domain or be skipped at startup.
         health_state = health.HealthState(
-            ready=False, broker_connected=self.is_broker_connected, cursor_lag=lambda: self.cursor_lag
+            ready=False,
+            broker_connected=self.is_broker_connected,
+            cursor_lag=lambda: self.cursor_lag,
+            identity_conflict=lambda: self.identity_conflict,
         )
         health_server = None
         try:

@@ -76,6 +76,11 @@ class RetainedView:
             return self._snapshot()
         except Exception:
             self._unavailable()
+            # The subscription loop retries only when a stream changes. On a
+            # quiet stream nothing would wake it, and the view a caller just
+            # failed stayed unavailable for good; wake it to recover with its
+            # own backoff.
+            self.watch.changes.notify()
             raise
 
     def _unavailable(self):

@@ -105,6 +105,14 @@ Pass the same topics as `svc.stream(..., topics=[...])`. A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
 `svc.cursor_lag` follows and a `DataOpsService` health door fails on.
 
+Run one process per service name on a node. A second process with the same
+name connects with the same MQTT client id; the broker hands the one session
+back and forth, and each process's unsubscribes remove the other's
+subscriptions, so consumers stop being woken. Both processes log an error on
+every takeover, report `unhealthy` in their `_ServiceDetails`, and fail their
+health door; `svc.identity_conflict` says why until no takeover has followed
+for 60 s. chaski does not pick which process stops.
+
 ### Push-driven consumer rules
 
 - Subscribe before hydrating state or draining history. On reconnect, rebuild

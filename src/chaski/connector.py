@@ -196,8 +196,8 @@ def round_to_precision(value: float, precision: int) -> float:
 
 
 def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandler]:
-    """``/is_healthy``: 200 while the broker is reachable, 503 while it is not,
-    so a connector buffering through an outage shows up as unhealthy."""
+    """``/is_healthy``: 200 while ``is_healthy`` says so, 503 while it does
+    not; see :func:`run` for what it checks."""
 
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -209,7 +209,7 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
                 else:
                     self.send_response(503)
                     self.end_headers()
-                    self.wfile.write(b"mqtt disconnected")
+                    self.wfile.write(b"unhealthy")
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -236,7 +236,9 @@ def run(build: Callable[[], ConnectorService], *, health_port: int | None = 8888
     async def main() -> None:
         svc = build()
         if health_port is not None:
-            start_health_server(health_port, svc.is_broker_connected)
+            # Unhealthy while buffering through a broker outage, and while
+            # another process runs as this connector (see Service.identity_conflict).
+            start_health_server(health_port, lambda: svc.is_broker_connected() and not svc.identity_conflict)
         await svc.serve()
 
     asyncio.run(main())

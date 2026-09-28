@@ -29,6 +29,7 @@ from .doorbell import Doorbell
 from .failures import HandlerHealth, Reject
 from .node import Node
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
+from .topic_wakeup import TopicWakeup
 
 __all__ = [
     "Clock",
@@ -59,6 +60,7 @@ __all__ = [
     "StreamGapError",
     "Target",
     "Telemetry",
+    "TopicWakeup",
     "lifetime_refusal",
     "write_deadline",
 ]

@@ -99,6 +99,7 @@ from .door import Door, KvEntry, Record, Stream
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
 from .subscriptions import Subscriptions
+from .topic_wakeup import TopicFanout, TopicWakeup
 
 if TYPE_CHECKING:
     from .retained_view import RetainedView
@@ -127,6 +128,14 @@ _DEFAULT_EXTERNAL_MQTT_PORT = 8883
 _DEFAULT_EXTERNAL_API_PORT = 443
 _DEFAULT_LOCAL_HTTP_PORT = 80
 _DEFAULT_LOCAL_MQTT_PORT = 1883
+
+#: MQTT 5 DISCONNECT reason code a broker sends to a connection whose client
+#: id another connection just claimed: the broker hands the session over.
+SESSION_TAKEN_OVER = 0x8E
+#: How long after the last takeover the identity conflict stands. Two
+#: processes on one identity displace each other every second or two; once
+#: none follows for this long, the other process has gone.
+IDENTITY_CONFLICT_HOLD_S = 60.0
 
 
 #: The deadline (unix seconds) writes from the current context must be sent by.
@@ -536,6 +545,9 @@ class Service:
         # lock and publish after releasing it.
         self._lock = threading.RLock()
         self._client: Client | None = None
+        # Push wake-ups handed out by wake_on(); each rings after a reconnect.
+        self._wakeups: list[TopicWakeup] = []
+        self._fanout: TopicFanout | None = None
         # HTTP client for kv() and stream(), opened by start() on the same door
         # and identity as the MQTT client.
         self._http: Door | None = None
@@ -583,6 +595,10 @@ class Service:
         # summary while it stands (see cursor_lag).
         self._lag_topic: str | None = None
         self._cursor_lag = ""
+        # When the broker last handed this identity's session to another
+        # connection (monotonic), and the timer that retires the conflict.
+        self._taken_over_at: float | None = None
+        self._conflict_timer: threading.Timer | None = None
 
         if isinstance(node, LocalDoor):
             self._external = False
@@ -776,6 +792,10 @@ class Service:
         else:
             logger.info("chaski.Service: %s reconnected; the broker kept the session", self.name)
         self._broker_state_changed(True)
+        with self._lock:
+            wakeups = list(self._wakeups)
+        for wakeup in wakeups:
+            wakeup.reconnected()
         self._reannounce_stop.set()
         self._reannounce_stop = threading.Event()
         try:
@@ -806,10 +826,67 @@ class Service:
                 error = exc
                 logger.warning("chaski.Service: registration retry for %s failed", self.name, exc_info=True)
 
-    def _on_disconnect(self, *_args: Any, **_kwargs: Any) -> None:
-        logger.warning("chaski.Service: %s disconnected from the broker (auto-reconnecting)", self.name)
+    def _on_disconnect(
+        self, _client: Any = None, _userdata: Any = None, _flags: Any = None, reason_code: Any = None, *_rest: Any
+    ) -> None:
         self._reannounce_stop.set()
+        if getattr(reason_code, "value", reason_code) == SESSION_TAKEN_OVER:
+            self._session_taken_over()
+        else:
+            logger.warning("chaski.Service: %s disconnected from the broker (auto-reconnecting)", self.name)
         self._broker_state_changed(False)
+
+    def _session_taken_over(self) -> None:
+        """Another connection claimed this service's MQTT client id: another
+        process runs as the same service. The broker hands the one session
+        back and forth, and one process's unsubscribes remove the other's
+        subscriptions, so consumers stop being woken. Report it; which
+        process should stop is the operator's decision."""
+        logger.error(
+            "chaski.Service: the broker handed %s's session to another connection: another process is "
+            "running as %s on this node; both keep displacing each other and consumers may stop being woken "
+            "until one of them stops",
+            self.name,
+            self.name,
+        )
+        with self._lock:
+            if self._closed:
+                return
+            self._taken_over_at = time.monotonic()
+            # The reconnect announces what this composes (see _reannounce).
+            self._compose_status()
+            if self._conflict_timer is not None:
+                self._conflict_timer.cancel()
+            timer = threading.Timer(IDENTITY_CONFLICT_HOLD_S, self._identity_conflict_expired)
+            timer.daemon = True
+            self._conflict_timer = timer
+            timer.start()
+
+    def _identity_conflict_expired(self) -> None:
+        """No takeover for IDENTITY_CONFLICT_HOLD_S: report healthy again."""
+        with self._lock:
+            if self._closed or self.identity_conflict:
+                return
+            self._conflict_timer = None
+            self._compose_status()
+        if not self.is_broker_connected():
+            return  # the reconnect announces the composed status
+        try:
+            self._publish_status()
+        except Exception:
+            logger.warning("chaski.Service: could not publish %s's status", self.name, exc_info=True)
+
+    @property
+    def identity_conflict(self) -> str:
+        """Why another process is taken to run as this service, ``""`` while
+        no session takeover happened in the last IDENTITY_CONFLICT_HOLD_S."""
+        taken = self._taken_over_at
+        if taken is None or time.monotonic() - taken >= IDENTITY_CONFLICT_HOLD_S:
+            return ""
+        return (
+            f"another process is running as {self.name}: the broker handed its session to another connection "
+            f"with the same client id (MQTT session taken over)"
+        )
 
     def _broker_state_changed(self, connected: bool) -> None:
         """Hook: the broker link came up (True) or went down (False)."""
@@ -1469,17 +1546,23 @@ class Service:
         self._publish_status()
 
     def _publish_status(self) -> None:
+        with self._lock:
+            self._compose_status()
+            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+        self._publish_details(details)
+
+    def _compose_status(self) -> None:
+        """What ``_ServiceDetails`` says: status() combined with
+        :attr:`handler_health` and :attr:`identity_conflict`."""
         handlers = self.handler_health.status
         summary = self.handler_health.summary()
-        ok = self._user_ok and handlers != UNHEALTHY
+        conflict = self.identity_conflict
+        ok = self._user_ok and handlers != UNHEALTHY and not conflict
         detail = "; ".join(
-            part for part in (self._user_detail, f"handlers {handlers}: {summary}" if summary else "") if part
+            part for part in (conflict, self._user_detail, f"handlers {handlers}: {summary}" if summary else "") if part
         )
         self._last_status = "healthy" if ok else "unhealthy"
         self._last_detail = detail[:500]
-        with self._lock:
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
-        self._publish_details(details)
 
     def _handler_health_changed(self, _status: str, _summary: str) -> None:
         """A consumer started or stopped failing: republish the status, off
@@ -1516,6 +1599,27 @@ class Service:
     def clear_rejections(self) -> None:
         """Retire the ``rejected_input`` finding."""
         self.retract(self._rejection_topic())
+
+    def wake_on(self, topics=()) -> TopicWakeup:
+        """A push wake-up on exactly ``topics``, for :meth:`consume`'s ``bell``.
+
+        A consumer that reads a few signals of a busy node drains a scoped
+        stream (``stream(..., signal_ids=...)``) and passes
+        ``wake_on(<their _Metric topics>).bell``: it wakes when one of them
+        changes and at no other time. :meth:`TopicWakeup.rebind` follows a
+        changed set; the subscriptions survive reconnects, and every reconnect
+        rings once.
+        """
+        with self._lock:
+            # One fanout per client: paho keeps a single callback per topic,
+            # and two consumers of this service may want the same one.
+            if self._fanout is None:
+                self._fanout = TopicFanout(self._started_client)
+            fanout = self._fanout
+        wakeup = TopicWakeup(fanout, topics)
+        with self._lock:
+            self._wakeups.append(wakeup)
+        return wakeup
 
     def consume(
         self,
@@ -1695,6 +1799,10 @@ class Service:
         self._disconnect_client()
 
     def _stop_progress(self) -> None:
+        with self._lock:
+            if self._conflict_timer is not None:
+                self._conflict_timer.cancel()
+                self._conflict_timer = None
         self._pending_stop.set()
         self._pending_wake.notify()
         if self._pending_thread is not None:
