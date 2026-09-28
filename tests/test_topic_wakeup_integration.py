@@ -44,7 +44,18 @@ def test_a_scoped_consumer_wakes_on_and_reads_only_its_signals(tmp_path):
         topic = state.topic.replace("/_Signal/", "/_Metric/", 1)
         wake = reader.wake_on([topic])
         stream = reader.stream("metrics", cursor="scoped", signal_ids=[state.payload["id"]])
-        stream.ack(stream.head() if callable(stream.head) else stream.head)
+        # The first sample reaches the metrics stream asynchronously, possibly
+        # after a head read; consume it rather than ack a head that misses it.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            records = stream.fetch().records
+            if records:
+                stream.ack(records[-1])
+            if any(r.payload["value"] == 1 for r in records):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("first sample never reached the scoped stream")
 
         # Subscribing rings once, and the broker then delivers the retained
         # value; both land asynchronously. Wait for the bell to go quiet.
@@ -57,8 +68,7 @@ def test_a_scoped_consumer_wakes_on_and_reads_only_its_signals(tmp_path):
 
         machine.publish("state", 4)
         assert wake.bell.wait_after(seen, timeout=10), "not woken by its own signal"
-        page = stream.fetch()
-        records = getattr(page, "records", page)
+        records = stream.fetch().records
         assert [r.payload["value"] for r in records] == [4]
         wake.close()
 
