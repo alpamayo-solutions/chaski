@@ -152,3 +152,32 @@ def test_a_view_at_the_head_still_fetches_with_its_contracts():
     door.filtered.clear()
     current.synchronize()
     assert door.filtered == [("metrics", ["_Metric"])]
+
+
+def test_a_failed_synchronize_is_retried_without_waiting_for_a_new_record():
+    # A caller's synchronize() failed once (a 429 from Colca) and marked the
+    # view unavailable. The subscription loop retries only when a stream
+    # changes, so on a quiet stream the view stayed unavailable for good and
+    # every read failed until the process restarted.
+    import time
+
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    current.thread.start()  # the subscription loop, without a real watch door
+    try:
+        door.fail = True
+        with pytest.raises(ConnectionError):
+            current.synchronize()
+        assert not current.available
+        door.fail = False  # Colca recovers; nothing new is written
+        deadline = time.monotonic() + 10
+        while not current.available and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert current.available
+        assert current.read()[0].payload == {"value": 1}
+    finally:
+        current.stop.set()
+        current.watch.changes.notify()
+        current.thread.join(timeout=5)
