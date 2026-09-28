@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/alpamayo-solutions/chaski/compare/v0.14.5...v0.15.0) (2026-09-28)
+
+
+### Features
+
+* **service:** scoped push wake-ups, view recovery, Retry-After backoff and identity conflicts ([#88](https://github.com/alpamayo-solutions/chaski/issues/88)) ([27d2086](https://github.com/alpamayo-solutions/chaski/commit/27d2086c446fae40a7b691e37a9452f1cb9fbfd0))
+
 ## [0.14.5](https://github.com/alpamayo-solutions/chaski/compare/v0.14.4...v0.14.5) (2026-09-27)
 
 
