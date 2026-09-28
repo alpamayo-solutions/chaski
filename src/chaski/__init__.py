@@ -26,6 +26,7 @@ from .connector import (
 )
 from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
+from .topic_wakeup import TopicWakeup
 from .failures import HandlerHealth, Reject
 from .node import Node
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
@@ -41,6 +42,7 @@ __all__ = [
     "Discovery",
     "Door",
     "Doorbell",
+    "TopicWakeup",
     "Driver",
     "Gap",
     "HandlerHealth",

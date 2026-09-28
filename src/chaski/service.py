@@ -99,6 +99,7 @@ from .door import Door, KvEntry, Record, Stream
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
 from .subscriptions import Subscriptions
+from .topic_wakeup import TopicWakeup
 
 if TYPE_CHECKING:
     from .retained_view import RetainedView
@@ -536,6 +537,8 @@ class Service:
         # lock and publish after releasing it.
         self._lock = threading.RLock()
         self._client: Client | None = None
+        # Push wake-ups handed out by wake_on(); each rings after a reconnect.
+        self._wakeups: list[TopicWakeup] = []
         # HTTP client for kv() and stream(), opened by start() on the same door
         # and identity as the MQTT client.
         self._http: Door | None = None
@@ -776,6 +779,10 @@ class Service:
         else:
             logger.info("chaski.Service: %s reconnected; the broker kept the session", self.name)
         self._broker_state_changed(True)
+        with self._lock:
+            wakeups = list(self._wakeups)
+        for wakeup in wakeups:
+            wakeup.reconnected()
         self._reannounce_stop.set()
         self._reannounce_stop = threading.Event()
         try:
@@ -1516,6 +1523,21 @@ class Service:
     def clear_rejections(self) -> None:
         """Retire the ``rejected_input`` finding."""
         self.retract(self._rejection_topic())
+
+    def wake_on(self, topics=()) -> TopicWakeup:
+        """A push wake-up on exactly ``topics``, for :meth:`consume`'s ``bell``.
+
+        A consumer that reads a few signals of a busy node drains a scoped
+        stream (``stream(..., signal_ids=...)``) and passes
+        ``wake_on(<their _Metric topics>).bell``: it wakes when one of them
+        changes and at no other time. :meth:`TopicWakeup.rebind` follows a
+        changed set; the subscriptions survive reconnects, and every reconnect
+        rings once.
+        """
+        wakeup = TopicWakeup(self._started_client, topics)
+        with self._lock:
+            self._wakeups.append(wakeup)
+        return wakeup
 
     def consume(
         self,
