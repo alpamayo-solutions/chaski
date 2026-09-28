@@ -46,7 +46,11 @@ def test_a_scoped_consumer_wakes_on_and_reads_only_its_signals(tmp_path):
         stream = reader.stream("metrics", cursor="scoped", signal_ids=[state.payload["id"]])
         stream.ack(stream.head() if callable(stream.head) else stream.head)
 
+        # Subscribing rings once, and the broker then delivers the retained
+        # value; both land asynchronously. Wait for the bell to go quiet.
         seen = wake.bell.generation
+        while wake.bell.wait_after(seen, timeout=0.5):
+            seen = wake.bell.generation
         for i in range(20):
             machine.publish("noise", i)
         assert not wake.bell.wait_after(seen, timeout=1.5), "woken by a signal it does not read"
