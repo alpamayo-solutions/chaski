@@ -99,7 +99,7 @@ from .door import Door, KvEntry, Record, Stream
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
 from .subscriptions import Subscriptions
-from .topic_wakeup import TopicWakeup
+from .topic_wakeup import TopicFanout, TopicWakeup
 
 if TYPE_CHECKING:
     from .retained_view import RetainedView
@@ -539,6 +539,7 @@ class Service:
         self._client: Client | None = None
         # Push wake-ups handed out by wake_on(); each rings after a reconnect.
         self._wakeups: list[TopicWakeup] = []
+        self._fanout: TopicFanout | None = None
         # HTTP client for kv() and stream(), opened by start() on the same door
         # and identity as the MQTT client.
         self._http: Door | None = None
@@ -1534,7 +1535,13 @@ class Service:
         changed set; the subscriptions survive reconnects, and every reconnect
         rings once.
         """
-        wakeup = TopicWakeup(self._started_client, topics)
+        with self._lock:
+            # One fanout per client: paho keeps a single callback per topic,
+            # and two consumers of this service may want the same one.
+            if self._fanout is None:
+                self._fanout = TopicFanout(self._started_client)
+            fanout = self._fanout
+        wakeup = TopicWakeup(fanout, topics)
         with self._lock:
             self._wakeups.append(wakeup)
         return wakeup

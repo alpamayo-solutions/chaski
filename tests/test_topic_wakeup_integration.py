@@ -54,3 +54,33 @@ def test_a_scoped_consumer_wakes_on_and_reads_only_its_signals(tmp_path):
         records = getattr(page, "records", page)
         assert [r.payload["value"] for r in records] == [4]
         wake.close()
+
+
+def test_two_consumers_of_one_service_both_wake_on_a_shared_topic(tmp_path):
+    # paho keeps one callback per topic; the second wake_on replaced the first
+    # and one consumer never woke again (tcdb-api's PLC consumer and its value
+    # view both read a machine's machine_state).
+    if not os.environ.get("COLCAD_BINARY"):
+        pytest.skip("requires real colcad binary and contracts bundle")
+    from chaski import Node
+
+    with Node("shared", data_dir=tmp_path / "node") as node, node.service("machine", mount="M") as machine, \
+            node.service("reader") as reader:
+        machine.publish("state", 1)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            rows = [r for r in reader.kv("", contract="_Signal") if r.path.endswith("/state")]
+            if rows:
+                break
+            time.sleep(0.1)
+        topic = rows[0].topic.replace("/_Signal/", "/_Metric/", 1)
+        first, second = reader.wake_on([topic]), reader.wake_on([topic])
+        seen = first.bell.generation, second.bell.generation
+        machine.publish("state", 4)
+        assert first.bell.wait_after(seen[0], timeout=10)
+        assert second.bell.wait_after(seen[1], timeout=10)
+        first.close()
+        seen = second.bell.generation
+        machine.publish("state", 3)
+        assert second.bell.wait_after(seen, timeout=10), "closing one consumer silenced the other"
+        second.close()

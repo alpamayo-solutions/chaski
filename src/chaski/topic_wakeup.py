@@ -10,6 +10,11 @@ to any service.
 
 The payload is not read; the bell only says the scoped stream may have grown.
 New topics and a reconnect ring once, for what arrived while nothing listened.
+
+Several wake-ups of one service may want the same topic. paho keeps one
+callback per topic, so they share one :class:`TopicFanout`: it subscribes a
+topic once, rings every wake-up that wants it, and unsubscribes it only when
+the last of them lets go.
 """
 
 from __future__ import annotations
@@ -23,12 +28,51 @@ from .doorbell import Doorbell
 QOS = 1
 
 
+class TopicFanout:
+    """One MQTT subscription and callback per topic, shared by wake-ups."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._lock = threading.Lock()
+        self._wanted: dict[str, set[TopicWakeup]] = {}
+
+    def add(self, topic: str, wakeup: TopicWakeup) -> None:
+        with self._lock:
+            holders = self._wanted.setdefault(topic, set())
+            first = not holders
+            holders.add(wakeup)
+        if first:
+            self._client.message_callback_add(topic, self._on_message)
+            self._client.subscribe(topic, qos=QOS)
+
+    def remove(self, topic: str, wakeup: TopicWakeup) -> None:
+        with self._lock:
+            holders = self._wanted.get(topic)
+            if not holders:
+                return
+            holders.discard(wakeup)
+            last = not holders
+            if last:
+                del self._wanted[topic]
+        if last:
+            self._client.message_callback_remove(topic)
+            self._client.unsubscribe(topic)
+
+    def _on_message(self, _client: Any, _userdata: Any, message: Any) -> None:
+        topic = str(getattr(message, "topic", ""))
+        with self._lock:
+            holders = list(self._wanted.get(topic, ())) if topic else [w for s in self._wanted.values() for w in s]
+        for wakeup in holders:
+            wakeup.bell.ring()
+
+
 class TopicWakeup:
     """See the module docstring. Obtain one from :meth:`chaski.Service.wake_on`."""
 
-    def __init__(self, client: Any, topics: Iterable[str] = ()) -> None:
+    def __init__(self, fanout: Any, topics: Iterable[str] = ()) -> None:
         self.bell = Doorbell()
-        self._client = client
+        # A bare client (tests, single consumers) gets a fanout of its own.
+        self._fanout = fanout if isinstance(fanout, TopicFanout) else TopicFanout(fanout)
         self._lock = threading.Lock()
         self._topics: set[str] = set()
         self._closed = False
@@ -49,11 +93,9 @@ class TopicWakeup:
             removed = sorted(self._topics - wanted)
             self._topics = wanted
         for topic in added:
-            self._client.message_callback_add(topic, self._on_message)
-            self._client.subscribe(topic, qos=QOS)
+            self._fanout.add(topic, self)
         for topic in removed:
-            self._client.message_callback_remove(topic)
-            self._client.unsubscribe(topic)
+            self._fanout.remove(topic, self)
         if added:
             # Records may have arrived before the subscription existed.
             self.bell.ring()
@@ -67,8 +109,4 @@ class TopicWakeup:
             self._closed = True
             topics, self._topics = sorted(self._topics), set()
         for topic in topics:
-            self._client.message_callback_remove(topic)
-            self._client.unsubscribe(topic)
-
-    def _on_message(self, _client: Any, _userdata: Any, _message: Any) -> None:
-        self.bell.ring()
+            self._fanout.remove(topic, self)

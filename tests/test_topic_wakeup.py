@@ -59,3 +59,32 @@ def test_close_drops_every_subscription():
     assert client.subscribed == {} and client.callbacks == {}
     wake.rebind([A])
     assert client.subscribed == {}
+
+
+def _hub_client():
+    from chaski.topic_wakeup import TopicFanout
+
+    client = Client()
+    return client, TopicFanout(client)
+
+
+def test_two_wakeups_on_one_topic_both_ring():
+    # paho keeps one callback per topic: a second message_callback_add replaced
+    # the first, and one consumer of a service silently stopped waking.
+    client, fanout = _hub_client()
+    first, second = TopicWakeup(fanout, [A]), TopicWakeup(fanout, [A, B])
+    seen = first.bell.generation, second.bell.generation
+    client.callbacks[A](client, None, object())
+    assert first.bell.generation > seen[0] and second.bell.generation > seen[1]
+
+
+def test_closing_one_wakeup_keeps_the_others_subscription():
+    client, fanout = _hub_client()
+    first, second = TopicWakeup(fanout, [A]), TopicWakeup(fanout, [A])
+    first.close()
+    assert client.subscribed == {A: 1}
+    seen = second.bell.generation
+    client.callbacks[A](client, None, object())
+    assert second.bell.generation > seen
+    second.close()
+    assert client.subscribed == {} and client.callbacks == {}
