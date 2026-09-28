@@ -77,7 +77,7 @@ def test_backlog_hints_cannot_bypass_retry_after(monkeypatch):
             self.reads += 1
             monitor.wake.notify()
             response = httpx.Response(
-                429, headers={"Retry-After": "90"}, request=httpx.Request("GET", "http://colca/backlog")
+                429, headers={"Retry-After": "45"}, request=httpx.Request("GET", "http://colca/backlog")
             )
             response.raise_for_status()
 
@@ -94,4 +94,4 @@ def test_backlog_hints_cannot_bypass_retry_after(monkeypatch):
     monkeypatch.setattr(monitor.stop, "wait", wait)
     monitor.run()
     assert door.reads == 1
-    assert delays[0] == 90
+    assert 45 <= delays[0] <= 54

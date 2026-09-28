@@ -494,7 +494,7 @@ async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
     ingest = _ingest(door, buffer, signal_ids=["sig-1"])
     stop = asyncio.Event()
     request = httpx.Request("GET", "http://node/fetch")
-    response = httpx.Response(429, headers={"Retry-After": "90"}, request=request)
+    response = httpx.Response(429, headers={"Retry-After": "45"}, request=request)
 
     async def refused():
         raise httpx.HTTPStatusError("limited", request=request, response=response)
@@ -508,7 +508,7 @@ async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
     ingest._step = refused
     ingest._sleep_or_stop = wait
     await ingest.run_forever(stop)
-    assert delays == [90]
+    assert len(delays) == 1 and 45 <= delays[0] <= 54
 
 
 # ------------------------------------------------------------------ generational cursor retirement

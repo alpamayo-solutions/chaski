@@ -1044,7 +1044,7 @@ def test_batch_throttling_preserves_samples_and_server_retry_deadline(node, driv
 
     node.publish_batch = throttled
     poll(svc)
-    assert svc.slept[-1] == 7
+    assert 7 <= svc.slept[-1] <= 8.4
     assert len(svc._pending) == 1
     node.publish_batch = publish
     svc._publish_batch([])
