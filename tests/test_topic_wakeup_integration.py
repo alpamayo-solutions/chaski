@@ -22,8 +22,11 @@ def test_a_scoped_consumer_wakes_on_and_reads_only_its_signals(tmp_path):
         pytest.skip("requires real colcad binary and contracts bundle")
     from chaski import Node
 
-    with Node("scoped", data_dir=tmp_path / "node") as node, node.service("machine", mount="Line/M1") as machine, \
-            node.service("reader") as reader:
+    with (
+        Node("scoped", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="Line/M1") as machine,
+        node.service("reader") as reader,
+    ):
         machine.publish("state", 1)
         machine.publish("noise", 0)
 
@@ -64,8 +67,11 @@ def test_two_consumers_of_one_service_both_wake_on_a_shared_topic(tmp_path):
         pytest.skip("requires real colcad binary and contracts bundle")
     from chaski import Node
 
-    with Node("shared", data_dir=tmp_path / "node") as node, node.service("machine", mount="M") as machine, \
-            node.service("reader") as reader:
+    with (
+        Node("shared", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="M") as machine,
+        node.service("reader") as reader,
+    ):
         machine.publish("state", 1)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
