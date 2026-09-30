@@ -75,15 +75,54 @@ with chaski.Service("line-guard") as svc:
     svc.send(f"colca/v1/_Finding/{svc.node_id}/line1/speed", json.dumps(finding), retain=True)
     svc.retract(f"colca/v1/_Finding/{svc.node_id}/line1/speed")   # the tombstone
 
-    ack = svc.command("_CmdConfigure", "constant/upsert", {"constants": [...]})
+    ack = svc.command("_CmdConfigure", "constant/upsert", {"constants": [...]}, lifetime=30)
     if ack["result_code"] != 200:
         raise RuntimeError(ack["message"])
 ```
 
 `command()` subscribes to the command's `_Ack`, sends it with a
-`correlation_id` and an expiry, and returns the ack, or raises `TimeoutError`.
-A process with its own franzmq session uses `chaski.CommandSender` for the
+`correlation_id`, and returns the outcome, or raises `TimeoutError`. A
+process with its own franzmq session uses `chaski.CommandSender` for the
 same.
+
+`lifetime` has no default; the sender decides. `lifetime=None` sends a
+command without `expires_at`: it never expires and is delivered whenever its
+node is reachable, for as long as the node's retention keeps it. A number of
+seconds sends an `expires_at`; once it passed, the executor answers `498`
+without running it. Give commands that move a physical machine a short
+lifetime.
+
+### Commanding a node below, and waiting separately
+
+A hub service commands a service on an edge by naming the edge node and the
+path as the hub sees it, the edge's mount first. The hub stores the command
+and hands it to the edge when the edge is connected, also after an outage of
+days, and the edge's answer comes back up:
+
+```python
+sent = svc.send_command(
+    "_CmdParam",
+    f"{edge_mount}/fleet/apply",          # the path at the hub
+    {"command": {"proposal": proposal}},
+    node=edge_node_id,                     # the node that executes it
+    lifetime=None,                         # wait for the edge, however long
+    progress=True,                         # 202 acks: queued, forwarded
+)
+# send_command returns once the hub stored it. Waiting is separate, and a
+# wait that times out leaves the command queued.
+try:
+    outcome = sent.wait(timeout=30)
+except TimeoutError:
+    ...  # still queued; the outcome arrives later
+```
+
+`sent.correlation_id` names the command. A sender that must learn an outcome
+that can come days later reads the `_Ack` records at `sent.ack_topic` from its
+node's `commands` stream with a cursor of its own, instead of holding a wait
+open. `chaski.is_progress(ack)` tells a `202` progress ack (`stage` `queued`
+or `forwarded`) from the outcome. The node answers a command it will never
+deliver: `403` when its sender lost the grant before it was forwarded, `410`
+when the edge was retired or retention dropped it.
 
 ## Read from the node
 
@@ -279,11 +318,12 @@ The command is read from the node's `commands` stream through a durable
 cursor of the service's own, so `command.actor_id`/`actor_label` are the
 node's attestation, not the sender's claim. The stream's growth, watched for
 the executor's command contracts and `_Ack`, wakes the drain, so its own
-answers never stay unread on its cursor. An expired command (`expires_at`, unix ms) is answered `498` without
-running the handler, and so is a deadline more than 60 s after the command
-arrived or was `created_at` (`400`): the sender's deadline is capped, not
-trusted. A receiver of its own checks the same rule with
-`chaski.lifetime_refusal`. `CommandRejected` answers its own code, any other exception `500`: that
+answers never stay unread on its cursor. An expired command (`expires_at`,
+unix ms) is answered `498` without running the handler. A command without
+`expires_at` never expires and may arrive long after it was sent, when this
+node was cut off from the sender's: a handler whose effect must not happen
+late checks `command.ts` itself or relies on its senders setting a lifetime.
+`CommandRejected` answers its own code, any other exception `500`: that
 answer is the command's durable rejection, and the command is not retried.
 
 A handler runs only while the executor's broker link is up. While it is down

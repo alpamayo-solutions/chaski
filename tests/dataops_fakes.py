@@ -132,6 +132,15 @@ class FakeRuntime:
     def retract(self, topic: str) -> None:
         self.door.published.append((topic, ""))
 
-    def command(self, contract: str, path: str, fields: dict | None = None, *, timeout: float = 30.0) -> dict:
-        self.door.published.append((f"colca/v1/{contract}/{NODE_ID}/{path}", json.dumps(fields or {})))
+    def command(
+        self,
+        contract: str,
+        path: str,
+        fields: dict | None = None,
+        *,
+        lifetime: float | None,
+        node: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict:
+        self.door.published.append((f"colca/v1/{contract}/{node or NODE_ID}/{path}", json.dumps(fields or {})))
         return {"result_code": 200, "message": ""}

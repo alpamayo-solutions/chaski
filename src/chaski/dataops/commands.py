@@ -32,10 +32,6 @@ with ``{correlation_id, result_code, message, performed_at}``:
 ======  =====================================================
 200     the handler returned; its string is the message
 4xx     the handler raised :class:`CommandRejected`
-400     the command asks to live longer than
-        :data:`chaski.command.MAX_LIFETIME_S`, counted
-        from its arrival at the node or from its ``created_at``, or says it
-        was created after it arrived; the handler is not run
 498     ``expires_at`` (unix ms) had passed, also while the executor
         waited for its broker link; the handler is not run
 500     the handler raised anything else; nothing it sent is pending
@@ -46,6 +42,14 @@ with ``{correlation_id, result_code, message, performed_at}``:
 
 A command without a ``correlation_id`` cannot be matched by its sender and is
 not answered.
+
+**A command may wait long.** A command without ``expires_at`` never expires:
+it may reach the executor days after it was sent, when its node was cut off
+from the sender's. A handler whose effect must not happen late checks the age
+itself (``Command.ts`` is when the sender's node stored it) or relies on the
+sender setting a lifetime. A handler must not repeat an effect that is not
+idempotent: the same command can be handed to it again only after the
+answer was lost, and the ledger below answers it without running it.
 
 **A handler runs only while the broker link is up.** Its effects are MQTT
 writes. While the link is down the executor waits for it, until the
@@ -94,7 +98,7 @@ import httpx
 from colca_data_contracts import topic_prefix
 from franzmq.errors import PublishTimeout
 
-from chaski.command import lifetime_refusal
+from chaski.command import is_progress
 from chaski.door import Page, Record, Stream, StreamGapError
 from chaski.service import NotSent, writes_until
 
@@ -107,7 +111,6 @@ log = logging.getLogger("chaski.dataops.commands")
 STREAM = "commands"
 CURSOR = "commands"
 ACK_OK = 200
-ACK_REFUSED = 400
 ACK_EXPIRED = 498
 ACK_FAILED = 500
 ACK_BUSY = 503
@@ -411,6 +414,8 @@ class CommandExecutor:
         for record in records:
             if record.topic not in self._ack_topics or not isinstance(record.payload, dict):
                 continue
+            if is_progress(record.payload):
+                continue  # a 202 says a node queued or forwarded it, not that it was answered
             correlation_id = str(record.payload.get("correlation_id") or "")
             if correlation_id:
                 self._remember(correlation_id)
@@ -490,10 +495,7 @@ class CommandExecutor:
                 await self._publish_answer(self.ack_topic(path), correlation_id, recorded)
                 return
 
-        refusal = lifetime_refusal(payload.get("expires_at"), payload.get("created_at"), record.ts)
-        if refusal is not None:
-            code, message = ACK_REFUSED, refusal
-        elif expired(payload.get("expires_at"), time.time() * 1000.0):
+        if expired(payload.get("expires_at"), time.time() * 1000.0):
             code, message = ACK_EXPIRED, "expired before it was executed"
         elif not await self._link_before(command.expires_at):
             code, message = ACK_EXPIRED, "expired while the broker link was down; not executed"

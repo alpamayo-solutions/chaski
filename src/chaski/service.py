@@ -93,7 +93,7 @@ from franzmq import Client, Topic
 from ._wakeup import Wakeup
 from .catalogue import Catalogue, element_for
 from .clock import Clock, ClockNotReady
-from .command import CommandSender
+from .command import CommandSender, SentCommand
 from .coordination import StepGate
 from .door import Door, KvEntry, Record, Stream
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
@@ -1338,28 +1338,57 @@ class Service:
                 raise NotSent(f"{topic}: not sent, the broker link is down")
         return client
 
+    def send_command(
+        self,
+        contract: str,
+        path: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        lifetime: float | None,
+        node: str | None = None,
+        progress: bool = False,
+    ) -> SentCommand:
+        """Send one command and return once the node accepted it (stored and
+        queued); :meth:`SentCommand.wait` waits for its outcome. ``node`` is
+        the node that executes it, this service's node when ``None``; ``path``
+        is in this node's coordinates, a child's mount included. ``lifetime``
+        is seconds until it expires, or ``None`` for a command that never
+        expires and is delivered whenever its node is reachable. See
+        :class:`chaski.command.CommandSender`. Under :func:`writes_until` the
+        command expires by the deadline at the latest; past it or while the
+        link is down it is not sent and raises :class:`NotSent`."""
+        self._writable("command", f"{contract} {path}")
+        deadline = _write_deadline.get()
+        if deadline is not None:
+            left = deadline - time.time()
+            if left <= 0:
+                raise NotSent(f"{contract} {path}: not sent, its deadline had passed")
+            lifetime = left if lifetime is None else min(lifetime, left)
+        return cast(CommandSender, self._command_sender).send(
+            contract, path, fields, lifetime=lifetime, node=node, progress=progress
+        )
+
     def command(
         self,
         contract: str,
         path: str,
         fields: dict[str, Any] | None = None,
         *,
+        lifetime: float | None,
+        node: str | None = None,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        """Send one command to ``path`` on this service's node and return its
-        ``_Ack`` as the executor wrote it (``result_code``, ``message``, and
-        whatever else it carries, such as ``state_writes``). See
-        :meth:`chaski.command.CommandSender.command`. Under
-        :func:`writes_until` the command expires, and is waited for, by the
-        deadline at the latest; past it or while the link is down it is not
-        sent and raises :class:`NotSent`."""
-        self._writable("command", f"{contract} {path}")
+        """Send one command and return its outcome, the ``_Ack`` as the
+        executor wrote it (``result_code``, ``message``, and whatever else it
+        carries, such as ``state_writes``). :meth:`send_command` says what
+        ``node``, ``path`` and ``lifetime`` mean. Waiting ends after
+        ``timeout`` seconds with :class:`TimeoutError` and leaves the command
+        queued. Under :func:`writes_until` it is also waited for until the
+        deadline at the latest."""
         deadline = _write_deadline.get()
         if deadline is not None:
             timeout = min(timeout, deadline - time.time())
-            if timeout <= 0:
-                raise NotSent(f"{contract} {path}: not sent, its deadline had passed")
-        return cast(CommandSender, self._command_sender).command(contract, path, fields, timeout=timeout)
+        return self.send_command(contract, path, fields, lifetime=lifetime, node=node).wait(timeout)
 
     # -- consuming ---------------------------------------------------------
 

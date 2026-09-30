@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from typing import ClassVar
@@ -174,36 +175,45 @@ async def test_expired_command_is_answered_498_and_not_run():
 
 
 @run_async
-async def test_a_deadline_beyond_the_lifetime_cap_is_refused_and_not_run():
-    ex, producer, door = executor(record(expires_at=(time.time() + 3600) * 1000))
+async def test_a_command_without_expiry_runs_however_long_it_waited():
+    """No expires_at: the command never expires. One sent a month ago, when
+    the node was cut off from its sender, still runs."""
+    body = record()
+    del body.payload["expires_at"]
+    month_ago = (time.time() - 30 * 86400) * 1000
+    body = dataclasses.replace(body, ts=month_ago)
+    ex, producer, door = executor(body)
     await ex.drain()
-    assert producer.seen == []
-    ack = acks(door)[0][1]
-    assert ack["result_code"] == 400
-    assert "60 s after it arrived" in ack["message"]
+    assert len(producer.seen) == 1
+    assert producer.seen[0].expires_at is None
+    assert acks(door)[0][1]["result_code"] == 200
 
 
 @run_async
-async def test_a_created_at_after_arrival_is_refused():
-    ex, producer, door = executor(record(created_at=(time.time() + 3600) * 1000))
-    await ex.drain()
-    assert producer.seen == []
-    assert acks(door)[0][1]["result_code"] == 400
-
-
-@run_async
-async def test_an_old_command_with_a_long_life_is_refused():
+async def test_a_long_lifetime_is_the_senders_choice_and_runs():
     now = time.time()
-    ex, producer, door = executor(record(created_at=(now - 600) * 1000, expires_at=(now + 30) * 1000))
+    ex, producer, door = executor(record(created_at=(now - 600) * 1000, expires_at=(now + 7 * 86400) * 1000))
     await ex.drain()
-    assert producer.seen == []
-    assert "after it was created" in acks(door)[0][1]["message"]
+    assert len(producer.seen) == 1
+    assert acks(door)[0][1]["result_code"] == 200
 
 
 @run_async
-async def test_a_command_within_the_cap_runs():
-    now = time.time()
-    ex, producer, door = executor(record(created_at=now * 1000, expires_at=(now + 15) * 1000))
+async def test_a_progress_ack_at_its_path_does_not_count_as_its_answer():
+    """A 202 says a node queued or forwarded the command; the command still
+    runs."""
+    progress = Record(
+        offset=2,
+        origin_offset=2,
+        topic=f"colca/v1/_Ack/{NODE_ID}/{SET_PRODUCT}",
+        payload={"correlation_id": "corr-1", "result_code": 202, "stage": "forwarded"},
+        ts=time.time() * 1000,
+        written_by="n-hub",
+        actor_id="human-1",
+        actor_label="anna",
+        actor_kind="human",
+    )
+    ex, producer, door = executor(record(), progress)
     await ex.drain()
     assert len(producer.seen) == 1
     assert acks(door)[0][1]["result_code"] == 200

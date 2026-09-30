@@ -48,7 +48,14 @@ class Runtime(Protocol):
     def retract(self, topic: str) -> None: ...
 
     def command(
-        self, contract: str, path: str, fields: dict[str, Any] | None = None, *, timeout: float = 30.0
+        self,
+        contract: str,
+        path: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        lifetime: float | None,
+        node: str | None = None,
+        timeout: float = 30.0,
     ) -> dict[str, Any]: ...
 
     @property

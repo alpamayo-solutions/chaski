@@ -125,7 +125,7 @@ class Executor:
 def _sender(node, svc, tmp_path):
     """An external service that may send ``param`` commands: local services
     may not, so it is enrolled at ``line1`` with a cmd grant."""
-    ack = svc.command("_CmdConfigure", "element/author", {"path": "line1"}, timeout=10)
+    ack = svc.command("_CmdConfigure", "element/author", {"path": "line1"}, lifetime=10, timeout=10)
     assert ack["result_code"] == 200, ack
     element = ack["message"]
     api, mqtt = node._ports["api"], node._ports["mqtt"]
@@ -159,7 +159,7 @@ def _sender(node, svc, tmp_path):
 def _command(sender, path: str, result: dict, contract: str = "_CmdParam", **fields) -> threading.Thread:
     def send() -> None:
         try:
-            result.update(sender.command(contract, path, {"command": fields}, timeout=45))
+            result.update(sender.command(contract, path, {"command": fields}, lifetime=45, timeout=45))
         except TimeoutError as exc:
             result["error"] = str(exc)
 
@@ -437,7 +437,7 @@ def test_a_command_that_expires_while_the_link_is_down_is_not_run_and_leaves_no_
 
             # Sent through the sender's own link; the executor is woken over HTTP.
             with pytest.raises(TimeoutError):
-                sender.command("_CmdParam", EFFECT, {"command": {"value": 3}}, timeout=3)
+                sender.command("_CmdParam", EFFECT, {"command": {"value": 3}}, lifetime=3, timeout=3)
             time.sleep(1.0)
             blocked.clear()
             _wait(lambda: runner.executor._link.is_set())
