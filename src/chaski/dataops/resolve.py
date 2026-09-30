@@ -141,11 +141,19 @@ class LiveIndex:
     """
 
     def __init__(self, door_or_view):
-        from chaski.retained_view import RetainedView
+        from chaski.retained_view import RetainedView, ViewScope
 
         self._owns_view = not hasattr(door_or_view, "snapshot")
+        # Resolution reaches any path a producer names, so the index is the
+        # node's, not one subtree's.
         self.view = (
-            RetainedView(door_or_view, INDEX_CONTRACTS, ("entities", "definitions"), "dataops-definitions")
+            RetainedView(
+                door_or_view,
+                INDEX_CONTRACTS,
+                ("entities", "definitions"),
+                "dataops-definitions",
+                scope=ViewScope.whole_node(),
+            )
             if self._owns_view
             else door_or_view
         )

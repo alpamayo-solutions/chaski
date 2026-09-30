@@ -87,6 +87,7 @@ from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
 from chaski.failures import HandlerHealth, Reject
+from chaski.retained_view import ViewScope
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
@@ -805,6 +806,8 @@ class DataOpsService(Service):
                 contracts=("_Signal", "_SystemElement", "_AnnotationType"),
                 streams=("entities", "definitions"),
                 cursor="dataops-definitions",
+                # Resolution reaches any path a producer names.
+                scope=ViewScope.whole_node(),
                 on_change=self.clock.changes.notify,
             )
         )

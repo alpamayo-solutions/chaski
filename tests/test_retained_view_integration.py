@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+import chaski
+
 
 @pytest.fixture(autouse=True)
 def _no_node_door():
@@ -22,7 +24,9 @@ def test_retained_view_follows_real_metrics_and_rebuilds_after_restart(tmp_path)
     from chaski import Node
 
     with Node("retained-view", data_dir=tmp_path / "node") as node, node.service("worker") as service:
-        current = service.retained_view(contracts=["_Metric"], streams=["metrics"], cursor="view")
+        current = service.retained_view(
+            contracts=["_Metric"], streams=["metrics"], cursor="view", scope=chaski.ViewScope.whole_node()
+        )
 
         def observed(value):
             deadline = time.monotonic() + 10
@@ -40,5 +44,7 @@ def test_retained_view_follows_real_metrics_and_rebuilds_after_restart(tmp_path)
         service.publish("temperature", 22)
         observed(22)
         current.close()
-        current = service.retained_view(contracts=["_Metric"], streams=["metrics"], cursor="view")
+        current = service.retained_view(
+            contracts=["_Metric"], streams=["metrics"], cursor="view", scope=chaski.ViewScope.whole_node()
+        )
         observed(22)
