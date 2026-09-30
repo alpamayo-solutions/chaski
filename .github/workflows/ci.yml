@@ -29,7 +29,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Consumer lifecycle/recovery protocol (colca#112); keep conformance reproducible.
-          ref: ff7c2fc2b11b0533eac319ad037fe2528f059357
+          ref: a56fdd40b5a642ce6f18f2220aab6e9a36707367
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Same broker revision as lint/contracts above.
-          ref: ff7c2fc2b11b0533eac319ad037fe2528f059357
+          ref: a56fdd40b5a642ce6f18f2220aab6e9a36707367
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
