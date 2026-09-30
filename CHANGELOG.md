@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/alpamayo-solutions/chaski/compare/v0.15.1...v0.16.0) (2026-09-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **retained-view:** retained_view() and RetainedView require scope=. Pass chaski.ViewScope([...]) with the paths the view needs, or ViewScope.whole_node() for the previous behaviour.
+
+### Fixes
+
+* **retained-view:** read only the paths a view is scoped to ([#93](https://github.com/alpamayo-solutions/chaski/issues/93)) ([4afe03b](https://github.com/alpamayo-solutions/chaski/commit/4afe03bc5869c0065eab41fdeb68193d431f3346))
+
 ## [0.15.1](https://github.com/alpamayo-solutions/chaski/compare/v0.15.0...v0.15.1) (2026-09-28)
 
 
