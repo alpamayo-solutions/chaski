@@ -127,7 +127,7 @@ def test_writes_need_a_started_open_service(tmp_path, monkeypatch):
     svc = _service(tmp_path, monkeypatch, _Client())
     svc.close()
     with pytest.raises(RuntimeError, match="closed"):
-        svc.command("_CmdConfigure", "element/upsert", {})
+        svc.command("_CmdConfigure", "element/upsert", {}, lifetime=5)
 
 
 def test_command_subscribes_to_its_ack_before_sending_and_returns_it(tmp_path, monkeypatch):
@@ -135,7 +135,7 @@ def test_command_subscribes_to_its_ack_before_sending_and_returns_it(tmp_path, m
     svc = _service(tmp_path, monkeypatch, client)
     before_ms = time.time() * 1000
 
-    ack = svc.command("_CmdConfigure", "element/upsert", {"elements": [{"path": "a"}]}, timeout=5)
+    ack = svc.command("_CmdConfigure", "element/upsert", {"elements": [{"path": "a"}]}, lifetime=5, timeout=5)
 
     assert ack["result_code"] == 200
     assert ack["state_writes"] == client.state_writes
@@ -147,13 +147,61 @@ def test_command_subscribes_to_its_ack_before_sending_and_returns_it(tmp_path, m
     assert payload["elements"] == [{"path": "a"}]
     assert payload["correlation_id"] == ack["correlation_id"]
     assert before_ms + 4000 <= payload["expires_at"] <= time.time() * 1000 + 5000
+    assert "progress" not in payload
+
+
+def test_a_command_without_a_lifetime_carries_no_expiry(tmp_path, monkeypatch):
+    client = _Client()
+    svc = _service(tmp_path, monkeypatch, client)
+
+    ack = svc.command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=None, timeout=5)
+
+    assert ack["result_code"] == 200
+    payload = json.loads(client.of("publish")[-1][2])
+    assert "expires_at" not in payload
+
+
+def test_the_lifetime_is_the_senders_choice(tmp_path, monkeypatch):
+    svc = _service(tmp_path, monkeypatch, _Client())
+    with pytest.raises(TypeError, match="lifetime"):
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=5)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="lifetime"):
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=0, timeout=5)
+
+
+def test_a_command_to_a_node_below_is_addressed_to_it_at_its_mounted_path(tmp_path, monkeypatch):
+    """A hub service commands a service on an edge: the topic names the edge,
+    the path is the hub's (the edge's mount first), and the answer is awaited
+    where it arrives at the hub."""
+    client = _Client(answer=None)
+    svc = _service(tmp_path, monkeypatch, client)
+
+    sent = svc.send_command(
+        "_CmdParam", "edge7/fleet/apply", {"command": {"x": 1}}, lifetime=None, node="n-edge7", progress=True
+    )
+
+    assert client.of("publish")[-1][1] == "colca/v1/_CmdParam/n-edge7/edge7/fleet/apply"
+    assert sent.ack_topic == "colca/v1/_Ack/n-edge7/edge7/fleet/apply"
+    assert [t for _k, t, _p, _r in client.of("subscribe")][-1] == sent.ack_topic
+    payload = json.loads(client.of("publish")[-1][2])
+    assert payload["progress"] is True and "expires_at" not in payload
+
+    # Progress acks are not the outcome; the executor's answer is.
+    for body in (
+        {"correlation_id": sent.correlation_id, "result_code": 202, "stage": "queued"},
+        {"correlation_id": sent.correlation_id, "result_code": 202, "stage": "forwarded"},
+        {"correlation_id": sent.correlation_id, "result_code": 200, "message": "applied"},
+    ):
+        client.callbacks[sent.ack_topic](client, None, _Message(json.dumps(body).encode()))
+    assert [p["stage"] for p in sent.progress] == ["queued", "forwarded"]
+    assert sent.wait(1)["message"] == "applied"
 
 
 def test_a_decoded_ack_is_returned_too_and_a_refusal_is_not_raised(tmp_path, monkeypatch):
     client = _Client(answer="decoded")
     svc = _service(tmp_path, monkeypatch, client)
 
-    ack = svc.command("_CmdConfigure", "signal/autobind", {"connector": "c"}, timeout=5)
+    ack = svc.command("_CmdConfigure", "signal/autobind", {"connector": "c"}, lifetime=5, timeout=5)
 
     assert (ack["result_code"], ack["message"]) == (409, "taken")
 
@@ -163,21 +211,26 @@ def test_the_ack_topic_is_subscribed_once_and_again_after_a_reconnect(tmp_path, 
     svc = _service(tmp_path, monkeypatch, client)
     ack_topic = f"colca/v1/_Ack/{NODE}/constant/upsert"
 
-    svc.command("_CmdConfigure", "constant/upsert", {"constants": []}, timeout=5)
-    svc.command("_CmdConfigure", "constant/upsert", {"constants": []}, timeout=5)
+    svc.command("_CmdConfigure", "constant/upsert", {"constants": []}, lifetime=5, timeout=5)
+    svc.command("_CmdConfigure", "constant/upsert", {"constants": []}, lifetime=5, timeout=5)
     assert [t for _k, t, _p, _r in client.of("subscribe")].count(ack_topic) == 1
 
     svc._on_connect(client, None, None, _ReasonCode())  # a reconnect
     assert [t for _k, t, _p, _r in client.of("subscribe")].count(ack_topic) == 2
 
 
-def test_no_ack_in_time_raises_and_forgets_the_waiter(tmp_path, monkeypatch):
+def test_no_outcome_in_time_raises_and_leaves_the_command_waitable(tmp_path, monkeypatch):
     client = _Client(answer=None)
     svc = _service(tmp_path, monkeypatch, client)
 
-    with pytest.raises(TimeoutError, match="_Ack"):
-        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=0.05)
+    sent = svc.send_command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=None)
+    with pytest.raises(TimeoutError, match="stays queued"):
+        sent.wait(0.05)
 
+    # The outcome comes later; the same command is waited for again.
+    ack = {"correlation_id": sent.correlation_id, "result_code": 200, "message": "late"}
+    client.callbacks[sent.ack_topic](client, None, _Message(json.dumps(ack).encode()))
+    assert sent.wait(0.05)["message"] == "late"
     assert svc._command_sender._waiters == {}
 
 
@@ -197,7 +250,7 @@ def test_a_command_under_a_write_deadline_expires_and_is_waited_for_by_it(tmp_pa
         assert write_deadline() == deadline
         started = time.monotonic()
         with pytest.raises(TimeoutError, match="_Ack"):
-            svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=30)
+            svc.command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=5, timeout=30)
         assert time.monotonic() - started < 2
 
     payload = json.loads(client.of("publish")[-1][2])
@@ -214,10 +267,10 @@ def test_a_command_past_its_write_deadline_or_without_a_link_is_not_sent(tmp_pat
     sent = len(client.of("publish"))
 
     with writes_until(time.time() - 1), pytest.raises(NotSent, match="deadline"):
-        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=5)
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=5, timeout=5)
     client.is_connected = lambda: False
     with writes_until(time.time() + 30), pytest.raises(NotSent, match="link is down"):
-        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, timeout=5)
+        svc.command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=5, timeout=5)
     assert len(client.of("publish")) == sent
 
 
@@ -225,7 +278,7 @@ def test_a_command_sender_works_on_any_session():
     client = _Client()
     sender = CommandSender(client, NODE)
 
-    ack = sender.command("_CmdConfigure", "signal/autobind", {"connector": "c"}, timeout=5)
+    ack = sender.command("_CmdConfigure", "signal/autobind", {"connector": "c"}, lifetime=5, timeout=5)
 
     assert ack["result_code"] == 200
     assert [t for _k, t, _p, _r in client.of("subscribe")] == [f"colca/v1/_Ack/{NODE}/signal/autobind"]

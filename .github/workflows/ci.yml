@@ -28,8 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
-          # Consumer lifecycle/recovery protocol (colca#112); keep conformance reproducible.
-          ref: a56fdd40b5a642ce6f18f2220aab6e9a36707367
+          # colca v0.24.0: commands without expiry wait for offline child nodes (colca#129).
+          ref: fd72e4a9df5d32965344598b32a982b0576c3b9d
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Same broker revision as lint/contracts above.
-          ref: a56fdd40b5a642ce6f18f2220aab6e9a36707367
+          ref: fd72e4a9df5d32965344598b32a982b0576c3b9d
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
