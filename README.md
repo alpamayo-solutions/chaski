@@ -231,6 +231,50 @@ class MyDriver(Driver):
 ConnectorService("oven-connector", mount="site1/ovens", driver=MyDriver()).run()
 ```
 
+### Write a signal
+
+The standard way to set a signal is a `_CmdParam` command at the signal's own
+path with `{"command": {"value": ...}}`. The connector that holds the signal's
+binding executes it; no custom verb is needed. It announces a route for every
+bound signal, writes through its driver's `write(target, value)`, reads the tag
+back, and only then answers. A driver that does not implement `write` answers
+`501` `unsupported`.
+
+```python
+class MyDriver(Driver):
+    async def write(self, target, value):
+        await self.client.write(target.handle, value)   # raise if the source refuses
+```
+
+A sender needs a `cmd` grant with the `param` class on the signal's path:
+
+```python
+sent = svc.write_signal("line1/press3/setpoint", 12.5, lifetime=10)   # short: it moves a machine
+try:
+    answer = sent.wait(timeout=15)
+except TimeoutError:
+    answer = None   # result unknown: the write may still happen; read the signal's current value
+```
+
+The answer is the result, not an acknowledgement of receipt:
+
+| `result_code` | `result.outcome` | Meaning |
+|---|---|---|
+| 200 | `applied` | written and read back; `result.value` is the value read |
+| 409 | `failed` | written, but the value read back differs (`result.value`, `result.requested`) |
+| 502 | `failed` | the source refused the write |
+| 503 | `failed` | the source is not connected, or the tag is not available there |
+| 504 | `unknown` | written, but reading it back failed |
+| 501 | `unsupported` | the driver cannot write |
+| 422 | `refused` | the tag is read-only, or the command carries no value |
+| 498 | | the command expired before it ran; nothing was written |
+
+A write for a signal on another node takes `node=` and the path as the
+sender's node sees it, like any command, and waits there while that node is
+unreachable, within its lifetime. The connector records a write on disk
+before it starts: restarted between the write and its answer, it answers
+`504` (outcome unknown) and does not write again.
+
 ## Compute from streams
 
 ```python

@@ -23,6 +23,7 @@ from .connector import (
     SourceDisconnectedError,
     Target,
     Telemetry,
+    WriteUnsupported,
 )
 from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
@@ -64,6 +65,7 @@ __all__ = [
     "Telemetry",
     "TopicWakeup",
     "ViewScope",
+    "WriteUnsupported",
     "is_progress",
     "write_deadline",
 ]
