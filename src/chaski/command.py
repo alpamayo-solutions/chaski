@@ -85,7 +85,10 @@ class SentCommand:
         command stays queued and may still run, and ``wait`` may be called
         again. Must not be called from an MQTT callback."""
         if not self._waiter.event.wait(timeout):
-            raise TimeoutError(f"no outcome on {self.ack_topic} within {timeout:.0f}s; the command stays queued")
+            raise TimeoutError(
+                f"no outcome on {self.ack_topic} within {timeout:.0f}s; the command stays queued and its result is "
+                "unknown: read the current state before relying on either outcome"
+            )
         self._sender._forget(self.correlation_id)
         return self._waiter.ack
 

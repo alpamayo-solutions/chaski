@@ -14,6 +14,7 @@ import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, run_async
 from franzmq.errors import PublishTimeout
 
+from chaski import executor as command_executor
 from chaski.dataops import Command, CommandRejected, commands, on_command, resolve
 from chaski.dataops.base import Producer
 from chaski.dataops.commands import CommandExecutor, gather, parse_topic
@@ -393,7 +394,7 @@ def flaky_executor(*records: Record, failures: int, ledger=None, health=None):
 
 @pytest.fixture
 def fast_answer_backoff(monkeypatch):
-    monkeypatch.setattr(commands, "ANSWER_BACKOFF_MAX_S", 0.02)
+    monkeypatch.setattr(command_executor, "ANSWER_BACKOFF_MAX_S", 0.02)
 
 
 @run_async

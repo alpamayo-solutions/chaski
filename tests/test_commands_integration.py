@@ -21,6 +21,7 @@ from dataops_fakes import FakeRuntime
 from franzmq.errors import PublishTimeout
 
 import chaski
+from chaski import executor as command_executor
 from chaski.dataops import Command, Producer, commands, on_command
 from chaski.dataops.buffer import Buffer
 from chaski.failures import HandlerHealth
@@ -54,7 +55,7 @@ def _isolate_registry():
 
 @pytest.fixture
 def fast_answer_backoff(monkeypatch):
-    monkeypatch.setattr(commands, "ANSWER_BACKOFF_MAX_S", 0.2)
+    monkeypatch.setattr(command_executor, "ANSWER_BACKOFF_MAX_S", 0.2)
 
 
 class Operator(Producer):

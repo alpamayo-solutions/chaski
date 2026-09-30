@@ -19,6 +19,11 @@ The driver protocol is four ``async`` methods (:class:`Driver`):
   going, and reconnects.
 * ``close()`` — release the source.
 
+and one optional method:
+
+* ``write(target, value)`` — write one value to one tag. The default raises
+  :class:`WriteUnsupported`; a read-only driver leaves it alone.
+
 Ids, topics, payloads and timing are the base class's and the loop's; a
 driver never sees a tag id, a topic it has to build, or a Metric.
 
@@ -30,6 +35,20 @@ journals every metric before publication. It drains that bounded journal before
 acquiring again, and preserves it through restart. Queue saturation is visible
 backpressure, never eviction.
 
+**Signal writes.** The standard way to set a signal is a ``_CmdParam``
+command at the signal's own path (``<element path>/<signal>``), with
+``{"command": {"value": ...}}``. The connector that holds the signal's
+binding executes it: it announces a route per bound signal, writes through
+``Driver.write``, reads the tag back and answers only then. The ``_Ack``
+carries the result: ``200`` with ``result.outcome`` ``applied`` and the
+value read back; ``409`` ``failed`` when the value read back differs; ``502``
+``failed`` when the source refused the write; ``503`` ``failed`` when the
+source is not connected; ``504`` ``unknown`` when the write went out but the
+read-back failed; ``501`` ``unsupported`` when the driver cannot write;
+``422`` ``refused`` for a read-only tag or a command without a value; and,
+from the executor, ``498`` when the command expired before it ran. Who may
+write a signal is a colca ``cmd`` grant with the ``param`` class on its path.
+
 **Not included.** Metrics exposition: the loop reports to a
 :class:`Telemetry`, a no-op by default. Configuration from the
 environment: the process that builds a connector reads its own.
@@ -39,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import functools
 import json
 import logging
 import threading
@@ -56,6 +76,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from franzmq import Topic
 from franzmq.errors import PublishRejected, PublishTimeout
 
+from .executor import CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
 from .service import Service
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
@@ -68,10 +89,16 @@ HEARTBEAT_TAG_NAME = "heartbeat"
 IS_CONNECTED_TAG_SOURCE = "__is_connected__"
 IS_CONNECTED_TAG_NAME = "is_connected"
 
+#: The contract of a signal write, and the cursor its executor reads with.
+WRITE_CONTRACT = "_CmdParam"
+WRITE_CURSOR = "signal-writes"
+
 #: How long after a failed startup discovery the loop retries it. The retry
 #: is a full connect + discover, not just a reconnect: a browse-based driver
 #: that started while its source was still booting has no catalogue at all.
 DISCOVERY_RETRY_SECONDS = 15.0
+
+_MISSING = object()
 
 
 class SourceDisconnectedError(Exception):
@@ -79,6 +106,11 @@ class SourceDisconnectedError(Exception):
     source connection is lost. The loop publishes ``is_connected=False``,
     reconnects with backoff, and keeps trying on later polls. Don't swallow
     connection errors in the driver, or the flag stays True."""
+
+
+class WriteUnsupported(Exception):
+    """Raised by :meth:`Driver.write` when the driver cannot write (the
+    default). The write is answered ``501`` ``unsupported``."""
 
 
 class MqttDisconnectedError(Exception):
@@ -153,6 +185,14 @@ class Driver:
         """Release the source. Must tolerate being called on a half-open
         or already-closed connection."""
         raise NotImplementedError
+
+    async def write(self, target: Target, value: Any) -> None:
+        """Write ``value`` to the tag ``target`` names and return once the
+        source accepted it. The connector reads the tag back through
+        :meth:`read` before it answers. Raise :class:`SourceDisconnectedError`
+        when the source is gone and any other exception when the source
+        refused the write. The default raises :class:`WriteUnsupported`."""
+        raise WriteUnsupported(f"the {self.protocol} connector does not write to its source")
 
 
 class Telemetry:
@@ -319,6 +359,17 @@ class ConnectorService(Service):
         self._metric_queue = None
         self._http_backoff = Backoff()
         self._stopping = asyncio.Event()
+        self._loop_for_writes: asyncio.AbstractEventLoop | None = None
+        # Signal writes: one handler per bound signal, keyed by (contract,
+        # node-local path) and changed in place under the lock when bindings
+        # change; the executor reads it at every command. _user_commands are
+        # the routes announce_commands was given; the signal routes are added.
+        self._writes: dict[tuple[str, str], Callable[..., Any]] = {}
+        self._user_commands: list[tuple[str, str]] = list(self._announced_commands)
+        self._writes_announced: list[tuple[str, str]] = []
+        self._write_executor: CommandExecutor | None = None
+        # The driver sees one call at a time: a poll, or a write and its read-back.
+        self._source_lock = asyncio.Lock()
 
         self._source_reconnects_total = 0
         self._mqtt_reconnects_total = 0
@@ -333,7 +384,140 @@ class ConnectorService(Service):
 
     def _bindings_changed(self) -> None:
         self._update_targets()
+        self._update_writes()
         self.clock.changes.notify()
+
+    def _broker_state_changed_writes(self, connected: bool) -> None:
+        executor, loop = self._write_executor, self._loop_for_writes
+        if executor is not None and loop is not None:
+            loop.call_soon_threadsafe(executor.link_changed, connected)
+
+    def announce_commands(self, commands: Iterable[tuple[str, str]]) -> None:
+        """:meth:`chaski.Service.announce_commands`, keeping the routes of the
+        bound signals this connector writes."""
+        with self._lock:
+            self._user_commands = sorted(set(commands))
+            writes = list(self._writes)
+        super().announce_commands([*self._user_commands, *writes])
+
+    def _update_writes(self) -> None:
+        """Under the lock: a write handler per bound signal, synthetic tags
+        excepted."""
+        synthetic = self._synthetic_tag_ids()
+        writes: dict[tuple[str, str], Callable[..., Any]] = {}
+        for binding in self._bindings.values():
+            if binding.tag_id in synthetic:
+                continue
+            parsed = parse_topic(str(binding.topic))
+            if parsed is None:
+                continue
+            writes[(WRITE_CONTRACT, parsed[1])] = functools.partial(self._write_signal, binding.tag_id, parsed[1])
+        self._writes.clear()
+        self._writes.update(writes)
+
+    async def _announce_writes(self) -> None:
+        """Announce the signal routes when they changed; from the loop, since a
+        binding changes on the MQTT thread, which cannot wait for a PUBACK."""
+        with self._lock:
+            routes = sorted(self._writes)
+            if routes == self._writes_announced:
+                return
+            user = list(self._user_commands)
+        try:
+            await asyncio.to_thread(super().announce_commands, [*user, *routes])
+        except Exception as exc:
+            # Announced again on the next iteration; until then the node may
+            # answer writes to a new signal 404.
+            self._log.warning("signal write routes not announced yet: %s", exc)
+            return
+        self._writes_announced = routes
+
+    async def _write_signal(self, tag_id: str, path: str, command: Any) -> CommandResult:
+        """One signal write: write, read back, answer with what was read."""
+        if "value" not in command.params:
+            raise CommandRejected(422, "refused: the command carries no value", {"outcome": "refused"})
+        value = command.params["value"]
+        with self._lock:
+            binding = next((b for b in self._bindings.values() if b.tag_id == tag_id), None)
+            source = self._started_catalogue.source_for_tag(tag_id)
+            tag = self._started_catalogue.tag(source) if source is not None else None
+            handle = self._handles.get(tag_id)
+        if binding is None or tag is None:
+            raise CommandRejected(404, f"refused: {path} is no longer bound here", {"outcome": "refused"})
+        if not tag.is_writable:
+            raise CommandRejected(422, f"refused: tag {tag.name} is read-only", {"outcome": "refused"})
+        if handle is None:
+            raise CommandRejected(503, f"failed: tag {tag.name} is not available at the source", {"outcome": "failed"})
+        target = Target(binding.signal, handle, binding.topic)
+        async with self._source_lock:
+            try:
+                await self.driver.write(target, value)
+            except WriteUnsupported as exc:
+                raise CommandRejected(501, f"unsupported: {exc}", {"outcome": "unsupported"}) from exc
+            except SourceDisconnectedError as exc:
+                self._set_source_healthy(False)
+                raise CommandRejected(
+                    503, f"failed: the source is not connected: {exc}", {"outcome": "failed"}
+                ) from exc
+            except Exception as exc:
+                self._log.warning("write %s = %r refused by the source: %s", path, value, exc)
+                raise CommandRejected(
+                    502, f"failed: the source refused the write: {exc}"[:300], {"outcome": "failed"}
+                ) from exc
+            try:
+                readings = list(await self.driver.read([target]))
+            except Exception as exc:
+                raise CommandRejected(
+                    504,
+                    f"unknown: written, but reading it back failed: {exc}"[:300],
+                    {"outcome": "unknown", "requested": value},
+                ) from exc
+        read = next((r[1] for r in readings if str(r[0]) == str(target.topic)), _MISSING)
+        if read is _MISSING:
+            raise CommandRejected(
+                504,
+                "unknown: written, but the source returned no value on read-back",
+                {"outcome": "unknown", "requested": value},
+            )
+        if not is_equal(read, value, getattr(binding.signal, "precision", None)):
+            raise CommandRejected(
+                409,
+                f"failed: wrote {value!r}, read back {read!r}",
+                {"outcome": "failed", "requested": value, "value": read},
+            )
+        return CommandResult(f"applied: {path} = {read!r}", {"outcome": "applied", "value": read})
+
+    async def _serve_writes(self) -> None:
+        """Execute signal writes until the connector stops. The ledger is on
+        disk: a write started before a restart is answered ``504`` (outcome
+        unknown) after it, never written again."""
+        ledger = SqliteLedger(self._state_dir / "signal-writes.sqlite3")
+        executor = CommandExecutor(
+            self._require_http("signal writes"),
+            self.send,
+            self.stream("commands", cursor=WRITE_CURSOR, contracts=[WRITE_CONTRACT, "_Ack"]),
+            self._writes,
+            str(self._node_id),
+            contracts=[WRITE_CONTRACT],
+            ledger=ledger,
+        )
+        self._loop_for_writes = asyncio.get_running_loop()
+        self._write_executor = executor
+        if not self.is_broker_connected():
+            executor.link_changed(False)
+        stop = asyncio.Event()
+
+        async def stop_with_connector() -> None:
+            await self._stopping.wait()
+            stop.set()
+
+        watcher = asyncio.ensure_future(stop_with_connector())
+        try:
+            await executor.run_forever(stop)
+        finally:
+            watcher.cancel()
+            self._write_executor = None
+            ledger.close()
 
     def _seal_catalogue(self) -> None:
         """Discovery decides what is stale; a shutdown changes nothing."""
@@ -342,6 +526,7 @@ class ConnectorService(Service):
         self.telemetry.broker_healthy(connected)
         if connected:
             self._report_mqtt_recovered()
+        self._broker_state_changed_writes(connected)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -362,10 +547,18 @@ class ConnectorService(Service):
         # Service configures Paho's queue before connecting. Its limit is
         # the same as our pending buffer; Paho refuses changing it afterwards.
         self.telemetry.broker_healthy(True)
+        writes: asyncio.Task | None = None
         try:
             await self._startup_discovery()
+            writes = asyncio.ensure_future(self._serve_writes())
             await self._poll_forever()
         finally:
+            if writes is not None:
+                self._stopping.set()
+                try:
+                    await asyncio.wait_for(writes, timeout=10.0)
+                except Exception:
+                    self._log.exception("Signal-write executor did not shut down cleanly")
             await self._teardown()
 
     async def _startup_discovery(self) -> None:
@@ -497,6 +690,7 @@ class ConnectorService(Service):
                 await self._retry_discovery()
 
             self._publish_catalogue_if_due()
+            await self._announce_writes()
 
             with self._lock:
                 targets = list(self._targets)
@@ -522,7 +716,8 @@ class ConnectorService(Service):
                 if len(protocol_targets) + len(heartbeat_targets) > self.max_pending:
                     raise BufferError("max_pending cannot hold one complete acquisition cycle")
                 try:
-                    raw_batch = list(await self.driver.read(protocol_targets))
+                    async with self._source_lock:
+                        raw_batch = list(await self.driver.read(protocol_targets))
                     # The authoritative health signal: the protocol
                     # channel demonstrably answered. connect() succeeding
                     # is not — some clients background the TCP setup.

@@ -1390,6 +1390,30 @@ class Service:
             timeout = min(timeout, deadline - time.time())
         return self.send_command(contract, path, fields, lifetime=lifetime, node=node).wait(timeout)
 
+    def write_signal(
+        self,
+        path: str,
+        value: Any,
+        *,
+        lifetime: float | None,
+        node: str | None = None,
+        progress: bool = False,
+    ) -> SentCommand:
+        """Write ``value`` to the signal at ``path``: a ``_CmdParam`` at the
+        signal's own position, executed by the connector that holds its
+        binding (:mod:`chaski.connector`, "Signal writes"). Returns once the
+        node accepted it; ``.wait(timeout)`` returns the connector's answer,
+        sent after the value was written and read back: ``result.outcome`` is
+        ``applied`` (with ``result.value``), ``failed``, ``unknown``,
+        ``unsupported`` or ``refused``, and ``result_code`` ``498`` means it
+        expired before it ran. A wait that times out says nothing about the
+        write: it may still happen. Read the signal's current value then.
+        ``node``, ``path`` and ``lifetime`` are as in :meth:`send_command`;
+        give a write to a machine a short lifetime."""
+        return self.send_command(
+            "_CmdParam", path, {"command": {"value": value}}, lifetime=lifetime, node=node, progress=progress
+        )
+
     # -- consuming ---------------------------------------------------------
 
     def _require_http(self, method: str) -> Door:
