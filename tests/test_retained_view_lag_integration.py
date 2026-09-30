@@ -33,7 +33,9 @@ def test_other_contracts_on_the_stream_are_not_unread_for_the_view(tmp_path, fas
     if not os.environ.get("COLCAD_BINARY"):
         pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
     with chaski.Node("view-lag", data_dir=tmp_path / "node") as node, node.service("worker") as svc:
-        view = svc.retained_view(contracts=["_Signal"], streams=["entities"], cursor="view")
+        view = svc.retained_view(
+            contracts=["_Signal"], streams=["entities"], cursor="view", scope=chaski.ViewScope.whole_node()
+        )
         view.read()
 
         # A consumer of every entities record, drained to the head: the control.
@@ -72,7 +74,9 @@ def test_a_restarted_view_replaces_the_filter_the_node_remembers_for_its_cursor(
     with chaski.Node("view-restart", data_dir=tmp_path / "node") as node, node.service("worker") as svc:
         # An earlier consumer on the same cursor read every record.
         list(svc.stream("entities", cursor="view"))
-        view = svc.retained_view(contracts=["_Signal"], streams=["entities"], cursor="view")
+        view = svc.retained_view(
+            contracts=["_Signal"], streams=["entities"], cursor="view", scope=chaski.ViewScope.whole_node()
+        )
         view.read()
         control = svc.stream("entities", cursor="control")
         list(control)

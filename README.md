@@ -105,6 +105,31 @@ Pass the same topics as `svc.stream(..., topics=[...])`. A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
 `svc.cursor_lag` follows and a `DataOpsService` health door fails on.
 
+For current state, `svc.retained_view` keeps a snapshot of some contracts and
+follows their changes on the durable streams. Every view names the paths it
+reads:
+
+```python
+view = svc.retained_view(
+    contracts=["_SystemElement", "_Signal"],
+    streams=["entities"],
+    cursor="plant",
+    scope=chaski.ViewScope(["line1/press3", "line2"], depth=2),
+)
+for entry in view.read():          # local, no network I/O once loaded
+    print(entry.path, entry.payload["name"])
+```
+
+A prefix is a path in whole segments without the node id: `line1/press3`
+holds itself and everything below it, not `line1/press30`. `depth` keeps
+entries at most that many segments below a prefix. The snapshot reads `/kv`
+per prefix, and the drain fetches with the view's contracts and matching topic
+filters, so records outside the scope are never applied and never count as
+unread on the view's cursor. A scope whose prefixes, contracts and depth need
+more than the node's 1000 topic filters is refused when the view is created.
+There is no empty scope: `chaski.ViewScope.whole_node()` reads every path and
+has to be asked for.
+
 Run one process per service name on a node. A second process with the same
 name connects with the same MQTT client id; the broker hands the one session
 back and forth, and each process's unsubscribes remove the other's
@@ -120,7 +145,8 @@ for 60 s. chaski does not pick which process stops.
 - Use `RetainedView` for live current state and `Stream` for durable history.
   MQTT messages and watch hints wake consumers; they do not prove that every
   record was processed. Do not use retained state as an event history.
-- Read only the contracts and paths you need. Hydrate on startup, reconnect or
+- Read only the contracts and paths you need: give every retained view the
+  narrowest `ViewScope` it can use. Hydrate on startup, reconnect or
   explicit invalidation, then maintain the view from pushed changes. Avoid a
   separate `/kv` lookup per message or a recurring refresh timer.
 - Capture the wakeup generation before draining. Continue through filtered

@@ -28,6 +28,7 @@ from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
 from .failures import HandlerHealth, Reject
 from .node import Node
+from .retained_view import ViewScope
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
 from .topic_wakeup import TopicWakeup
 
@@ -61,6 +62,7 @@ __all__ = [
     "Target",
     "Telemetry",
     "TopicWakeup",
+    "ViewScope",
     "lifetime_refusal",
     "write_deadline",
 ]

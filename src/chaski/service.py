@@ -1401,12 +1401,23 @@ class Service:
         self._stream_watches.append(watch)
         return watch
 
-    def retained_view(self, *, contracts, streams, cursor, on_change=None):
-        """Rebuildable retained view, updated from durable stream notifications."""
+    def retained_view(self, *, contracts, streams, cursor, scope, on_change=None):
+        """Rebuildable retained view, updated from durable stream notifications.
+
+        ``scope`` is a :class:`chaski.ViewScope` naming the paths the view
+        reads: its snapshot, its stream drain and its unread count stay inside
+        them. ``ViewScope.whole_node()`` reads every path and has to be asked
+        for.
+        """
         from .retained_view import RetainedView
 
         view = RetainedView(
-            self._require_http("retained_view"), contracts, streams, self.cursor_prefix + cursor, on_change=on_change
+            self._require_http("retained_view"),
+            contracts,
+            streams,
+            self.cursor_prefix + cursor,
+            scope=scope,
+            on_change=on_change,
         ).start()
         self._retained_views.append(view)
         return view

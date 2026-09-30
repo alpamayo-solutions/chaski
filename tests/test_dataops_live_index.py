@@ -12,7 +12,7 @@ from chaski.dataops.buffer import Buffer
 from chaski.dataops.inputs import SignalRangeInput
 from chaski.dataops.outputs import AnnotationOutput, bind_annotation_outputs
 from chaski.door import Page
-from chaski.retained_view import RetainedView
+from chaski.retained_view import RetainedView, ViewScope
 
 SIGNAL = f"colca/v1/_Signal/{NODE_ID}"
 
@@ -35,7 +35,7 @@ class CountingDoor(FakeDoor):
         if payload is not None:
             self.entries.append(replace(kv_entry(topic, payload), offset=offset))
 
-    def kv(self, prefix="", *, contract=None):
+    def kv(self, prefix="", *, contract=None, depth=None):
         self.index_reads += 1
         entries = super().kv(prefix, contract=contract)
         if self.during_read:
@@ -43,7 +43,7 @@ class CountingDoor(FakeDoor):
             hook()
         return entries
 
-    def fetch(self, stream, cursor, *, max=1000, tail=False, contracts=None):
+    def fetch(self, stream, cursor, *, max=1000, tail=False, contracts=None, topics=None):
         rows = self.records[stream]
         if tail:
             return Page([], len(rows) + 1)
@@ -67,7 +67,9 @@ def door():
 
 
 def index_for(door):
-    return resolve.LiveIndex(RetainedView(door, resolve.INDEX_CONTRACTS, ("entities", "definitions"), "index"))
+    return resolve.LiveIndex(
+        RetainedView(door, resolve.INDEX_CONTRACTS, ("entities", "definitions"), "index", scope=ViewScope.whole_node())
+    )
 
 
 @pytest.fixture

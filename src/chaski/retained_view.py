@@ -3,13 +3,22 @@
 Capture stream positions before the snapshot; catch up from those positions
 before exposing it. Per-topic offsets reject records older than the snapshot.
 Tombstones are applied too. This view is rebuildable, not a delivery ledger.
-It fetches only its contracts, and fetches on every drain, so other records
-on the same stream never count as unread on its cursor.
+
+A view holds its contracts within one :class:`ViewScope`: the paths it reads.
+The snapshot reads only those paths, and the drain fetches only its contracts
+and paths, on every drain, so other records on the same stream never count as
+unread on its cursor. Records outside the scope are never applied.
 """
+
+from __future__ import annotations
 
 import copy
 import logging
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from colca_data_contracts.root import topic_prefix
 
 from ._wakeup import Wakeup
 from .door import KvEntry
@@ -18,15 +27,116 @@ from .stream_changes import BatchWait, StreamChanges
 
 log = logging.getLogger(__name__)
 
+# The node accepts at most this many topic filters on one fetch.
+MAX_TOPIC_FILTERS = 1000
+
+
+@dataclass(frozen=True, init=False)
+class ViewScope:
+    """The paths a retained view reads.
+
+    ``prefixes`` are hierarchy paths in whole segments, without the node id:
+    ``"line1/press3"`` holds ``line1/press3`` itself and everything below it,
+    not ``line1/press30``. ``depth`` keeps entries at most that many segments
+    below a prefix (``None``: no limit). There is no empty scope: a view of
+    every path on the node is :meth:`whole_node`, said explicitly.
+    """
+
+    prefixes: tuple[str, ...]
+    depth: int | None = None
+
+    def __init__(self, prefixes: Iterable[str], depth: int | None = None):
+        if isinstance(prefixes, str):
+            raise TypeError("ViewScope prefixes is a collection of paths, not one string")
+        normalized = tuple(dict.fromkeys(self._path(p) for p in prefixes))
+        if not normalized:
+            raise ValueError("ViewScope needs at least one prefix; use ViewScope.whole_node() for every path")
+        if depth is not None and (isinstance(depth, bool) or not isinstance(depth, int) or depth < 1):
+            raise ValueError("ViewScope depth must be a positive number of path segments")
+        object.__setattr__(self, "prefixes", normalized)
+        object.__setattr__(self, "depth", depth)
+
+    @staticmethod
+    def _path(prefix: str) -> str:
+        path = str(prefix).strip("/")
+        if not path and prefix != "":
+            raise ValueError(f"ViewScope prefix {prefix!r} names no path")
+        if not path:
+            raise ValueError("ViewScope prefix '' is every path; use ViewScope.whole_node()")
+        if any(not segment or segment in ("+", "#") for segment in path.split("/")):
+            raise ValueError(f"ViewScope prefix {prefix!r} must be whole path segments without wildcards")
+        return path
+
+    @classmethod
+    def whole_node(cls, depth: int | None = None) -> ViewScope:
+        """Every path on the node, to ``depth`` segments."""
+        scope = object.__new__(cls)
+        if depth is not None and (isinstance(depth, bool) or not isinstance(depth, int) or depth < 1):
+            raise ValueError("ViewScope depth must be a positive number of path segments")
+        object.__setattr__(scope, "prefixes", ("",))
+        object.__setattr__(scope, "depth", depth)
+        return scope
+
+    @property
+    def is_whole_node(self) -> bool:
+        return self.prefixes == ("",)
+
+    def contains(self, path: str) -> bool:
+        """Whether an entry at ``path`` (without the node id) is in scope."""
+        for prefix in self.prefixes:
+            if prefix == "":
+                below = path
+            elif path == prefix:
+                below = ""
+            elif path.startswith(prefix + "/"):
+                below = path[len(prefix) + 1 :]
+            else:
+                continue
+            if self.depth is None or (below.count("/") + 1 if below else 0) <= self.depth:
+                return True
+        return False
+
+    def topic_filters(self, contracts: Iterable[str]) -> list[str] | None:
+        """MQTT filters for this scope's records of ``contracts``, for a fetch.
+
+        ``None`` for the whole node without a depth: the contract filter is the
+        whole scope.
+        """
+        if self.is_whole_node and self.depth is None:
+            return None
+        filters = []
+        for contract in sorted(contracts):
+            for prefix in self.prefixes:
+                base = f"{topic_prefix()}{contract}/+" + (f"/{prefix}" if prefix else "")
+                if self.depth is None:
+                    filters.append(f"{base}/#")
+                    continue
+                filters.append(base)
+                filters.extend(base + "/+" * level for level in range(1, self.depth + 1))
+        if len(filters) > MAX_TOPIC_FILTERS:
+            raise ValueError(
+                f"this scope needs {len(filters)} topic filters, more than the node accepts "
+                f"({MAX_TOPIC_FILTERS}); use fewer prefixes, contracts or a smaller depth"
+            )
+        return filters
+
 
 class RetainedView:
-    def __init__(self, door, contracts, streams, cursor, on_change=None):
+    def __init__(self, door, contracts, streams, cursor, *, scope: ViewScope, on_change=None):
+        if not isinstance(scope, ViewScope):
+            raise TypeError("RetainedView needs a ViewScope; ViewScope.whole_node() reads every path")
         self.door, self.contracts = door, frozenset(contracts)
+        self.scope = scope
+        self.topics = scope.topic_filters(self.contracts)
+        # Only a narrower scope adds parameters to the door calls.
+        self._depth: dict[str, int] = {} if scope.depth is None else {"depth": scope.depth}
+        self._topics: dict[str, list[str]] = {} if self.topics is None else {"topics": self.topics}
         self.streams, self.cursor = tuple(streams), cursor
         self.lock, self.stop = threading.RLock(), threading.Event()
-        self.entries, self.offsets = {}, {}
-        self.positions = {}
-        self._stream_versions = {}
+        self.entries: dict[str, KvEntry] = {}
+        self.offsets: dict[str, int] = {}
+        self.positions: dict[str, int] = {}
+        self._stream_versions: dict[str, int] = {}
         self.initialized = False
         self.available = False
         self.revision = 0
@@ -42,7 +152,13 @@ class RetainedView:
 
     def _bootstrap(self):
         heads = {s: max(0, self.door.fetch(s, self.cursor, max=1, tail=True).next - 1) for s in self.streams}
-        entries = self.door.kv("", contract=self.contracts)
+        entries = [
+            e
+            for prefix in self.scope.prefixes
+            for e in self.door.kv(prefix, contract=sorted(self.contracts), **self._depth)
+            # /kv matches the prefix as a string; the scope is whole segments.
+            if self.scope.contains(e.path)
+        ]
         self.entries = {e.topic: e for e in entries}
         self.offsets = {e.topic: e.offset for e in entries}
         for stream, head in heads.items():
@@ -114,7 +230,9 @@ class RetainedView:
                     # tail read or an ack does not replace an earlier one.
                     head = self.door.fetch(stream, self.cursor, max=1, tail=True).next - 1
                     while not self.stop.is_set():
-                        page = self.door.fetch(stream, self.cursor, max=1000, contracts=sorted(self.contracts))
+                        page = self.door.fetch(
+                            stream, self.cursor, max=1000, contracts=sorted(self.contracts), **self._topics
+                        )
                         if page.gap is not None:
                             self.initialized = False
                             gap = True
@@ -122,6 +240,10 @@ class RetainedView:
                         for record in page.records:
                             parts = record.topic.split("/")
                             if len(parts) < 4 or parts[2] not in self.contracts:
+                                continue
+                            # A node older than colca 0.19 ignores the topic
+                            # filter; out-of-scope records are never applied.
+                            if not self.scope.contains("/".join(parts[4:])):
                                 continue
                             if record.offset <= self.offsets.get(record.topic, -1):
                                 continue
