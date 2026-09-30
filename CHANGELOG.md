@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/alpamayo-solutions/chaski/compare/v0.16.1...v0.17.0) (2026-09-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **command:** Service.command, CommandSender.command and Runtime.command require lifetime=. Pass the old timeout to keep the old expiry, or None for a command that waits for its node. chaski.lifetime_refusal and chaski.command.MAX_LIFETIME_S are removed.
+
+### Features
+
+* **command:** command a node below, choose the lifetime, wait separately ([#97](https://github.com/alpamayo-solutions/chaski/issues/97)) ([e9d647c](https://github.com/alpamayo-solutions/chaski/commit/e9d647c8a48fa301a5f0ee77c77e486ef74574b4))
+* **connector:** write a signal through the connector that binds it ([#99](https://github.com/alpamayo-solutions/chaski/issues/99)) ([b1a6f09](https://github.com/alpamayo-solutions/chaski/commit/b1a6f0921e717e2e5c74cb4cb9ac06d031efadf3))
+
 ## [0.16.1](https://github.com/alpamayo-solutions/chaski/compare/v0.16.0...v0.16.1) (2026-09-30)
 
 
