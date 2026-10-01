@@ -133,6 +133,9 @@ def test_a_consumer_rescoped_before_its_signals_exist_stops_and_restarts_on_them
         machine.publish("state", 7)
         _wait(lambda: any(r.path.endswith("/state") for r in view.kv("", contract="_Signal")))
         signal = next(r for r in view.kv("", contract="_Signal") if r.path.endswith("/state"))
+        # The metrics stream is not empty, so a drain of any scope ends at a head > 0.
+        probe = view.stream("metrics", cursor="probe", signal_ids=[signal.payload["id"]])
+        _wait(lambda: bool(probe.fetch().records))
 
         # The view does not know the signal yet: no topic, a scope nothing matches.
         wake = view.wake_on([])
