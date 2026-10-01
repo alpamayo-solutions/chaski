@@ -28,8 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
-          # colca v0.24.0: commands without expiry wait for offline child nodes (colca#129).
-          ref: e6668348b9bbc856413d1d1a794a6eccd52e9432
+          # colca v0.26.0: grants relative to the node a person signs in at.
+          ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Same broker revision as lint/contracts above.
-          ref: e6668348b9bbc856413d1d1a794a6eccd52e9432
+          ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
           path: colca
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
