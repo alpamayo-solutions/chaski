@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/alpamayo-solutions/chaski/compare/v0.17.1...v0.18.0) (2026-10-01)
+
+
+### Features
+
+* **retained-view:** expose applied stream positions for read-after-write ([#102](https://github.com/alpamayo-solutions/chaski/issues/102)) ([9e9f6da](https://github.com/alpamayo-solutions/chaski/commit/9e9f6dab429cb965632310b980cd8172c8a6924f))
+
 ## [0.17.1](https://github.com/alpamayo-solutions/chaski/compare/v0.17.0...v0.17.1) (2026-09-30)
 
 
