@@ -11,6 +11,10 @@ to any service.
 The payload is not read; the bell only says the scoped stream may have grown.
 New topics and a reconnect ring once, for what arrived while nothing listened.
 
+A topic may be an MQTT filter with ``+`` and ``#`` (``colca/v1/_Signal/+/Line/#``):
+the bell then rings for every message whose topic the filter matches, for a
+consumer that wakes when anything under its scope changes.
+
 Several wake-ups of one service may want the same topic. paho keeps one
 callback per topic, so they share one :class:`TopicFanout`: it subscribes a
 topic once, rings every wake-up that wants it, and unsubscribes it only when
@@ -22,6 +26,8 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterable
 from typing import Any
+
+from paho.mqtt.client import topic_matches_sub
 
 from .doorbell import Doorbell
 
@@ -59,11 +65,25 @@ class TopicFanout:
             self._client.unsubscribe(topic)
 
     def _on_message(self, _client: Any, _userdata: Any, message: Any) -> None:
+        # A message carries its concrete topic; the wake-ups are keyed by the
+        # filter they subscribed, which may hold ``+`` or ``#``.
         topic = str(getattr(message, "topic", ""))
         with self._lock:
-            holders = list(self._wanted.get(topic, ())) if topic else [w for s in self._wanted.values() for w in s]
+            if not topic:
+                holders = {w for s in self._wanted.values() for w in s}
+            else:
+                holders = {
+                    w
+                    for wanted, subscribed in self._wanted.items()
+                    if wanted == topic or (_is_filter(wanted) and topic_matches_sub(wanted, topic))
+                    for w in subscribed
+                }
         for wakeup in holders:
             wakeup.bell.ring()
+
+
+def _is_filter(topic: str) -> bool:
+    return "+" in topic or "#" in topic
 
 
 class TopicWakeup:

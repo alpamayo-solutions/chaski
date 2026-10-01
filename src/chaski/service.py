@@ -1708,6 +1708,10 @@ class Service:
     def wake_on(self, topics=()) -> TopicWakeup:
         """A push wake-up on exactly ``topics``, for :meth:`consume`'s ``bell``.
 
+        A topic may be an MQTT filter (``+``, ``#``): the bell rings for every
+        message under it, e.g. ``colca/v1/_Signal/+/Line/#`` for a consumer
+        that follows anything added below ``Line``.
+
         A consumer that reads a few signals of a busy node drains a scoped
         stream (``stream(..., signal_ids=...)``) and passes
         ``wake_on(<their _Metric topics>).bell``: it wakes when one of them

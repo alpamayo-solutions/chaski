@@ -88,3 +88,34 @@ def test_closing_one_wakeup_keeps_the_others_subscription():
     assert second.bell.generation > seen
     second.close()
     assert client.subscribed == {} and client.callbacks == {}
+
+
+class Message:
+    def __init__(self, topic):
+        self.topic = topic
+
+
+def test_a_wildcard_filter_rings_for_every_topic_it_matches():
+    # The fanout looked the message's concrete topic up among the subscribed
+    # filters; a filter with + or # never matched and never rang.
+    client, fanout = _hub_client()
+    scope = "prekit/v1/_Signal/+/Hygentile/#"
+    wake, other = TopicWakeup(fanout, [scope]), TopicWakeup(fanout, [A])
+    assert client.subscribed == {scope: 1, A: 1}
+    for topic in ("prekit/v1/_Signal/edge-2/Hygentile/M2/state", "prekit/v1/_Signal/hub/Hygentile"):
+        seen, quiet = wake.bell.generation, other.bell.generation
+        client.callbacks[scope](client, None, Message(topic))
+        assert wake.bell.generation > seen, topic
+        assert other.bell.generation == quiet, topic
+
+
+def test_a_wildcard_filter_does_not_ring_for_a_topic_outside_it():
+    client, fanout = _hub_client()
+    scope, plus = "prekit/v1/_Signal/+/Hygentile/#", "prekit/v1/_Metric/+/M/state"
+    wake = TopicWakeup(fanout, [scope, plus])
+    seen = wake.bell.generation
+    for topic in ("prekit/v1/_Signal/edge-2/Other/M2/state", "prekit/v1/_Metric/N/M/sub/state"):
+        client.callbacks[scope](client, None, Message(topic))
+    assert wake.bell.generation == seen
+    client.callbacks[plus](client, None, Message("prekit/v1/_Metric/N/M/state"))
+    assert wake.bell.generation > seen

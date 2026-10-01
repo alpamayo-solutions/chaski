@@ -405,7 +405,7 @@ async def test_an_input_commissioned_later_is_followed_over_mqtt_without_reading
         (signal,) = door.uncommissioned
         from dataclasses import replace
 
-        door.entries.append(replace(signal, offset=max(e.offset for e in door.entries) + 1))
+        door.entries.append(replace(signal, offset=max((e.offset for e in door.entries), default=0) + 1))
         client.deliver_retained(signal.topic, SignalRecord(id="sig-in", name="temperature"))
         with door.changed:
             door.change_version += 1
