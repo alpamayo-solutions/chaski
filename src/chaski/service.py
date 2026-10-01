@@ -1379,6 +1379,7 @@ class Service:
             progress=progress,
             operation_id=operation_id,
             on_behalf_of=on_behalf_of,
+            expires_by=deadline,
         )
 
     def command(
