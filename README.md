@@ -169,6 +169,32 @@ more than the node's 1000 topic filters is refused when the view is created.
 There is no empty scope: `chaski.ViewScope.whole_node()` reads every path and
 has to be asked for.
 
+#### Read after write
+
+A screen that re-reads when a record's topic fires on MQTT can reach the view
+before the view applied that record. Capture the stream heads when the read
+arrives and wait until the view applied through them:
+
+```python
+heads = view.heads()               # {"entities": 4711}: one tail read, moves nothing
+if not view.wait_caught_up(heads, timeout=2):
+    log.info("answering from position %s", view.position("entities"))
+rows = view.read()                 # holds every record up to the heads
+```
+
+`view.position(stream)` is the last offset the view applied and acknowledged
+(local, no network I/O; the stream may be omitted for a single-stream view).
+`view.wait_caught_up(heads, timeout)` takes a `{stream: offset}` mapping, one
+offset for a single-stream view, or nothing to capture `view.heads()` itself.
+It waits on the view's own drain, which runs on stream-change hints, and
+returns `False` when the timeout passed first or the view was closed.
+
+A stream that `svc.consume` (or `follow`/`drain`) works through offers the
+same: `stream.position` is the last offset its cursor passed in this process,
+moved by every acknowledgement and set to the head when a drain finds the
+cursor already there, and `stream.wait_caught_up(stream.head(), timeout=2)`
+waits for the consumer to get there.
+
 Run one process per service name on a node. A second process with the same
 name connects with the same MQTT client id; the broker hands the one session
 back and forth, and each process's unsubscribes remove the other's

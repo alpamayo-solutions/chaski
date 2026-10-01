@@ -6,6 +6,7 @@ keeps cursor positions like colcad: ``/fetch`` reads from the position and only
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import ClassVar
@@ -412,3 +413,49 @@ def test_cancel_mid_page_preserves_it_for_replay(tmp_path, monkeypatch, fake_doo
     assert seen == [1]
     assert door.acks() == []
     assert [r.offset for r in stream.drain()] == [1, 2]
+
+
+# -- read after write: position and wait_caught_up ------------------------------
+
+
+def test_position_follows_the_acks_of_a_drain(tmp_path, monkeypatch, fake_door):
+    svc = _local_service(tmp_path, monkeypatch)
+    (door,) = fake_door.instances
+    door.streams["annotations"] = [_record(n) for n in range(1, 6)]
+    stream = svc.stream("annotations", max=2)
+    assert stream.position == 0
+    positions = [stream.position for _ in stream]
+    assert positions == [0, 0, 2, 2, 4], "a page counts once it is acknowledged"
+    assert stream.position == 5
+
+
+def test_a_cursor_found_at_the_head_reports_the_head(tmp_path, monkeypatch, fake_door):
+    """A restarted consumer whose cursor already stands at the head acks
+    nothing, yet it holds everything up to the head."""
+    svc = _local_service(tmp_path, monkeypatch)
+    (door,) = fake_door.instances
+    door.streams["annotations"] = [_record(n) for n in range(1, 4)]
+    door.cursors[("annotations", "c/erp-bridge/annotations")] = 3
+    stream = svc.stream("annotations")
+    assert list(stream) == []
+    assert door.acks() == []
+    assert stream.position == 3
+    assert stream.wait_caught_up(stream.head(), timeout=0) is True
+
+
+def test_wait_caught_up_wakes_on_the_consumers_ack(tmp_path, monkeypatch, fake_door):
+    svc = _local_service(tmp_path, monkeypatch)
+    (door,) = fake_door.instances
+    door.streams["annotations"] = [_record(1)]
+    stream = svc.stream("annotations")
+    list(stream)
+    door.streams["annotations"].append(_record(2))
+    head = stream.head()
+    assert stream.wait_caught_up(head, timeout=0) is False
+
+    result: list[bool] = []
+    waiter = threading.Thread(target=lambda: result.append(stream.wait_caught_up(head, timeout=10)))
+    waiter.start()
+    list(stream)
+    waiter.join(timeout=10)
+    assert result == [True]
