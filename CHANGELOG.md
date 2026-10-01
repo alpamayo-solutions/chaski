@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.1](https://github.com/alpamayo-solutions/chaski/compare/v0.19.0...v0.19.1) (2026-10-01)
+
+
+### Fixes
+
+* **consume:** end a consumer's wait when stop is set, without a ring ([#107](https://github.com/alpamayo-solutions/chaski/issues/107)) ([f544b92](https://github.com/alpamayo-solutions/chaski/commit/f544b9211ebbd1474d80b0a6363413ede7f7f02e))
+* **wakeup:** ring wake_on filters with + and # for every matching topic ([#106](https://github.com/alpamayo-solutions/chaski/issues/106)) ([ceef5cf](https://github.com/alpamayo-solutions/chaski/commit/ceef5cfdba66c3dd4a65854cd998f8b711694441))
+
 ## [0.19.0](https://github.com/alpamayo-solutions/chaski/compare/v0.18.0...v0.19.0) (2026-10-01)
 
 
