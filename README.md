@@ -262,20 +262,30 @@ ConnectorService("oven-connector", mount="site1/ovens", driver=MyDriver()).run()
 The standard way to set a signal is a `_CmdParam` command at the signal's own
 path with `{"command": {"value": ...}}`. The connector that holds the signal's
 binding executes it; no custom verb is needed. It announces a route for every
-bound signal, writes through its driver's `write(target, value)`, reads the tag
-back, and only then answers. A driver that does not implement `write` answers
-`501` `unsupported`.
+bound signal, writes through its driver's `write(target, value, command)`, reads
+the tag back, and only then answers. A driver that does not implement `write`
+answers `501` `unsupported`.
 
 ```python
 class MyDriver(Driver):
-    async def write(self, target, value):
+    async def write(self, target, value, command):
         await self.client.write(target.handle, value)   # raise if the source refuses
 ```
+
+`command` is the write being executed (`chaski.executor.Command`):
+`command.sender` is the sender the node attested, `command.on_behalf_of` the
+person it says it acts for, `command.operation_id` its idempotency key,
+`command.expires_at` its deadline (unix ms) and `command.params` every field
+the sender put beside `value`.
 
 A sender needs a `cmd` grant with the `param` class on the signal's path:
 
 ```python
-sent = svc.write_signal("line1/press3/setpoint", 12.5, lifetime=10)   # short: it moves a machine
+sent = svc.write_signal(
+    "line1/press3/setpoint", 12.5, lifetime=10,    # short: it moves a machine
+    operation_id=request_id,                       # the same id when retrying this write
+    on_behalf_of={"id": user.sub, "label": user.username},
+)
 try:
     answer = sent.wait(timeout=15)
 except TimeoutError:
@@ -292,8 +302,52 @@ The answer is the result, not an acknowledgement of receipt:
 | 503 | `failed` | the source is not connected, or the tag is not available there |
 | 504 | `unknown` | written, but reading it back failed |
 | 501 | `unsupported` | the driver cannot write |
-| 422 | `refused` | the tag is read-only, or the command carries no value |
+| 422 | `refused` | the tag is read-only, the command carries no value, or a malformed `operation_id`/`on_behalf_of` |
+| 409 | `refused` | the `operation_id` was already used for a different write |
+| 403 | `refused` | a person sent a write on behalf of someone else |
 | 498 | | the command expired before it ran; nothing was written |
+
+The `_Ack` repeats `operation_id` and `on_behalf_of` when the write carried
+them.
+
+**Once per operation.** A write sent with an `operation_id` is recorded on
+disk under the attested sender and that id before the driver runs. A repeat
+(an HTTP request retried by a browser, a resend after a timeout) gets a new
+`correlation_id` but the same `operation_id`; it is answered with the recorded
+outcome and `"replayed": true`, and the source is not written again. A repeat
+of a write that was started and never answered (the connector restarted
+mid-write) is answered `504`. A repeat gets whatever the first execution
+answered, a failure included; a new attempt after a failure takes a new
+`operation_id`. A write that expired (`498`) was not executed and is not
+recorded. The record is kept seven days. Every command
+executor does this, `@on_command` handlers included.
+
+**Who.** The node attests the sender: it authenticated the session and stamps
+that identity on the stored command, and the executor reads it from there.
+`on_behalf_of` is not attested by the node. It is the sender's claim, exactly
+as trustworthy as the sender, so grant `cmd` only to services that
+authenticate the people they act for, and show it as "anna via hmi-api". A
+person cannot send a command on behalf of someone else (`403`).
+
+**Taking over a write.** `ConnectorService.handle_signal_write(write)` runs
+every write once the connector checked the binding and the tag; its default
+is `await write.apply()`. Override it to check the sender, to write a value
+derived from the command (a recipe of several values on one signal), or to
+add to the answer:
+
+```python
+class PressConnector(ConnectorService):
+    async def handle_signal_write(self, write):
+        if write.command.sender.label != "hmi-api":
+            raise CommandRejected(403, "refused: only the HMI writes this machine", {"outcome": "refused"})
+        values = write.command.params.get("values")   # sent with write_signal(..., params={"values": ...})
+        journal_id = self.journal.start(write.command)  # who, for whom, which operation
+        try:
+            answer = await write.apply(value=encode_recipe(values))
+        except CommandRejected as rejected:
+            raise CommandRejected(rejected.code, rejected.message, {**rejected.result, "journal": journal_id}) from None
+        return CommandResult(answer.message, {**answer.result, "journal": journal_id})
+```
 
 A write for a signal on another node takes `node=` and the path as the
 sender's node sees it, like any command, and waits there while that node is

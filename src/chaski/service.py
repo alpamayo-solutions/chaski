@@ -59,7 +59,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -93,7 +93,7 @@ from franzmq import Client, Topic
 from ._wakeup import Wakeup
 from .catalogue import Catalogue, element_for
 from .clock import Clock, ClockNotReady
-from .command import CommandSender, SentCommand
+from .command import Actor, CommandSender, SentCommand
 from .coordination import StepGate
 from .door import Door, KvEntry, Record, Stream
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
@@ -1347,6 +1347,8 @@ class Service:
         lifetime: float | None,
         node: str | None = None,
         progress: bool = False,
+        operation_id: str | None = None,
+        on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
     ) -> SentCommand:
         """Send one command and return once the node accepted it (stored and
         queued); :meth:`SentCommand.wait` waits for its outcome. ``node`` is
@@ -1354,9 +1356,13 @@ class Service:
         is in this node's coordinates, a child's mount included. ``lifetime``
         is seconds until it expires, or ``None`` for a command that never
         expires and is delivered whenever its node is reachable. See
-        :class:`chaski.command.CommandSender`. Under :func:`writes_until` the
-        command expires by the deadline at the latest; past it or while the
-        link is down it is not sent and raises :class:`NotSent`."""
+        :class:`chaski.command.CommandSender`, which also describes
+        ``operation_id`` (an idempotency key the executor answers repeats of
+        from its record) and ``on_behalf_of`` (the person this service acts
+        for; asserted by this service, not attested by the node). Under
+        :func:`writes_until` the command expires by the deadline at the
+        latest; past it or while the link is down it is not sent and raises
+        :class:`NotSent`."""
         self._writable("command", f"{contract} {path}")
         deadline = _write_deadline.get()
         if deadline is not None:
@@ -1365,7 +1371,14 @@ class Service:
                 raise NotSent(f"{contract} {path}: not sent, its deadline had passed")
             lifetime = left if lifetime is None else min(lifetime, left)
         return cast(CommandSender, self._command_sender).send(
-            contract, path, fields, lifetime=lifetime, node=node, progress=progress
+            contract,
+            path,
+            fields,
+            lifetime=lifetime,
+            node=node,
+            progress=progress,
+            operation_id=operation_id,
+            on_behalf_of=on_behalf_of,
         )
 
     def command(
@@ -1377,6 +1390,8 @@ class Service:
         lifetime: float | None,
         node: str | None = None,
         timeout: float = 30.0,
+        operation_id: str | None = None,
+        on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
     ) -> dict[str, Any]:
         """Send one command and return its outcome, the ``_Ack`` as the
         executor wrote it (``result_code``, ``message``, and whatever else it
@@ -1388,7 +1403,9 @@ class Service:
         deadline = _write_deadline.get()
         if deadline is not None:
             timeout = min(timeout, deadline - time.time())
-        return self.send_command(contract, path, fields, lifetime=lifetime, node=node).wait(timeout)
+        return self.send_command(
+            contract, path, fields, lifetime=lifetime, node=node, operation_id=operation_id, on_behalf_of=on_behalf_of
+        ).wait(timeout)
 
     def write_signal(
         self,
@@ -1398,6 +1415,9 @@ class Service:
         lifetime: float | None,
         node: str | None = None,
         progress: bool = False,
+        operation_id: str | None = None,
+        on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> SentCommand:
         """Write ``value`` to the signal at ``path``: a ``_CmdParam`` at the
         signal's own position, executed by the connector that holds its
@@ -1409,9 +1429,26 @@ class Service:
         expired before it ran. A wait that times out says nothing about the
         write: it may still happen. Read the signal's current value then.
         ``node``, ``path`` and ``lifetime`` are as in :meth:`send_command`;
-        give a write to a machine a short lifetime."""
+        give a write to a machine a short lifetime.
+
+        ``operation_id`` makes the write idempotent: send the same id when
+        retrying the same write and the connector answers the repeat from its
+        record (``"replayed": true``) without writing the source again.
+        ``on_behalf_of`` names the person this service writes for; the
+        connector hands both, with the attested sender, to the driver
+        (``Driver.write``'s ``command``) and the ``_Ack`` carries them.
+        ``params`` are further ``command`` fields beside ``value`` for a
+        connector that takes them (:meth:`chaski.ConnectorService.handle_signal_write`)."""
+        command = {**(params or {}), "value": value}
         return self.send_command(
-            "_CmdParam", path, {"command": {"value": value}}, lifetime=lifetime, node=node, progress=progress
+            "_CmdParam",
+            path,
+            {"command": command},
+            lifetime=lifetime,
+            node=node,
+            progress=progress,
+            operation_id=operation_id,
+            on_behalf_of=on_behalf_of,
         )
 
     # -- consuming ---------------------------------------------------------

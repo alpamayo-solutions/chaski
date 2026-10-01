@@ -10,12 +10,24 @@ running again. :mod:`chaski.dataops.commands` documents the answer codes.
 A handler returns a message string, or a :class:`CommandResult` whose
 ``result`` mapping is carried in the ``_Ack`` as ``result``;
 :class:`CommandRejected` answers its own code (and optional ``result``).
+
+**Operations.** A command that carries an ``operation_id``
+(:mod:`chaski.command`, "Who and which operation") is also recorded in the
+ledger under ``(attested sender, operation_id)`` before its handler runs, and
+its outcome after. A later command with the same key is not executed: it is
+answered with the recorded outcome and ``"replayed": true``, or ``504`` when
+the first one was started and never answered (the service stopped mid-way),
+or ``409`` when its contract, path, ``command`` or ``on_behalf_of`` differ
+from the recorded one. The ledger keeps entries for its retention (a
+:class:`SqliteLedger` seven days), which is how long a repeat is recognised.
+An ``_Ack`` repeats the command's ``operation_id`` and ``on_behalf_of``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -32,7 +44,7 @@ import httpx
 from colca_data_contracts import topic_prefix
 from franzmq.errors import PublishTimeout
 
-from chaski.command import is_progress
+from chaski.command import Actor, EnvelopeError, check_operation_id, is_progress
 from chaski.door import Page, Record, Stream, StreamGapError
 from chaski.service import NotSent, writes_until
 
@@ -41,6 +53,9 @@ log = logging.getLogger("chaski.executor")
 STREAM = "commands"
 CURSOR = "commands"
 ACK_OK = 200
+ACK_FORBIDDEN = 403
+ACK_CONFLICT = 409
+ACK_INVALID = 422
 ACK_EXPIRED = 498
 ACK_FAILED = 500
 ACK_BUSY = 503
@@ -148,8 +163,11 @@ class _Stopping(Exception):
 
 @dataclass(frozen=True)
 class Command:
-    """One command as a handler sees it. The actor fields are the node's
-    attestation from the stored record, never the payload's."""
+    """One command as a handler sees it. The ``actor_*`` fields are the node's
+    attestation of the sender from the stored record, never the payload's.
+    ``on_behalf_of`` is the person the sender says it acts for, asserted by
+    that sender (:mod:`chaski.command`); ``operation_id`` its idempotency key,
+    ``""`` when it sent none. ``expires_at`` is unix milliseconds."""
 
     path: str
     verb: str
@@ -162,6 +180,13 @@ class Command:
     actor_kind: str = ""
     ts: float = 0.0
     offset: int = 0
+    operation_id: str = ""
+    on_behalf_of: Actor | None = None
+
+    @property
+    def sender(self) -> Actor:
+        """The attested sender."""
+        return Actor(self.actor_id, self.actor_label, self.actor_kind)
 
 
 class CommandRejected(Exception):
@@ -408,6 +433,20 @@ class CommandExecutor:
         contract, path = parsed
         payload = record.payload if isinstance(record.payload, dict) else {}
         params = payload.get("command")
+        envelope_error: tuple[int, str] | None = None
+        operation_id = ""
+        on_behalf_of: Actor | None = None
+        try:
+            if payload.get("operation_id") is not None:
+                operation_id = check_operation_id(payload["operation_id"])
+            if payload.get("on_behalf_of") is not None:
+                if not isinstance(payload["on_behalf_of"], dict):
+                    raise EnvelopeError("on_behalf_of must be an object with an id")
+                on_behalf_of = Actor.coerce(payload["on_behalf_of"])
+        except EnvelopeError as exc:
+            envelope_error = (ACK_INVALID, f"refused: {exc}")
+        if on_behalf_of is not None and record.actor_kind == "human" and on_behalf_of.id != record.actor_id:
+            envelope_error = (ACK_FORBIDDEN, "refused: a person cannot send a command on behalf of someone else")
         command = Command(
             path=path,
             verb=path.rsplit("/", 1)[-1],
@@ -420,6 +459,8 @@ class CommandExecutor:
             actor_kind=record.actor_kind,
             ts=record.ts,
             offset=record.offset,
+            operation_id=operation_id,
+            on_behalf_of=on_behalf_of,
         )
         correlation_id = command.correlation_id
         who = command.actor_label or command.actor_id or "?"
@@ -443,24 +484,113 @@ class CommandExecutor:
                 return
 
         result: Mapping[str, Any] | None = None
-        if expired(payload.get("expires_at"), time.time() * 1000.0):
+        replayed = False
+        operation_key = self._operation_key(command) if not envelope_error else None
+        digest = self._operation_digest(command)
+        recorded_operation = (
+            await asyncio.to_thread(self._ledger.command_entry, operation_key) if operation_key else (False, None)
+        )
+        if envelope_error is not None:
+            code, message = envelope_error
+            result = {"outcome": "refused"}
+        elif recorded_operation[0]:
+            code, message, result, replayed = await self._replay(operation_key, digest, recorded_operation[1])
+        elif expired(payload.get("expires_at"), time.time() * 1000.0):
             code, message = ACK_EXPIRED, "expired before it was executed"
         elif not await self._link_before(command.expires_at):
             code, message = ACK_EXPIRED, "expired while the broker link was down; not executed"
         else:
             if correlation_id:
                 await asyncio.to_thread(self._ledger.command_started, correlation_id)
+            if operation_key:
+                await asyncio.to_thread(self._ledger.command_started, operation_key)
             code, message, result = await self._run(handler, command)
-        log.info("command %s %s by %s -> %d %s", contract, path, who, code, message)
+            if operation_key:
+                await asyncio.to_thread(
+                    self._ledger.command_answered, operation_key, self._operation_record(digest, code, message, result)
+                )
+        log.info(
+            "command %s %s by %s%s -> %d %s%s",
+            contract,
+            path,
+            who,
+            f" for {command.on_behalf_of.label or command.on_behalf_of.id}" if command.on_behalf_of else "",
+            code,
+            message,
+            " (replayed)" if replayed else "",
+        )
         if not correlation_id:
             log.warning("command %s %s has no correlation_id — not answered", contract, path)
             return
-        answer = self._answer_body(correlation_id, code, message, result)
+        answer = self._answer_body(correlation_id, code, message, result, command=command, replayed=replayed)
         await asyncio.to_thread(self._ledger.command_answered, correlation_id, answer)
         await self._publish_answer(self.ack_topic(path), correlation_id, answer)
 
+    # -- operations -------------------------------------------------------------
+
     @staticmethod
-    def _answer_body(correlation_id: str, code: int, message: str, result: Mapping[str, Any] | None = None) -> str:
+    def _operation_key(command: Command) -> str | None:
+        """The ledger key of a command's operation: its id, scoped to the
+        attested sender, so one sender cannot replay or block another's."""
+        if not command.operation_id:
+            return None
+        return "op\x1f" + json.dumps([command.actor_id, command.operation_id])
+
+    @staticmethod
+    def _operation_digest(command: Command) -> str:
+        """What a repeat of the operation must match: everything it asks for,
+        not when it expires or how it is correlated."""
+        material = {
+            "contract": command.contract,
+            "path": command.path,
+            "command": command.params,
+            "on_behalf_of": command.on_behalf_of.envelope() if command.on_behalf_of else None,
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
+
+    @staticmethod
+    def _operation_record(digest: str, code: int, message: str, result: Mapping[str, Any] | None) -> str:
+        return json.dumps(
+            {"digest": digest, "result_code": code, "message": message, "result": dict(result) if result else None}
+        )
+
+    async def _replay(
+        self, operation_key: str | None, digest: str, recorded: str | None
+    ) -> tuple[int, str, Mapping[str, Any] | None, bool]:
+        """The answer to a repeated operation, from what the ledger holds."""
+        if recorded is None:
+            # Started and never answered: the service stopped while executing
+            # it. Recorded, so every further repeat gets the same answer.
+            message = "outcome unknown: the service stopped while executing this operation; it may have taken effect"
+            if operation_key:
+                await asyncio.to_thread(
+                    self._ledger.command_answered,
+                    operation_key,
+                    self._operation_record(digest, ACK_UNKNOWN, message, None),
+                )
+            return ACK_UNKNOWN, message, None, True
+        entry = json.loads(recorded)
+        if entry.get("digest") != digest:
+            return (
+                ACK_CONFLICT,
+                "refused: this operation_id was already used for a different command; not executed",
+                # A connector's 409 is also a write read back different; the
+                # outcome tells the two apart.
+                {"outcome": "refused"},
+                False,
+            )
+        return int(entry["result_code"]), str(entry.get("message") or ""), entry.get("result"), True
+
+    @staticmethod
+    def _answer_body(
+        correlation_id: str,
+        code: int,
+        message: str,
+        result: Mapping[str, Any] | None = None,
+        *,
+        command: Command | None = None,
+        replayed: bool = False,
+    ) -> str:
         body: dict[str, Any] = {
             "correlation_id": correlation_id,
             "result_code": code,
@@ -469,6 +599,12 @@ class CommandExecutor:
         }
         if result:
             body["result"] = dict(result)
+        if command is not None and command.operation_id:
+            body["operation_id"] = command.operation_id
+        if command is not None and command.on_behalf_of is not None:
+            body["on_behalf_of"] = command.on_behalf_of.envelope()
+        if replayed:
+            body["replayed"] = True
         return json.dumps(body)
 
     async def _publish_answer(self, topic: str, correlation_id: str, answer: str) -> None:

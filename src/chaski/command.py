@@ -29,6 +29,35 @@ leaves the command queued; it is not cancelled. A sender that must learn an
 outcome that may come days later reads the ``_Ack`` records from its node's
 ``commands`` stream with a cursor of its own, by correlation id
 (:func:`is_progress` tells progress from outcome).
+
+**Who and which operation.** Two optional envelope fields sit beside
+``correlation_id`` and ``expires_at``:
+
+* ``operation_id`` — the sender's idempotency key for one logical operation,
+  kept the same when the sender retries it (an HTTP request repeated by a
+  browser, a resend after a timeout). The executor records the outcome under
+  ``(attested sender, operation_id)``; a repeat is answered with that recorded
+  outcome and ``"replayed": true``, and is never executed twice. A repeat
+  whose contract, path, ``command`` or ``on_behalf_of`` differ is answered
+  ``409``. Whatever the first execution answered is what a repeat gets, a
+  failure included: a new attempt after a failure is a new operation with a
+  new id. A command that expired, or was refused for its envelope, was not
+  executed and is not recorded. Each send still gets its own
+  ``correlation_id``. At most
+  :data:`OPERATION_ID_MAX` characters, no ``/`` and no control characters.
+* ``on_behalf_of`` — the person (or system) the sender acts for, as
+  ``{"id": ..., "label": ..., "kind": ...}`` (:class:`Actor`). ``kind``
+  defaults to ``human``.
+
+Trust: the node attests the sender. It authenticated the session that
+published the command and stamps that identity on the stored record; the
+executor reads the sender from there, never from the payload. ``on_behalf_of``
+is not attested by the node: it is the sender's claim, and it is exactly as
+trustworthy as the sender that made it. Grant the command class only to
+services that authenticate the people they act for. A reader shows it as
+"<on_behalf_of> via <sender>", never as the sender. A person (a sender of kind
+``human``) cannot act on behalf of anyone else: the executor refuses that
+``403``.
 """
 
 from __future__ import annotations
@@ -43,6 +72,78 @@ from typing import Any
 
 import ulid as ulid_lib
 from colca_data_contracts import topic_prefix
+
+#: The longest ``operation_id`` a command may carry.
+OPERATION_ID_MAX = 128
+#: The longest ``on_behalf_of`` id or label.
+ACTOR_FIELD_MAX = 255
+#: The ``on_behalf_of`` kinds a sender may assert.
+ACTOR_KINDS = frozenset({"human", "service", "system"})
+
+
+class EnvelopeError(ValueError):
+    """An ``operation_id`` or ``on_behalf_of`` a command must not carry."""
+
+
+@dataclass(frozen=True)
+class Actor:
+    """Someone a command names: the attested sender (``Command.sender``) or
+    the person it acts for (``Command.on_behalf_of``)."""
+
+    id: str
+    label: str = ""
+    kind: str = "human"
+
+    def envelope(self) -> dict[str, str]:
+        """The ``on_behalf_of`` object on the wire."""
+        body = {"id": self.id, "kind": self.kind}
+        if self.label:
+            body["label"] = self.label
+        return body
+
+    @classmethod
+    def coerce(cls, value: Actor | Mapping[str, Any] | str) -> Actor:
+        """An :class:`Actor` from an id, a wire object or an Actor, validated.
+        Raises :class:`EnvelopeError`."""
+        if isinstance(value, Actor):
+            actor = value
+        elif isinstance(value, str):
+            actor = cls(value)
+        elif isinstance(value, Mapping):
+            unknown = set(value) - {"id", "label", "kind"}
+            if unknown:
+                raise EnvelopeError(f"on_behalf_of: unknown field(s) {sorted(unknown)}")
+            fields = {key: value[key] for key in ("id", "label", "kind") if value.get(key) is not None}
+            if not all(isinstance(item, str) for item in fields.values()):
+                raise EnvelopeError("on_behalf_of: id, label and kind are strings")
+            actor = cls(**fields) if "id" in fields else cls("")
+        else:
+            raise EnvelopeError("on_behalf_of must be an object with an id")
+        if not actor.id.strip():
+            raise EnvelopeError("on_behalf_of needs an id")
+        if len(actor.id) > ACTOR_FIELD_MAX or len(actor.label) > ACTOR_FIELD_MAX:
+            raise EnvelopeError(f"on_behalf_of: id and label are at most {ACTOR_FIELD_MAX} characters")
+        if actor.kind not in ACTOR_KINDS:
+            raise EnvelopeError(f"on_behalf_of: kind must be one of {sorted(ACTOR_KINDS)}")
+        if _has_control(actor.id) or _has_control(actor.label):
+            raise EnvelopeError("on_behalf_of: control characters are not allowed")
+        return actor
+
+
+def _has_control(text: str) -> bool:
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+
+
+def check_operation_id(value: Any) -> str:
+    """``value`` as an ``operation_id``, or :class:`EnvelopeError`."""
+    if not isinstance(value, str) or not value:
+        raise EnvelopeError("operation_id must be a non-empty string")
+    if len(value) > OPERATION_ID_MAX:
+        raise EnvelopeError(f"operation_id is longer than {OPERATION_ID_MAX} characters")
+    if "/" in value or _has_control(value):
+        raise EnvelopeError("operation_id must not contain '/' or control characters")
+    return value
+
 
 #: ``result_code`` of a progress ack: the command was queued or forwarded, it
 #: has no outcome yet.
@@ -124,15 +225,24 @@ class CommandSender:
         lifetime: float | None,
         node: str | None = None,
         progress: bool = False,
+        operation_id: str | None = None,
+        on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
     ) -> SentCommand:
         """Send ``fields`` as ``contract`` to ``path`` at ``node`` (this node
         when ``None``) and return once the node accepted it. ``lifetime`` is
         seconds until it expires, or ``None`` for a command that never
         expires. ``progress`` asks the nodes for ``202`` acks while it is
         queued and forwarded. ``path`` is in this node's coordinates: for a
-        node below, it starts with that node's mount."""
+        node below, it starts with that node's mount. ``operation_id`` and
+        ``on_behalf_of`` are the envelope fields the module describes (an
+        ``on_behalf_of`` string is the person's id)."""
         if lifetime is not None and lifetime <= 0:
             raise ValueError(f"lifetime must be positive or None, got {lifetime}")
+        envelope: dict[str, Any] = {}
+        if operation_id is not None:
+            envelope["operation_id"] = check_operation_id(operation_id)
+        if on_behalf_of is not None:
+            envelope["on_behalf_of"] = Actor.coerce(on_behalf_of).envelope()
         target = node or self._node_id
         topic = f"{topic_prefix()}{contract}/{target}/{path}"
         ack_topic = f"{topic_prefix()}_Ack/{target}/{path}"
@@ -148,7 +258,7 @@ class CommandSender:
         if subscribe:
             self._client.message_callback_add(ack_topic, self._on_ack)
             self._client.subscribe(ack_topic, qos=1)
-        payload: dict[str, Any] = {**(fields or {}), "correlation_id": correlation_id}
+        payload: dict[str, Any] = {**(fields or {}), **envelope, "correlation_id": correlation_id}
         if expires_at is not None:
             payload["expires_at"] = expires_at
         if progress:
@@ -170,12 +280,16 @@ class CommandSender:
         lifetime: float | None,
         node: str | None = None,
         timeout: float = 30.0,
+        operation_id: str | None = None,
+        on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
     ) -> dict[str, Any]:
         """:meth:`send` and :meth:`SentCommand.wait` in one call: the outcome,
         or :class:`TimeoutError` after ``timeout`` seconds, which leaves the
         command queued. Must not be called from an MQTT callback, which cannot
         wait for its own PUBACK."""
-        return self.send(contract, path, fields, lifetime=lifetime, node=node).wait(timeout)
+        return self.send(
+            contract, path, fields, lifetime=lifetime, node=node, operation_id=operation_id, on_behalf_of=on_behalf_of
+        ).wait(timeout)
 
     def _forget(self, correlation_id: str) -> None:
         with self._lock:

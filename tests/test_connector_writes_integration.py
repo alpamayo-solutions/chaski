@@ -66,8 +66,10 @@ def _signal_path(svc: chaski.Service, tag_id: str, timeout: float = 30.0) -> str
     raise AssertionError(f"no signal bound to tag {tag_id}")
 
 
-def test_a_signal_write_is_answered_after_the_read_back(tmp_path):
-    driver = WritableDriver()
+@contextlib.contextmanager
+def _operator_and_signal(tmp_path, driver):
+    """A node, a connector holding one writable signal, and an enrolled
+    external operator service allowed to write it: ``(operator, path)``."""
     with (
         chaski.Node("writes", data_dir=tmp_path / "node") as node,
         node.service("admin") as admin,
@@ -98,19 +100,63 @@ def test_a_signal_write_is_answered_after_the_read_back(tmp_path):
         )
         operator.start()
         try:
-            deadline = time.monotonic() + 30
-            while True:
-                answer = operator.write_signal(path, 12.5, lifetime=10).wait(15)
-                if answer["result_code"] != 404 or time.monotonic() > deadline:
-                    break  # 404 until the connector announced the route
-                time.sleep(0.5)
-            assert answer["result_code"] == 200, answer
-            assert answer["result"] == {"outcome": "applied", "value": 12.5}
-            assert driver.writes == [(SETPOINT, 12.5)]
-
-            driver.applies = lambda value: min(value, 20.0)
-            clamped = operator.write_signal(path, 99.0, lifetime=10).wait(15)
-            assert clamped["result_code"] == 409, clamped
-            assert clamped["result"]["value"] == 20.0
+            yield operator, path
         finally:
             operator.close()
+
+
+def _first_answer(operator: chaski.Service, path: str, value, **kwargs) -> dict:
+    """The first answer that is not the 404 a write gets before the connector
+    announced its route."""
+    deadline = time.monotonic() + 30
+    while True:
+        answer = operator.write_signal(path, value, lifetime=10, **kwargs).wait(15)
+        if answer["result_code"] != 404 or time.monotonic() > deadline:
+            return answer
+        time.sleep(0.5)
+
+
+def test_a_signal_write_is_answered_after_the_read_back(tmp_path):
+    driver = WritableDriver()
+    with _operator_and_signal(tmp_path, driver) as (operator, path):
+        answer = _first_answer(operator, path, 12.5)
+        assert answer["result_code"] == 200, answer
+        assert answer["result"] == {"outcome": "applied", "value": 12.5}
+        assert driver.writes == [(SETPOINT, 12.5)]
+
+        driver.applies = lambda value: min(value, 20.0)
+        clamped = operator.write_signal(path, 99.0, lifetime=10).wait(15)
+        assert clamped["result_code"] == 409, clamped
+        assert clamped["result"]["value"] == 20.0
+
+
+def test_a_write_carries_its_sender_person_and_operation_and_is_done_once(tmp_path):
+    """The driver sees the node-attested sender, the person it acts for and the
+    operation; a retry of the same operation (a new correlation id) is answered
+    from the connector's record without writing the source again."""
+    driver = WritableDriver()
+    anna = {"id": "sub-anna", "label": "anna"}
+    with _operator_and_signal(tmp_path, driver) as (operator, path):
+        first = _first_answer(operator, path, 12.5, operation_id="op-1", on_behalf_of=anna, params={"note": "n"})
+        assert first["result_code"] == 200, first
+        assert first["operation_id"] == "op-1"
+        assert first["on_behalf_of"] == {**anna, "kind": "human"}
+        assert "replayed" not in first
+
+        command = driver.commands[-1]
+        assert command.sender.id == operator.ulid
+        assert command.sender.kind == "service"
+        assert command.on_behalf_of == chaski.Actor("sub-anna", "anna")
+        assert (command.operation_id, command.params["note"]) == ("op-1", "n")
+        assert command.correlation_id == first["correlation_id"]
+
+        repeat = operator.write_signal(
+            path, 12.5, lifetime=10, operation_id="op-1", on_behalf_of=anna, params={"note": "n"}
+        ).wait(15)
+        assert repeat["correlation_id"] != first["correlation_id"]
+        assert (repeat["result_code"], repeat["result"], repeat["replayed"]) == (200, first["result"], True)
+
+        other = operator.write_signal(path, 13.0, lifetime=10, operation_id="op-1", on_behalf_of=anna).wait(15)
+        assert (other["result_code"], other["result"]) == (409, {"outcome": "refused"})
+
+        assert driver.writes == [(SETPOINT, 12.5)]

@@ -14,12 +14,13 @@ from typing import Any
 from colca_data_contracts.payload import DataTag
 
 from .clock import Clock, ClockNotReady, ClockStatus
-from .command import CommandSender, SentCommand, is_progress
+from .command import Actor, CommandSender, SentCommand, is_progress
 from .connector import (
     ConnectorService,
     Discovery,
     Driver,
     Reading,
+    SignalWrite,
     SourceDisconnectedError,
     Target,
     Telemetry,
@@ -34,6 +35,7 @@ from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
 from .topic_wakeup import TopicWakeup
 
 __all__ = [
+    "Actor",
     "Clock",
     "ClockNotReady",
     "ClockStatus",
@@ -58,6 +60,7 @@ __all__ = [
     "Reject",
     "SentCommand",
     "Service",
+    "SignalWrite",
     "SourceDisconnectedError",
     "Stream",
     "StreamGapError",

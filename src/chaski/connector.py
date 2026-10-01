@@ -21,8 +21,9 @@ The driver protocol is four ``async`` methods (:class:`Driver`):
 
 and one optional method:
 
-* ``write(target, value)`` — write one value to one tag. The default raises
-  :class:`WriteUnsupported`; a read-only driver leaves it alone.
+* ``write(target, value, command)`` — write one value to one tag. The
+  default raises :class:`WriteUnsupported`; a read-only driver leaves it
+  alone. ``command`` is the :class:`~chaski.executor.Command` being executed.
 
 Ids, topics, payloads and timing are the base class's and the loop's; a
 driver never sees a tag id, a topic it has to build, or a Metric.
@@ -48,6 +49,25 @@ read-back failed; ``501`` ``unsupported`` when the driver cannot write;
 ``422`` ``refused`` for a read-only tag or a command without a value; and,
 from the executor, ``498`` when the command expired before it ran. Who may
 write a signal is a colca ``cmd`` grant with the ``param`` class on its path.
+
+**Who wrote it, and once.** The driver gets the whole command as
+``Driver.write``'s third argument: the attested sender
+(``command.sender``), the person it acts for (``command.on_behalf_of``,
+asserted by the sender), the ``operation_id`` and ``correlation_id``,
+``expires_at`` and every ``command`` field beside ``value``
+(``command.params``). A write sent with an ``operation_id`` is recorded on
+disk under it before the driver is called; a repeat is answered from that
+record and never reaches the driver (:mod:`chaski.executor`, "Operations").
+The ``_Ack`` repeats ``operation_id`` and ``on_behalf_of``.
+
+**Taking over a write.** :meth:`ConnectorService.handle_signal_write` runs
+every write, after the connector checked the binding and the tag. Its
+default is :meth:`SignalWrite.apply`: write ``command.params["value"]``, read
+back, answer. A subclass overrides it to check the sender, to write
+something derived from the command (a recipe of several values on one
+signal: ``write.apply(value=...)``), or to add to the answer: return a
+:class:`~chaski.executor.CommandResult`, or raise
+:class:`~chaski.executor.CommandRejected`, with more ``result`` fields.
 
 **Not included.** Metrics exposition: the loop reports to a
 :class:`Telemetry`, a no-op by default. Configuration from the
@@ -76,7 +96,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from franzmq import Topic
 from franzmq.errors import PublishRejected, PublishTimeout
 
-from .executor import CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
+from .executor import Command, CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
 from .service import Service
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
@@ -186,13 +206,43 @@ class Driver:
         or already-closed connection."""
         raise NotImplementedError
 
-    async def write(self, target: Target, value: Any) -> None:
+    async def write(self, target: Target, value: Any, command: Command) -> None:
         """Write ``value`` to the tag ``target`` names and return once the
         source accepted it. The connector reads the tag back through
-        :meth:`read` before it answers. Raise :class:`SourceDisconnectedError`
-        when the source is gone and any other exception when the source
-        refused the write. The default raises :class:`WriteUnsupported`."""
+        :meth:`read` before it answers. ``command`` is the signal write being
+        executed: who sent it and for whom, its ``operation_id``, its expiry
+        and all its fields (module docstring, "Who wrote it, and once").
+        Raise :class:`SourceDisconnectedError` when the source is gone and
+        any other exception when the source refused the write. The default
+        raises :class:`WriteUnsupported`."""
         raise WriteUnsupported(f"the {self.protocol} connector does not write to its source")
+
+
+class SignalWrite:
+    """One signal write as :meth:`ConnectorService.handle_signal_write` gets
+    it: the command, the bound ``target`` and its ``tag``, already checked
+    (bound here, writable, available at the source)."""
+
+    def __init__(self, connector: ConnectorService, command: Command, target: Target, tag: DataTag) -> None:
+        self.connector = connector
+        self.command = command
+        self.target = target
+        self.tag = tag
+
+    @property
+    def path(self) -> str:
+        return self.command.path
+
+    async def apply(self, value: Any = _MISSING) -> CommandResult:
+        """The standard write: ``value`` (the command's ``value`` when not
+        given) through ``Driver.write``, read back, compared. Returns the
+        ``applied`` answer or raises :class:`~chaski.executor.CommandRejected`
+        with the outcome (module docstring, "Signal writes")."""
+        if value is _MISSING:
+            if "value" not in self.command.params:
+                raise CommandRejected(422, "refused: the command carries no value", {"outcome": "refused"})
+            value = self.command.params["value"]
+        return await self.connector._apply_write(self, value)
 
 
 class Telemetry:
@@ -432,11 +482,9 @@ class ConnectorService(Service):
             return
         self._writes_announced = routes
 
-    async def _write_signal(self, tag_id: str, path: str, command: Any) -> CommandResult:
-        """One signal write: write, read back, answer with what was read."""
-        if "value" not in command.params:
-            raise CommandRejected(422, "refused: the command carries no value", {"outcome": "refused"})
-        value = command.params["value"]
+    async def _write_signal(self, tag_id: str, path: str, command: Command) -> CommandResult:
+        """The route handler of one bound signal: check the binding and the
+        tag, then :meth:`handle_signal_write`."""
         with self._lock:
             binding = next((b for b in self._bindings.values() if b.tag_id == tag_id), None)
             source = self._started_catalogue.source_for_tag(tag_id)
@@ -448,10 +496,24 @@ class ConnectorService(Service):
             raise CommandRejected(422, f"refused: tag {tag.name} is read-only", {"outcome": "refused"})
         if handle is None:
             raise CommandRejected(503, f"failed: tag {tag.name} is not available at the source", {"outcome": "failed"})
-        target = Target(binding.signal, handle, binding.topic)
+        return await self.handle_signal_write(
+            SignalWrite(self, command, Target(binding.signal, handle, binding.topic), tag)
+        )
+
+    async def handle_signal_write(self, write: SignalWrite) -> CommandResult:
+        """Execute one signal write and answer it. The default is
+        :meth:`SignalWrite.apply`. Override it to check who sent the write,
+        to write a value derived from the command, or to add to the answer's
+        ``result`` (module docstring, "Taking over a write"). A repeat of an
+        ``operation_id`` never gets here."""
+        return await write.apply()
+
+    async def _apply_write(self, write: SignalWrite, value: Any) -> CommandResult:
+        """Write, read back, answer with what was read."""
+        target, path, binding_signal = write.target, write.path, write.target.signal
         async with self._source_lock:
             try:
-                await self.driver.write(target, value)
+                await self.driver.write(target, value, write.command)
             except WriteUnsupported as exc:
                 raise CommandRejected(501, f"unsupported: {exc}", {"outcome": "unsupported"}) from exc
             except SourceDisconnectedError as exc:
@@ -479,7 +541,7 @@ class ConnectorService(Service):
                 "unknown: written, but the source returned no value on read-back",
                 {"outcome": "unknown", "requested": value},
             )
-        if not is_equal(read, value, getattr(binding.signal, "precision", None)):
+        if not is_equal(read, value, getattr(binding_signal, "precision", None)):
             raise CommandRejected(
                 409,
                 f"failed: wrote {value!r}, read back {read!r}",
