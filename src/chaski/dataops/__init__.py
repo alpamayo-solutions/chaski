@@ -13,9 +13,9 @@ node sees one more local service, not a kind of its own.
 
 from chaski.failures import Reject
 
-from .base import Producer, Runtime
+from .base import Producer, Runtime, save_checkpoint
 from .buffer import Buffer
-from .commands import Command, CommandRejected
+from .commands import Command, CommandRejected, CommandResult
 from .ingest import Ingest
 from .inputs import Historian, SignalRangeInput, WindowExceedsRetentionError, validate_windows
 from .outputs import AnnotationOutput, SignalOutput, bind_annotation_outputs, build_catalogue
@@ -27,6 +27,7 @@ __all__ = [
     "Buffer",
     "Command",
     "CommandRejected",
+    "CommandResult",
     "DataOpsService",
     "Historian",
     "Ingest",
@@ -48,5 +49,6 @@ __all__ = [
     "on_metric",
     "on_signal",
     "parse_duration",
+    "save_checkpoint",
     "validate_windows",
 ]
