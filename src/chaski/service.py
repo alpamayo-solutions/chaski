@@ -1461,6 +1461,10 @@ class Service:
         reads: its snapshot, its stream drain and its unread count stay inside
         them. ``ViewScope.whole_node()`` reads every path and has to be asked
         for.
+
+        For a read that must include every record admitted before it, capture
+        ``view.heads()`` and call ``view.wait_caught_up(heads, timeout)``;
+        ``view.position(stream)`` is how far the view applied.
         """
         from .retained_view import RetainedView
 
@@ -1704,6 +1708,10 @@ class Service:
         record aside instead (see :meth:`reject`). ``bell`` is a
         :class:`chaski.Doorbell` rung by the stream's MQTT topics and on
         reconnect; without one the stream's growth is watched. Blocks.
+
+        ``stream.position`` says how far the handler got;
+        ``stream.wait_caught_up(head, timeout)`` lets another thread wait for
+        a head it captured, for a read that must include that record.
         """
         from .consume import consume
 

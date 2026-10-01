@@ -15,13 +15,15 @@ from __future__ import annotations
 import copy
 import logging
 import threading
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from colca_data_contracts.root import topic_prefix
 
 from ._wakeup import Wakeup
 from .door import KvEntry
+from .doorbell import Doorbell
 from .retry import Backoff
 from .stream_changes import BatchWait, StreamChanges
 
@@ -141,6 +143,9 @@ class RetainedView:
         self.available = False
         self.revision = 0
         self.changes = Wakeup()
+        # Rung whenever a stream position moves, also without a state change
+        # (records outside the scope still advance the cursor).
+        self._applied = Doorbell()
         self.on_change = on_change
         self.watch = StreamChanges(door, self.streams, disconnected=self._unavailable, contracts=self.contracts)
         self.thread = threading.Thread(target=self._run, daemon=True, name="retained-view")
@@ -167,9 +172,74 @@ class RetainedView:
         self.positions = heads
         self.initialized = True
         self.revision += 1
+        self._applied.ring()
 
     def read(self):
         return self.snapshot()[1]
+
+    def _stream(self, stream):
+        if stream is None:
+            if len(self.streams) != 1:
+                raise ValueError(f"this view reads {len(self.streams)} streams; name one of {list(self.streams)}")
+            return self.streams[0]
+        if stream not in self.streams:
+            raise ValueError(f"this view does not read stream {stream!r}; it reads {list(self.streams)}")
+        return stream
+
+    def position(self, stream=None):
+        """The last offset of ``stream`` this view applied and acknowledged.
+
+        Every record up to it is in :meth:`snapshot`, or was outside the
+        view's scope. ``stream`` may be omitted when the view reads one
+        stream. 0 before the view first hydrated. No network I/O.
+        """
+        stream = self._stream(stream)
+        with self.lock:
+            return self.positions.get(stream, 0)
+
+    def heads(self):
+        """The last admitted offset of every stream this view reads, now.
+
+        One tail read per stream with the view's cursor; it moves nothing and
+        does not change the cursor's filter. Pass the result to
+        :meth:`wait_caught_up` for a read that must include every record
+        admitted before it arrived.
+        """
+        return {s: max(0, self.door.fetch(s, self.cursor, max=1, tail=True).next - 1) for s in self.streams}
+
+    def wait_caught_up(self, heads=None, timeout=None):
+        """Block until this view applied every stream through ``heads``.
+
+        ``heads`` maps stream names to offsets (from :meth:`heads`, or a head
+        the caller captured elsewhere); an ``int`` is the head of the one
+        stream a single-stream view reads; ``None`` captures :meth:`heads`
+        now. Waits on the view's own drain, which runs on stream-change
+        hints; nothing is read on a timer and nothing is drained here.
+
+        True once :meth:`position` reached every head; False when ``timeout``
+        (seconds) passed first or the view is closed. A following
+        :meth:`snapshot` then holds every record up to those heads.
+        """
+        if heads is None:
+            heads = self.heads()
+        elif isinstance(heads, Mapping):
+            heads = {self._stream(stream): int(offset) for stream, offset in heads.items()}
+        elif isinstance(heads, int) and not isinstance(heads, bool):
+            heads = {self._stream(None): heads}
+        else:
+            raise TypeError("heads is a {stream: offset} mapping, one offset or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            seen = self._applied.generation
+            if self.stop.is_set():
+                return False
+            with self.lock:
+                if all(self.positions.get(stream, 0) >= head for stream, head in heads.items()):
+                    return True
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._applied.wait_after(seen, remaining)
 
     def snapshot(self):
         """Read the push-maintained view without performing network I/O.
@@ -267,6 +337,7 @@ class RetainedView:
                             break
                         self.door.ack(stream, self.cursor, ack_offset)
                         self.positions[stream] = ack_offset
+                        self._applied.ring()
                         if ack_offset >= head:
                             break
                     if gap:
@@ -308,6 +379,7 @@ class RetainedView:
 
     def close(self):
         self.stop.set()
+        self._applied.ring()
         self.watch.changes.notify()
         self.watch.close()
         if self.thread.is_alive():

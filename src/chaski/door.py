@@ -25,6 +25,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -484,6 +485,7 @@ class Stream:
         self.cursor = cursor
         self._max = max
         self._acknowledged = 0
+        self._moved = Doorbell()
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
         self._contracts = sorted(contracts) if contracts is not None else None
         self._topics = list(topics) if topics is not None else None
@@ -520,14 +522,49 @@ class Stream:
         if offset <= self._acknowledged:
             return False
         moved = self._door.ack(self.name, self.cursor, offset)
-        self._acknowledged = offset
+        self._advance(offset)
         return moved
+
+    def _advance(self, offset: int) -> None:
+        if offset > self._acknowledged:
+            self._acknowledged = offset
+            self._moved.ring()
+
+    @property
+    def position(self) -> int:
+        """The last offset this cursor passed, as far as this object knows.
+
+        Moves with every :meth:`ack` (also the page acks of :meth:`drain`,
+        :meth:`follow` and ``Service.consume``), and to the head when a drain
+        finds the cursor already there. Every record up to it was handled or
+        skipped by the cursor's filter. 0 until the first ack or drain in this
+        process; no network I/O.
+        """
+        return self._acknowledged
+
+    def wait_caught_up(self, head: int, timeout: float | None = None) -> bool:
+        """Block until :attr:`position` reached ``head`` (e.g. from
+        :meth:`head`, captured when a request arrived).
+
+        Waits on this stream's own acknowledgements from whoever drains it;
+        nothing is read here. False when ``timeout`` (seconds) passed first.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            seen = self._moved.generation
+            if self._acknowledged >= head:
+                return True
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._moved.wait_after(seen, remaining)
 
     def retire(self) -> None:
         """Delete this cursor at the door — idempotent, also when it never
         existed. A later fetch under the same name starts over."""
         self._door.delete_cursor(self.name, self.cursor)
         self._acknowledged = 0
+        self._moved.ring()
 
     def __iter__(self) -> Iterator[Record]:
         return self.drain()
@@ -560,6 +597,9 @@ class Stream:
             if ack_offset is None:
                 if page.next <= head:
                     raise RuntimeError("stream stopped before its captured head")
+                if not page.records and page.gap is None:
+                    # Nothing after the cursor: it already stands at the head.
+                    self._advance(page.next - 1)
                 return
             self.ack(ack_offset)
             if ack_offset >= head:

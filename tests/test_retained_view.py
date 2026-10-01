@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -324,3 +325,81 @@ def test_a_scope_that_needs_too_many_topic_filters_is_refused():
             "c/worker/view",
             scope=ViewScope([f"line{i}" for i in range(400)], depth=2),
         )
+
+
+# ─── read after write: position and wait_caught_up ───────────────────────────
+
+
+def test_position_is_the_acknowledged_offset_and_needs_no_network():
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    assert current.position() == 0
+    current.synchronize()
+    assert current.position() == current.position("metrics") == 1
+    door.put({"value": 2})
+    door.fail = True  # position() never reads the node.
+    assert current.position() == 1
+    door.fail = False
+    assert current.heads() == {"metrics": 2}
+    current.synchronize()
+    assert current.position() == 2
+
+
+def test_wait_caught_up_returns_once_the_drain_applied_the_head():
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    door.put({"value": 2})
+    head = current.heads()
+    assert current.wait_caught_up(head, timeout=0) is False
+
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(current.wait_caught_up(head, timeout=10)))
+    waiter.start()
+    current.synchronize()  # What the view's own drain does on a stream hint.
+    waiter.join(timeout=10)
+    assert result == [True]
+    assert current.read()[0].payload == {"value": 2}
+    assert current.wait_caught_up(2, timeout=0) is True
+    assert current.wait_caught_up(timeout=0) is True, "None captures the heads now"
+
+
+def test_records_outside_the_scope_still_move_the_position():
+    door = ScopedDoor()
+    door.put("line1/temp", {"id": "a"})
+    current = scoped(door, ViewScope(["line1"]))
+    current.synchronize()
+    revision = current.revision
+    door.put("line2/temp", {"id": "b"})
+    current.synchronize()
+    assert current.revision == revision, "no in-scope change"
+    assert current.wait_caught_up({"entities": 2}, timeout=0) is True
+
+
+def test_wait_caught_up_gives_up_when_the_view_closes():
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(current.wait_caught_up(5, timeout=10)))
+    waiter.start()
+    current.stop.set()
+    current._applied.ring()
+    waiter.join(timeout=10)
+    assert result == [False]
+
+
+def test_wait_caught_up_names_streams_the_view_reads():
+    door = Door()
+    multi = RetainedView(door, ["_Metric"], ["metrics", "entities"], "c/w/v", scope=ViewScope.whole_node())
+    with pytest.raises(ValueError, match="name one of"):
+        multi.position()
+    with pytest.raises(ValueError, match="name one of"):
+        multi.wait_caught_up(3, timeout=0)
+    with pytest.raises(ValueError, match="does not read stream 'alarms'"):
+        multi.wait_caught_up({"alarms": 1}, timeout=0)
+    with pytest.raises(TypeError):
+        multi.wait_caught_up("3", timeout=0)
