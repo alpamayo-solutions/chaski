@@ -116,3 +116,57 @@ def test_failed_record_is_not_acked_restart_resumes_there_and_rejection_is_durab
 
         svc.clear_rejections()
         _wait(lambda: not any(e.path.endswith("rejected_input") for e in svc.kv(contract="_Finding")))
+
+
+def test_a_consumer_rescoped_before_its_signals_exist_stops_and_restarts_on_them(tmp_path):
+    # The rig's HMI API saw its machine element before the element's signals:
+    # its wake-up subscribed no topic. When the signals came, the view set
+    # stop to rebind, but consume kept waiting on a bell nothing could ring
+    # and the API never read a value until it was restarted.
+    if not os.environ.get("COLCAD_BINARY"):
+        pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
+    with (
+        chaski.Node("consume-rescope", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="Line/M1") as machine,
+        node.service("view") as view,
+    ):
+        machine.publish("state", 7)
+        _wait(lambda: any(r.path.endswith("/state") for r in view.kv("", contract="_Signal")))
+        signal = next(r for r in view.kv("", contract="_Signal") if r.path.endswith("/state"))
+
+        # The view does not know the signal yet: no topic, a scope nothing matches.
+        wake = view.wake_on([])
+        stream = view.stream("metrics", cursor="rescope", signal_ids=["not-yet-known"])
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=view.consume,
+            args=(stream, lambda _record: None),
+            kwargs={"bell": wake.bell, "stop": stop},
+            daemon=True,  # on main it never returns; let the failure report
+        )
+        worker.start()
+        _wait(lambda: stream.position > 0)  # drained to the head; now waiting on the bell
+        stop.set()  # rescope: no ring
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "consume did not notice stop while its bell had no topic"
+
+        # The rebound consumer reads the signal it now knows.
+        wake.rebind([signal.topic.replace("/_Signal/", "/_Metric/", 1)])
+        values: list[float] = []
+        stream = view.stream("metrics", cursor="rescope-2", signal_ids=[signal.payload["id"]])
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=view.consume,
+            args=(stream, lambda record: values.append(record.payload["value"])),
+            kwargs={"bell": wake.bell, "stop": stop},
+        )
+        worker.start()
+        try:
+            _wait(lambda: 7 in values)
+            machine.publish("state", 8)
+            _wait(lambda: 8 in values)
+        finally:
+            stop.set()
+            worker.join(timeout=10)
+        assert not worker.is_alive()
+        wake.close()

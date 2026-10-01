@@ -472,3 +472,24 @@ def test_a_failed_tick_counts_against_health_and_still_reaches_the_scheduler(_is
     instance.broken = False
     job()
     assert runtime.handler_health.status == OK
+
+
+def test_consume_ends_when_stop_is_set_without_a_ring():
+    # A view rescoped its consumer to no topics: nothing could ring the bell,
+    # and consume waited on it forever after stop was set (Hygentile rig).
+    door = CursorDoor([_record(1)])
+    stream = Stream(door, "metrics", "c/consumer")
+    stop, bell = threading.Event(), Doorbell()
+    handled: list[int] = []
+    worker = threading.Thread(
+        target=consume,
+        args=(stream, lambda record: handled.append(record.offset)),
+        kwargs={"health": HandlerHealth(), "reject": lambda *_: None, "bell": bell, "stop": stop},
+        daemon=True,
+    )
+    worker.start()
+    _wait(lambda: door.cursors.get("c/consumer") == 1)
+    stop.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "consume kept waiting on a bell nobody rings"
+    assert handled == [1]

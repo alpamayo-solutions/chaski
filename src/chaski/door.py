@@ -610,7 +610,7 @@ class Stream:
         ``stop`` is set. Nothing is read on a timer: ring the bell from the
         MQTT subscription to the topics this stream reads and on every
         reconnect. The generation is taken before each drain, so a ring during
-        a drain is not lost. To end it, set ``stop`` and ring."""
+        a drain is not lost. Setting ``stop`` ends it."""
         stop = stop or threading.Event()
         if bell is None:
             from .stream_changes import StreamChanges
@@ -626,4 +626,4 @@ class Stream:
             yield from self.drain(stop=stop)
             if stop.is_set():
                 return
-            bell.wait_after(seen)
+            bell.wait_after(seen, stop=stop)
