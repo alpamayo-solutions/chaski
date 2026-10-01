@@ -104,3 +104,36 @@ def test_two_consumers_of_one_service_both_wake_on_a_shared_topic(tmp_path):
         machine.publish("state", 3)
         assert second.bell.wait_after(seen, timeout=10), "closing one consumer silenced the other"
         second.close()
+
+
+def test_a_wildcard_wake_on_rings_for_every_signal_added_under_its_scope(tmp_path):
+    # The rig's usage service waited on _Signal/+/Hygentile/# for new machines;
+    # the broker delivered, but the fanout matched the concrete topic literally
+    # and the second machine never woke it.
+    if not os.environ.get("COLCAD_BINARY"):
+        pytest.skip("requires real colcad binary and contracts bundle")
+    from chaski import Node
+
+    with (
+        Node("wild", data_dir=tmp_path / "node") as node,
+        node.service("first", mount="Plant/M1") as first,
+        node.service("second", mount="Plant/M2") as second,
+        node.service("outside", mount="Other/M3") as outside,
+        node.service("reader") as reader,
+    ):
+        wake = reader.wake_on(["colca/v1/_Signal/+/Plant/#"])
+        seen = wake.bell.generation
+        while wake.bell.wait_after(seen, timeout=0.5):
+            seen = wake.bell.generation
+
+        outside.publish("state", 1)
+        assert not wake.bell.wait_after(seen, timeout=1.5), "woken by a signal outside its scope"
+
+        first.publish("state", 1)
+        assert wake.bell.wait_after(seen, timeout=10), "not woken by a signal under its scope"
+        while wake.bell.wait_after(seen, timeout=0.5):
+            seen = wake.bell.generation
+
+        second.publish("state", 1)
+        assert wake.bell.wait_after(seen, timeout=10), "not woken by a second machine's signal"
+        wake.close()
