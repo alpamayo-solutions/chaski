@@ -7,6 +7,11 @@ local door. ``DataOpsService`` is a ``Service`` that runs producers
 (``chaski.dataops``); it is resolved lazily because it needs the
 ``chaski[dataops]`` extra. ``CommandSender`` sends commands and waits for
 their ``_Ack`` on any franzmq session.
+
+``run_connector`` serves a connector built inside the running event loop.
+``CommandResult`` is what a command handler returns to add a ``result`` to its
+``_Ack``. ``Backoff`` spaces the retries of a failed operation and honours
+``Retry-After``.
 """
 
 from typing import Any
@@ -26,19 +31,24 @@ from .connector import (
     Telemetry,
     WriteUnsupported,
 )
+from .connector import run as run_connector
 from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
+from .executor import CommandResult
 from .failures import HandlerHealth, Reject
 from .node import Node
 from .retained_view import ViewScope
+from .retry import Backoff
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
 from .topic_wakeup import TopicWakeup
 
 __all__ = [
     "Actor",
+    "Backoff",
     "Clock",
     "ClockNotReady",
     "ClockStatus",
+    "CommandResult",
     "CommandSender",
     "ConnectorService",
     "DataOpsService",
@@ -70,6 +80,7 @@ __all__ = [
     "ViewScope",
     "WriteUnsupported",
     "is_progress",
+    "run_connector",
     "write_deadline",
 ]
 

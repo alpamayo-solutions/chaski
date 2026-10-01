@@ -298,7 +298,12 @@ def restore_checkpoint(producer: Producer) -> bool:
 
 def save_checkpoint(producer: Producer) -> None:
     """Save the state of ``producer`` and its handled offsets; nothing for a
-    producer without ``state_version``."""
+    producer without ``state_version``.
+
+    Chaski calls it after every ``@on_metric`` handler. A callback it does not
+    cover (``@every``/``@cron``, ``@on_constant``, ``@on_command``) that
+    changes checkpointed state calls ``save_checkpoint(self)`` itself, after
+    the change."""
     if producer.state_version is None:
         return
     if producer._checkpoint_hash is None:

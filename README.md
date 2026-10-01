@@ -223,9 +223,10 @@ for 60 s. chaski does not pick which process stops.
 - Coalesce wakeups into bounded batches. Limit how often a batch starts without
   sleeping between pages that still contain admitted work. A continuous stream
   must not require reaching an empty queue before progress can be committed.
-- Retry failed operations with backoff and honor `Retry-After`. Do not add
-  periodic reads to hide a broken subscription. Expose connection health, last
-  completed drain and queue/processing lag separately.
+- Retry failed operations with backoff and honor `Retry-After`
+  (`chaski.Backoff`: `delay(error)` after each failure, `reset()` after a
+  success). Do not add periodic reads to hide a broken subscription. Expose
+  connection health, last completed drain and queue/processing lag separately.
 - Publish state/configuration when it changes; batch high-rate measurements.
   Command acceptance, execution and projected visibility are different events.
   An MQTT acknowledgement does not establish execution completion.
@@ -255,6 +256,16 @@ class MyDriver(Driver):
     ...
 
 ConnectorService("oven-connector", mount="site1/ovens", driver=MyDriver()).run()
+```
+
+`run()` serves the connector with `/is_healthy` on port 8888. A driver whose
+client needs the running event loop at construction (pymodbus's
+`AsyncModbusTcpClient`, for one) builds the connector in a factory instead:
+
+```python
+from chaski import run_connector
+
+run_connector(lambda: ConnectorService("press-connector", mount="site1/press", driver=ModbusDriver()))
 ```
 
 ### Write a signal
@@ -333,9 +344,11 @@ person cannot send a command on behalf of someone else (`403`).
 every write once the connector checked the binding and the tag; its default
 is `await write.apply()`. Override it to check the sender, to write a value
 derived from the command (a recipe of several values on one signal), or to
-add to the answer:
+add to the answer with a `chaski.CommandResult`:
 
 ```python
+from chaski import CommandResult, ConnectorService
+
 class PressConnector(ConnectorService):
     async def handle_signal_write(self, write):
         if write.command.sender.label != "hmi-api":
@@ -447,6 +460,8 @@ unix ms) is answered `498` without running the handler. A command without
 `expires_at` never expires and may arrive long after it was sent, when this
 node was cut off from the sender's: a handler whose effect must not happen
 late checks `command.ts` itself or relies on its senders setting a lifetime.
+A handler may return `CommandResult(message, result)` (from `chaski.dataops`)
+instead of a string; the `_Ack` carries `result`.
 `CommandRejected` answers its own code, any other exception `500`: that
 answer is the command's durable rejection, and the command is not retried.
 
@@ -648,8 +663,20 @@ open interval, so preserve the buffer volume.
 
 Effects must still be idempotent: a crash after publication but before saving a
 checkpoint can repeat them. Chaski does not promise a transaction spanning a
-remote system and local SQLite. State changed by timers or commands still needs an
-explicit durable recovery design; metric checkpoints do not cover those callbacks.
+remote system and local SQLite. Chaski saves a checkpoint only after metric handlers.
+A `@every`/`@cron`, `@on_constant` or `@on_command` callback that changes
+checkpointed state saves it itself, after the change:
+
+```python
+from chaski.dataops import every, save_checkpoint
+
+@every("5m")
+async def flush(self) -> None:
+    self.publish_pending()
+    self.pending.clear()
+    save_checkpoint(self)    # nothing for a producer without state_version
+```
+
 Existing producers with external recovery may keep their own implementation and
 leave `state_version` unset. Do not enable both recovery owners for the same state.
 

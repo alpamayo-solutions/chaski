@@ -42,15 +42,23 @@ def retry_after(error) -> float | None:
 
 
 class Backoff:
-    def __init__(self, minimum=1.0, maximum=30.0):
+    """The wait between retries of one failed operation.
+
+    Call :meth:`delay` after each consecutive failure and wait that long;
+    call :meth:`reset` after a success. It spaces retries of an operation
+    that failed; it is not a cadence for reading a node to find new work.
+    """
+
+    def __init__(self, minimum: float = 1.0, maximum: float = 30.0) -> None:
         if not 0 < minimum <= maximum:
             raise ValueError("backoff requires 0 < minimum <= maximum")
         self.minimum, self.maximum, self.failures = minimum, maximum, 0
 
-    def reset(self):
+    def reset(self) -> None:
+        """Start again at ``minimum``: the operation succeeded."""
         self.failures = 0
 
-    def delay(self, error=None):
+    def delay(self, error: BaseException | None = None) -> float:
         """Seconds to wait before retrying after ``error``.
 
         Exponential with jitter per consecutive failure. A 429 carrying
