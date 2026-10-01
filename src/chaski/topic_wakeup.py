@@ -104,7 +104,8 @@ class TopicWakeup:
             return frozenset(self._topics)
 
     def rebind(self, topics: Iterable[str]) -> None:
-        """Subscribe exactly ``topics``, dropping the ones no longer read."""
+        """Subscribe exactly ``topics``, dropping the ones no longer read.
+        Any change rings the bell."""
         wanted = {str(t) for t in topics}
         with self._lock:
             if self._closed:
@@ -116,8 +117,9 @@ class TopicWakeup:
             self._fanout.add(topic, self)
         for topic in removed:
             self._fanout.remove(topic, self)
-        if added:
-            # Records may have arrived before the subscription existed.
+        if added or removed:
+            # Records may have arrived before a new subscription existed, and
+            # a consumer waiting on this bell must see that its scope moved.
             self.bell.ring()
 
     def reconnected(self) -> None:

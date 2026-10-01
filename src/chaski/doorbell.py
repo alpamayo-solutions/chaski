@@ -8,12 +8,18 @@ The consumer takes :attr:`Doorbell.generation` **before** it drains and then
 waits for a newer one. A ring that arrives while it drains therefore leads to
 one more drain instead of being lost, and many rings during one drain cost one
 drain. Thread-safe: MQTT callbacks ring from paho's network thread.
+
+A consumer waits on its bell and its ``stop`` together
+(``wait_after(seen, stop=stop)``): setting ``stop`` ends the wait without a
+ring, so a consumer whose bell nothing can ring any more (rescoped to no
+topics) still notices it is to stop.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 
 
 class Doorbell:
@@ -40,11 +46,23 @@ class Doorbell:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(_resolve, future)
 
-    def wait_after(self, since: int, timeout: float | None = None) -> bool:
+    def wait_after(self, since: int, timeout: float | None = None, *, stop: threading.Event | None = None) -> bool:
         """Block until the bell rang after ``since`` was taken (at once when it
-        already has). False when ``timeout`` passed first."""
+        already has). False when ``timeout`` passed or ``stop`` was set first."""
+        if stop is None:
+            with self._cond:
+                return self._cond.wait_for(lambda: self._generation != since, timeout)
+        release = _when_set(stop, self._wake_waiters)
+        try:
+            with self._cond:
+                self._cond.wait_for(lambda: self._generation != since or stop.is_set(), timeout)
+                return self._generation != since
+        finally:
+            release()
+
+    def _wake_waiters(self) -> None:
         with self._cond:
-            return self._cond.wait_for(lambda: self._generation != since, timeout)
+            self._cond.notify_all()
 
     async def after(self, since: int) -> None:
         """Wait on the running loop until the bell rang after ``since``."""
@@ -60,6 +78,41 @@ class Doorbell:
             with self._cond:
                 if (loop, future) in self._async:
                     self._async.remove((loop, future))
+
+
+_hooks_lock = threading.Lock()
+_HOOKS = "_chaski_when_set"
+
+
+def _when_set(event: threading.Event, callback: Callable[[], None]) -> Callable[[], None]:
+    """Call ``callback`` when ``event`` is set; returns the function that
+    stops that. ``threading.Event`` has no hook of its own, so the instance's
+    ``set`` is wrapped once and calls the registered callbacks after setting
+    the flag."""
+    with _hooks_lock:
+        hooks: list[Callable[[], None]] | None = event.__dict__.get(_HOOKS)
+        if hooks is None:
+            hooks = []
+            original = event.set
+            registered = hooks
+
+            def set_and_notify() -> None:
+                original()
+                with _hooks_lock:
+                    pending = list(registered)
+                for hook in pending:
+                    hook()
+
+            setattr(event, _HOOKS, hooks)
+            event.set = set_and_notify  # type: ignore[method-assign]
+        hooks.append(callback)
+
+    def release() -> None:
+        with _hooks_lock:
+            if callback in hooks:
+                hooks.remove(callback)
+
+    return release
 
 
 def _resolve(future: asyncio.Future[None]) -> None:

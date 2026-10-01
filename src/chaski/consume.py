@@ -44,7 +44,8 @@ def consume(
     retry: Backoff | None = None,
 ) -> None:
     """Drain ``stream`` through ``handler`` now and after every ring of
-    ``bell`` (a stream watch when omitted), until ``stop`` is set.
+    ``bell`` (a stream watch when omitted), until ``stop`` is set. Setting
+    ``stop`` alone ends it; no ring is needed.
 
     A pruned range raises :class:`chaski.door.StreamGapError`; a failed
     fetch or ack is retried with the same backoff as a failed handler.
@@ -86,7 +87,9 @@ def consume(
             backoff.reset()
             if stop.is_set():
                 return
-            bell.wait_after(seen)
+            # Setting stop ends the wait too: a consumer rescoped to nothing
+            # has a bell that nothing rings any more.
+            bell.wait_after(seen, stop=stop)
     finally:
         if watch is not None:
             watch.close()
