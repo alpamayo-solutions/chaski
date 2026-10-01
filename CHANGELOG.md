@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/alpamayo-solutions/chaski/compare/v0.19.3...v0.20.0) (2026-10-01)
+
+
+### Features
+
+* export Backoff, Command helpers, run_connector and save_checkpoint ([#113](https://github.com/alpamayo-solutions/chaski/issues/113)) ([294de9c](https://github.com/alpamayo-solutions/chaski/commit/294de9ccd2c371ea0db4d0df6682c6a0cfe0d85b))
+
 ## [0.19.3](https://github.com/alpamayo-solutions/chaski/compare/v0.19.2...v0.19.3) (2026-10-01)
 
 
