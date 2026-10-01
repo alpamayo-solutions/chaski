@@ -63,6 +63,7 @@ services that authenticate the people they act for. A reader shows it as
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -227,6 +228,7 @@ class CommandSender:
         progress: bool = False,
         operation_id: str | None = None,
         on_behalf_of: Actor | Mapping[str, Any] | str | None = None,
+        expires_by: float | None = None,
     ) -> SentCommand:
         """Send ``fields`` as ``contract`` to ``path`` at ``node`` (this node
         when ``None``) and return once the node accepted it. ``lifetime`` is
@@ -235,7 +237,8 @@ class CommandSender:
         queued and forwarded. ``path`` is in this node's coordinates: for a
         node below, it starts with that node's mount. ``operation_id`` and
         ``on_behalf_of`` are the envelope fields the module describes (an
-        ``on_behalf_of`` string is the person's id)."""
+        ``on_behalf_of`` string is the person's id). ``expires_by`` (unix
+        seconds) caps ``expires_at``."""
         if lifetime is not None and lifetime <= 0:
             raise ValueError(f"lifetime must be positive or None, got {lifetime}")
         envelope: dict[str, Any] = {}
@@ -248,6 +251,9 @@ class CommandSender:
         ack_topic = f"{topic_prefix()}_Ack/{target}/{path}"
         correlation_id = str(ulid_lib.new())
         expires_at = None if lifetime is None else int((time.time() + lifetime) * 1000)
+        if expires_at is not None and expires_by is not None:
+            # A lifetime taken from a deadline was measured a moment ago.
+            expires_at = min(expires_at, math.floor(expires_by * 1000))
         waiter = _Waiter()
         with self._lock:
             self._waiters[correlation_id] = waiter

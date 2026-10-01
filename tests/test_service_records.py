@@ -257,6 +257,28 @@ def test_a_command_under_a_write_deadline_expires_and_is_waited_for_by_it(tmp_pa
     assert payload["expires_at"] <= deadline * 1000
 
 
+def test_a_command_under_a_write_deadline_never_expires_after_it_while_the_clock_moves(tmp_path, monkeypatch):
+    # The lifetime left until the deadline was measured, then added to a later
+    # clock read: expires_at could land a millisecond past the deadline.
+    import chaski.command
+    from chaski.service import writes_until
+
+    client = _Client(answer=None)
+    client.is_connected = lambda: True
+    svc = _service(tmp_path, monkeypatch, client)
+    deadline = 1_790_831_739.7679906
+    clock = iter(deadline - 0.3 + 0.0009 * i for i in range(1000))
+    fake_time = type("T", (), {"time": staticmethod(lambda: next(clock)), "monotonic": staticmethod(time.monotonic)})
+    monkeypatch.setattr(chaski.command, "time", fake_time)
+    monkeypatch.setattr("chaski.service.time", fake_time)
+
+    with writes_until(deadline):
+        svc.send_command("_CmdConfigure", "element/upsert", {"elements": []}, lifetime=5)
+
+    payload = json.loads(client.of("publish")[-1][2])
+    assert payload["expires_at"] <= deadline * 1000
+
+
 def test_a_command_past_its_write_deadline_or_without_a_link_is_not_sent(tmp_path, monkeypatch):
     from chaski import NotSent
     from chaski.service import writes_until
