@@ -292,7 +292,8 @@ def make_service(node: FakeNode, driver: Driver, monkeypatch, *, mount: str = ""
     monkeypatch.setattr("chaski.service.connect_local_mqtt", connect)
     monkeypatch.setattr("chaski.service.Door", node.door)
     clock = kwargs.pop("clock", None) or Clock()
-    svc = ConnectorService(NAME, mount, driver=driver, interval=0.0, **kwargs)
+    connector = kwargs.pop("connector", ConnectorService)
+    svc = connector(NAME, mount, driver=driver, interval=0.0, **kwargs)
     svc._now = clock
     slept: list[float] = []
 
