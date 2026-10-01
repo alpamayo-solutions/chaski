@@ -12,12 +12,14 @@ import chaski.retry
 
 
 def test_chaski_exports_the_retry_command_and_connector_helpers():
-    from chaski import Backoff, CommandResult, run_connector
+    from chaski import Backoff, Command, CommandRejected, CommandResult, run_connector
 
     assert Backoff is chaski.retry.Backoff
+    assert Command is chaski.executor.Command
+    assert CommandRejected is chaski.executor.CommandRejected
     assert CommandResult is chaski.executor.CommandResult
     assert run_connector is chaski.connector.run
-    assert {"Backoff", "CommandResult", "run_connector"} <= set(chaski.__all__)
+    assert {"Backoff", "Command", "CommandRejected", "CommandResult", "run_connector"} <= set(chaski.__all__)
 
 
 def test_chaski_dataops_exports_command_result_and_save_checkpoint():

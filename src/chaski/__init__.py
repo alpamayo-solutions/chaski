@@ -9,8 +9,9 @@ local door. ``DataOpsService`` is a ``Service`` that runs producers
 their ``_Ack`` on any franzmq session.
 
 ``run_connector`` serves a connector built inside the running event loop.
-``CommandResult`` is what a command handler returns to add a ``result`` to its
-``_Ack``. ``Backoff`` spaces the retries of a failed operation and honours
+``Command`` is a command as its handler sees it; a handler returns a
+``CommandResult`` to add a ``result`` to its ``_Ack``, or raises
+``CommandRejected`` to answer with its own code. ``Backoff`` spaces the retries of a failed operation and honours
 ``Retry-After``.
 """
 
@@ -34,7 +35,7 @@ from .connector import (
 from .connector import run as run_connector
 from .door import Door, Gap, KvEntry, Page, Record, Stream, StreamGapError
 from .doorbell import Doorbell
-from .executor import CommandResult
+from .executor import Command, CommandRejected, CommandResult
 from .failures import HandlerHealth, Reject
 from .node import Node
 from .retained_view import ViewScope
@@ -48,6 +49,8 @@ __all__ = [
     "Clock",
     "ClockNotReady",
     "ClockStatus",
+    "Command",
+    "CommandRejected",
     "CommandResult",
     "CommandSender",
     "ConnectorService",

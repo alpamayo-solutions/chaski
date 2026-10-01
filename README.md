@@ -283,7 +283,7 @@ class MyDriver(Driver):
         await self.client.write(target.handle, value)   # raise if the source refuses
 ```
 
-`command` is the write being executed (`chaski.executor.Command`):
+`command` is the write being executed (`chaski.Command`):
 `command.sender` is the sender the node attested, `command.on_behalf_of` the
 person it says it acts for, `command.operation_id` its idempotency key,
 `command.expires_at` its deadline (unix ms) and `command.params` every field
@@ -344,10 +344,10 @@ person cannot send a command on behalf of someone else (`403`).
 every write once the connector checked the binding and the tag; its default
 is `await write.apply()`. Override it to check the sender, to write a value
 derived from the command (a recipe of several values on one signal), or to
-add to the answer with a `chaski.CommandResult`:
+add to the answer with a `chaski.CommandResult` or a `chaski.CommandRejected`:
 
 ```python
-from chaski import CommandResult, ConnectorService
+from chaski import CommandRejected, CommandResult, ConnectorService
 
 class PressConnector(ConnectorService):
     async def handle_signal_write(self, write):
