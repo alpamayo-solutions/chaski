@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/alpamayo-solutions/chaski/compare/v0.19.1...v0.19.2) (2026-10-01)
+
+
+### Fixes
+
+* **command:** never let a command expire after the write deadline it was sent under ([#109](https://github.com/alpamayo-solutions/chaski/issues/109)) ([a3ac6d0](https://github.com/alpamayo-solutions/chaski/commit/a3ac6d03b5a9dca3301977d6a6ec6284d6400811))
+
 ## [0.19.1](https://github.com/alpamayo-solutions/chaski/compare/v0.19.0...v0.19.1) (2026-10-01)
 
 
