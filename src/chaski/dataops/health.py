@@ -39,7 +39,8 @@ class HealthState:
     ``cursor_lag`` finding about this service (``cursor_lag``): records it
     reads have waited unread past the node's threshold, a lost wake or a stuck
     loop. An idle stream is healthy however old its last record is: the ingest
-    reads when woken, not on a timer, and only records that wait count. An
+    reads when woken (and walks a silent filter forward now and then), and
+    only records that wait count. An
     ingest that never started (nothing resolved yet) is healthy: a fresh node
     waiting to be commissioned. A broker link that stays down for
     ``broker_grace_s`` fails the probe too: without it no command, wake-up or

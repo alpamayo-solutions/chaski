@@ -41,12 +41,18 @@ returns a ``gap`` with the surviving records. Processing fails visibly rather th
 **MQTT only wakes it.** A message on one of the service's input topics calls
 :meth:`Ingest.wake` (through
 :meth:`chaski.dataops.service.DataOpsService._wake_on_inputs`); the message
-itself is not read. So does every reconnect of the broker link. Nothing is
-read on a timer: the loop drains at start, then waits for the next wake. It
-takes the wake generation before each drain, so a wake that arrives while it
-drains leads to one more drain instead of being lost. A consumer that stops
-reading anyway is caught by the node's cursor watchdog, which the health door
-reports (:mod:`chaski.dataops.health`).
+itself is not read. So does every reconnect of the broker link. The loop
+drains at start, then waits for the next wake. It takes the wake generation
+before each drain, so a wake that arrives while it drains leads to one more
+drain instead of being lost. A consumer that stops reading anyway is caught by
+the node's cursor watchdog, which the health door reports
+(:mod:`chaski.dataops.health`).
+
+**A silent filter still moves.** The wake comes from the signals the loop
+reads, so while none of them changes it would never drain, and its cursor
+would hold the node's retention of the whole stream. After ``idle_drain_s``
+(:data:`chaski.doorbell.IDLE_DRAIN_S`) without a wake it drains anyway; the
+pages it walks hold none of its signals and are acked past.
 """
 
 from __future__ import annotations
@@ -62,7 +68,7 @@ from typing import Any
 import httpx
 
 from chaski.door import Gap, Page, Record, Stream, StreamGapError
-from chaski.doorbell import Doorbell
+from chaski.doorbell import IDLE_DRAIN_S, Doorbell
 from chaski.failures import HandlerHealth, Reject, record_subject
 from chaski.retry import Backoff
 
@@ -127,8 +133,10 @@ class Ingest:
         retry_min_s: float = 1.0,
         health: HandlerHealth | None = None,
         reject: RejectFn | None = None,
+        idle_drain_s: float | None = IDLE_DRAIN_S,
     ) -> None:
         self._retry_min_s = retry_min_s
+        self._idle_drain_s = idle_drain_s
         self._health = health or HandlerHealth()
         self._reject = reject
         # (handler, record) of the handler failure that ended the last step.
@@ -612,7 +620,10 @@ class Ingest:
             wake_task = asyncio.ensure_future(self._bell.after(seen))
             stop_task = asyncio.ensure_future(stop.wait())
             try:
-                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                # A timeout drains too: see "A silent filter still moves".
+                await asyncio.wait(
+                    {wake_task, stop_task}, timeout=self._idle_drain_s, return_when=asyncio.FIRST_COMPLETED
+                )
             finally:
                 for task in (wake_task, stop_task):
                     if not task.done():
