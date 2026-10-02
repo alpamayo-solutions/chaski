@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.3](https://github.com/alpamayo-solutions/chaski/compare/v0.20.2...v0.20.3) (2026-10-02)
+
+
+### Fixes
+
+* **retained-view:** wake on every record so the cursor follows the head ([#120](https://github.com/alpamayo-solutions/chaski/issues/120)) ([2c848f9](https://github.com/alpamayo-solutions/chaski/commit/2c848f94632718a3ad84a07299f646f565187d3e))
+
 ## [0.20.2](https://github.com/alpamayo-solutions/chaski/compare/v0.20.1...v0.20.2) (2026-10-02)
 
 
