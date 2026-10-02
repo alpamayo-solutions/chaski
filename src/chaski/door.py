@@ -195,7 +195,7 @@ class Door:
     # ------------------------------------------------------------------ reads
 
     def backlog(self, prefixes):
-        """Bounded local cursor telemetry for 1–32 cursor-name prefixes.
+        """Bounded local cursor telemetry for 1 to 32 cursor-name prefixes.
 
         One row per cursor: ``position`` (the next offset it reads), ``head``,
         ``lag_records`` and, from colca 0.27, ``last_ack_ms`` (when it last
