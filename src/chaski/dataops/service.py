@@ -961,9 +961,10 @@ class DataOpsService(Service):
         late-resolved input starts waking the ingest from then on.
 
         QoS 1 on the service's persistent session, so a wake is not dropped on
-        the way. Nothing reads on a timer behind it: a reconnect wakes the
-        ingest, and a consumer that stops reading anyway is reported by the
-        node's cursor watchdog.
+        the way. A reconnect wakes the ingest too, a silent filter still drains
+        every ``idle_drain_s`` (see :mod:`chaski.dataops.ingest`), and a
+        consumer that stops reading anyway is reported by the node's cursor
+        watchdog.
 
         The topics come from ``/kv``, which the node rate-limits. A transport
         error there (429, 5xx, a timeout) keeps the topics already

@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .door import Record, Stream, StreamGapError
+from .doorbell import IDLE_DRAIN_S
 from .failures import HandlerHealth, Reject, record_subject
 from .retry import Backoff
 
@@ -42,10 +43,15 @@ def consume(
     stop: threading.Event | None = None,
     consumer: str | None = None,
     retry: Backoff | None = None,
+    idle_drain_s: float | None = IDLE_DRAIN_S,
 ) -> None:
     """Drain ``stream`` through ``handler`` now and after every ring of
     ``bell`` (a stream watch when omitted), until ``stop`` is set. Setting
     ``stop`` alone ends it; no ring is needed.
+
+    After ``idle_drain_s`` without a ring it drains anyway, so a filtered
+    cursor whose topics stay silent still moves past the records it skips
+    (:data:`chaski.doorbell.IDLE_DRAIN_S`; ``None`` waits for the bell alone).
 
     A pruned range raises :class:`chaski.door.StreamGapError`; a failed
     fetch or ack is retried with the same backoff as a failed handler.
@@ -89,7 +95,7 @@ def consume(
                 return
             # Setting stop ends the wait too: a consumer rescoped to nothing
             # has a bell that nothing rings any more.
-            bell.wait_after(seen, stop=stop)
+            bell.wait_after(seen, idle_drain_s, stop=stop)
     finally:
         if watch is not None:
             watch.close()

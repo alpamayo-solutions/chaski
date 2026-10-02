@@ -96,6 +96,7 @@ from .clock import Clock, ClockNotReady
 from .command import Actor, CommandSender, SentCommand
 from .coordination import StepGate
 from .door import Door, KvEntry, Record, Stream
+from .doorbell import IDLE_DRAIN_S
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
 from .subscriptions import Subscriptions
@@ -1041,8 +1042,8 @@ class Service:
         The node (colca 0.19+) watches every cursor: when a record this
         service reads has waited unread longer than the node's threshold, it
         writes the finding next to the service's own record, and retires it
-        once the cursor caught up. Nothing here reads on a timer, so this is
-        how a lost wake or a stuck loop shows; a health check fails on it.
+        once the cursor caught up. Consumers read when woken, so this is how a
+        lost wake or a stuck loop shows; a health check fails on it.
         """
         return self._cursor_lag
 
@@ -1739,6 +1740,7 @@ class Service:
         bell: Any = None,
         stop: threading.Event | None = None,
         consumer: str | None = None,
+        idle_drain_s: float | None = IDLE_DRAIN_S,
     ) -> None:
         """Run ``handler(record)`` for every record of ``stream`` (from
         :meth:`stream`), now and whenever it grows, until ``stop`` is set.
@@ -1749,7 +1751,9 @@ class Service:
         degraded, then unhealthy. Raise :class:`chaski.Reject` to set a
         record aside instead (see :meth:`reject`). ``bell`` is a
         :class:`chaski.Doorbell` rung by the stream's MQTT topics and on
-        reconnect; without one the stream's growth is watched. Blocks.
+        reconnect; without one the stream's growth is watched. After
+        ``idle_drain_s`` without a ring it drains anyway, so a filtered cursor
+        keeps moving past the records it skips. Blocks.
 
         ``stream.position`` says how far the handler got;
         ``stream.wait_caught_up(head, timeout)`` lets another thread wait for
@@ -1765,6 +1769,7 @@ class Service:
             bell=bell,
             stop=stop,
             consumer=consumer,
+            idle_drain_s=idle_drain_s,
         )
 
     # -- signal binding ------------------------------------------------

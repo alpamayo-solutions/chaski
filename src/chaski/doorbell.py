@@ -1,8 +1,16 @@
 """``chaski.Doorbell``: the wake-up of a consumer that drains a stream.
 
-A consumer reads nothing on a timer. Whatever says the stream may have grown —
-an MQTT message on the topics it reads, a ``/watch`` hint, a reconnect — rings
-the bell, and the consumer drains from its cursor until the stream is empty.
+Whatever says the stream may have grown — an MQTT message on the topics it
+reads, a ``/watch`` hint, a reconnect — rings the bell, and the consumer drains
+from its cursor until the stream is empty.
+
+The bell rings only for what the consumer reads. A filtered consumer whose
+topics stay silent would never drain, so its cursor would stand still while the
+stream grows past it, and the node's pruner, which never cuts below the lowest
+cursor, would keep everything. So a consumer also drains after
+:data:`IDLE_DRAIN_S` without a ring: the drain finds nothing to hand out but
+acks the filtered pages it walked, moving the cursor over records that are
+not its own. That is the only work done on a timer.
 
 The consumer takes :attr:`Doorbell.generation` **before** it drains and then
 waits for a newer one. A ring that arrives while it drains therefore leads to
@@ -20,6 +28,10 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+
+#: How long a consumer waits on a silent bell before it drains anyway, to walk
+#: its cursor past records its filter skips (see the module docstring).
+IDLE_DRAIN_S = 300.0
 
 
 class Doorbell:

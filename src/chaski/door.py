@@ -33,7 +33,7 @@ from typing import Any
 
 import httpx
 
-from chaski.doorbell import Doorbell
+from chaski.doorbell import IDLE_DRAIN_S, Doorbell
 
 log = logging.getLogger("chaski.door")
 
@@ -465,8 +465,9 @@ class Stream:
     idempotent. Iteration stops at the first empty page.
 
     :meth:`ack` commits before the page boundary if needed. :meth:`follow`
-    repeats the drain whenever a :class:`chaski.Doorbell` rings; nothing is
-    read on a timer. A pruned range (``Page.gap``) raises :class:`StreamGapError`.
+    repeats the drain whenever a :class:`chaski.Doorbell` rings, and after a
+    silent :data:`chaski.doorbell.IDLE_DRAIN_S` so a filtered cursor keeps
+    moving. A pruned range (``Page.gap``) raises :class:`StreamGapError`.
     """
 
     def __init__(
@@ -605,19 +606,30 @@ class Stream:
             if ack_offset >= head:
                 return
 
-    def follow(self, bell: Doorbell | None = None, *, stop: threading.Event | None = None) -> Iterator[Record]:
+    def follow(
+        self,
+        bell: Doorbell | None = None,
+        *,
+        stop: threading.Event | None = None,
+        idle_drain_s: float | None = IDLE_DRAIN_S,
+    ) -> Iterator[Record]:
         """:meth:`drain` now, then again after every ring of ``bell``, until
-        ``stop`` is set. Nothing is read on a timer: ring the bell from the
-        MQTT subscription to the topics this stream reads and on every
-        reconnect. The generation is taken before each drain, so a ring during
-        a drain is not lost. Setting ``stop`` ends it."""
+        ``stop`` is set. Ring the bell from the MQTT subscription to the topics
+        this stream reads and on every reconnect. The generation is taken
+        before each drain, so a ring during a drain is not lost. Setting
+        ``stop`` ends it.
+
+        After ``idle_drain_s`` without a ring it drains anyway: a filtered
+        stream whose topics stay silent still walks its cursor past the
+        records it skips, so it does not hold the node's retention (``None``
+        waits for the bell alone)."""
         stop = stop or threading.Event()
         if bell is None:
             from .stream_changes import StreamChanges
 
             watch = StreamChanges(self._door, [self.name], stop=stop).start()
             try:
-                yield from self.follow(watch[self.name], stop=stop)
+                yield from self.follow(watch[self.name], stop=stop, idle_drain_s=idle_drain_s)
             finally:
                 watch.close()
             return
@@ -626,4 +638,4 @@ class Stream:
             yield from self.drain(stop=stop)
             if stop.is_set():
                 return
-            bell.wait_after(seen, stop=stop)
+            bell.wait_after(seen, idle_drain_s, stop=stop)
