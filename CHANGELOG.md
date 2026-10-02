@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.1](https://github.com/alpamayo-solutions/chaski/compare/v0.20.0...v0.20.1) (2026-10-02)
+
+
+### Fixes
+
+* **connector:** publish the heartbeat on its own schedule ([#115](https://github.com/alpamayo-solutions/chaski/issues/115)) ([2a91bab](https://github.com/alpamayo-solutions/chaski/commit/2a91babcb9dd329a1e3a8e94db2ad81f5ff07370))
+
 ## [0.20.0](https://github.com/alpamayo-solutions/chaski/compare/v0.19.3...v0.20.0) (2026-10-01)
 
 
