@@ -31,7 +31,7 @@ jobs:
           # colca v0.26.0: grants relative to the node a person signs in at.
           ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
           path: colca
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.11.17"
       - name: ruff
@@ -84,7 +84,7 @@ jobs:
           # Same broker revision as lint/contracts above.
           ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
           path: colca
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.11.17"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
@@ -116,7 +116,7 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.11.17"
       - name: Version
