@@ -17,6 +17,11 @@ class StreamChanges:
 
     Capture ``signal.version`` before draining, then call ``wait``. Hints may
     coalesce freely; fetching and acknowledging remain the consumer's job.
+
+    ``contracts`` narrows the hints to growth by those contracts. A filtered
+    consumer woken only by them leaves its cursor behind the records it skips
+    between hints, which holds back the node's pruner; leave it empty unless
+    something else wakes the consumer past them.
     """
 
     def __init__(self, door, streams, *, stop=None, disconnected=None, contracts=(), on_change=None):

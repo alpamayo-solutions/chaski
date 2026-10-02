@@ -403,3 +403,11 @@ def test_wait_caught_up_names_streams_the_view_reads():
         multi.wait_caught_up({"alarms": 1}, timeout=0)
     with pytest.raises(TypeError):
         multi.wait_caught_up("3", timeout=0)
+
+
+def test_the_view_is_woken_by_records_of_every_contract():
+    """A filtered drain acks the offset it scanned to; woken only by its own
+    contracts, the view's cursor stood still between them and held back the
+    node's pruner."""
+    current = view(Door())
+    assert current.watch.contracts == ()

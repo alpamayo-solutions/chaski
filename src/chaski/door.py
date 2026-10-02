@@ -195,7 +195,14 @@ class Door:
     # ------------------------------------------------------------------ reads
 
     def backlog(self, prefixes):
-        """Bounded local queue telemetry. Positions are next offsets to consume."""
+        """Bounded local cursor telemetry for 1–32 cursor-name prefixes.
+
+        One row per cursor: ``position`` (the next offset it reads), ``head``,
+        ``lag_records`` and, from colca 0.27, ``last_ack_ms`` (when it last
+        moved, 0 when unknown), ``stale`` (stood still past the node's
+        ``cursors.stale_after`` while records wait) and ``read_since_start``.
+        A cursor a removed consumer left is retired with :meth:`delete_cursor`.
+        """
         response = self._client.get("/backlog", params=[("prefix", p) for p in prefixes])
         response.raise_for_status()
         return response.json()["queues"]
