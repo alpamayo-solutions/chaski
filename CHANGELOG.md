@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.2](https://github.com/alpamayo-solutions/chaski/compare/v0.20.1...v0.20.2) (2026-10-02)
+
+
+### Fixes
+
+* **consume:** drain a silent filtered stream so its cursor keeps moving ([#118](https://github.com/alpamayo-solutions/chaski/issues/118)) ([a5c25d8](https://github.com/alpamayo-solutions/chaski/commit/a5c25d85f14ce014dfc3e63740b44d6922dffb2d)), closes [#117](https://github.com/alpamayo-solutions/chaski/issues/117)
+
 ## [0.20.1](https://github.com/alpamayo-solutions/chaski/compare/v0.20.0...v0.20.1) (2026-10-02)
 
 
