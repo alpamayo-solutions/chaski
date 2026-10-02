@@ -341,7 +341,9 @@ def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver,
     real = Clock()
     svc = started(node, driver, monkeypatch, clock=real)
     svc.interval = 10
+    wait = svc.clock.changes.wait_async
     svc.clock = ApplicationClock(wall=real)
+    svc.clock.changes.wait_async = wait
     svc.clock.apply_definition(ClockDefinition("factory", "run", 1, 1000, 100, 100))
     bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
     bind(node, svc, HEARTBEAT_TAG_SOURCE, path="heartbeat", signal_id="heartbeat")
@@ -354,8 +356,10 @@ def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver,
     real.now += 5
     poll(svc)
     assert len(driver.reads) == 1
+    # The heartbeat runs on its own schedule, paused clock or not.
+    svc._publish_heartbeat()
     heartbeats = [m for _, m in node.metrics() if m.signal_id == "heartbeat"]
-    assert len(heartbeats) == 2
+    assert len(heartbeats) == 1
     assert all(m.timestamp > 1_000_000_000 for m in heartbeats)
 
     svc.clock.apply_definition(ClockDefinition("factory", "run", 3, 1005, 100, 10))
@@ -368,7 +372,7 @@ def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver,
 
 
 @pytest.mark.parametrize("heartbeat", [False, True])
-def test_future_start_wakes_acquisition_before_heartbeat(node, driver, monkeypatch, heartbeat):
+def test_future_start_wakes_acquisition_and_nothing_else(node, driver, monkeypatch, heartbeat):
     from colca_data_contracts.payload import ClockDefinition
 
     from chaski.clock import Clock as ApplicationClock
@@ -393,22 +397,26 @@ def test_future_start_wakes_acquisition_before_heartbeat(node, driver, monkeypat
     assert len(driver.reads) == 1
     assert next(m for _, m in node.metrics() if m.signal_id == "temp").timestamp == 100
 
-    # Once the bounded run is over, do not replace idle waiting with polling.
+    # Once the bounded run is over, do not replace idle waiting with polling;
+    # a bound heartbeat does not wake the loop either, it has its own schedule.
     real.now += 3
     svc.slept.clear()
     poll(svc)
     assert len(driver.reads) == 1
-    assert (svc.slept[-1] > 0) if heartbeat else not svc.slept
+    assert not svc.slept
 
 
 def test_missing_clock_stops_sampling_without_stopping_health(node, driver, monkeypatch):
     from chaski.clock import Clock as ApplicationClock
 
     svc = started(node, driver, monkeypatch)
+    wait = svc.clock.changes.wait_async
     svc.clock = ApplicationClock(source="mqtt")
+    svc.clock.changes.wait_async = wait
     bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
     bind(node, svc, HEARTBEAT_TAG_SOURCE, path="heartbeat", signal_id="heartbeat")
     poll(svc)
+    svc._publish_heartbeat()
     assert driver.reads == []
     assert [m.signal_id for _, m in node.metrics()] == ["heartbeat"]
 
@@ -608,15 +616,20 @@ def test_unchanged_measurements_are_preserved_and_heartbeat_only_flips_on_its_in
     bind(node, svc, HEARTBEAT_TAG_SOURCE, path="line1/heartbeat", signal_id="s-hb")
 
     poll(svc)
-    assert sorted(m.signal_id for _t, m in node.metrics()) == ["s-hb", "s-temp"]
+    svc._publish_heartbeat()
+    assert [m.signal_id for _t, m in node.metrics()] == ["s-temp", "s-hb"]
 
     poll(svc)
-    assert len(node.metrics()) == 3, "the stable measurement is a new observation"
+    svc._publish_heartbeat()
+    assert [m.signal_id for _t, m in node.metrics()[2:]] == ["s-temp"], (
+        "the stable measurement is a new observation; the heartbeat is unchanged"
+    )
 
     clock.now += 5.0
     poll(svc)
+    svc._publish_heartbeat()
     assert [m.signal_id for _t, m in node.metrics()[3:]] == ["s-temp", "s-hb"]
-    assert node.metrics()[-1][1].value != node.metrics()[0][1].value
+    assert node.metrics()[-1][1].value != node.metrics()[1][1].value
 
     driver.values["Axis1/Temperature"] = 43.0
     poll(svc)
@@ -709,6 +722,7 @@ def test_a_lost_source_keeps_the_heartbeat_and_reconnects_with_backoff(node, dri
     driver.fail_connects = 2
 
     poll(svc)
+    svc._publish_heartbeat()
 
     assert [m.signal_id for _t, m in node.metrics()] == ["s-hb"], (
         "the connector is alive even when its source is not; the heartbeat says so"
@@ -723,6 +737,42 @@ def test_a_lost_source_keeps_the_heartbeat_and_reconnects_with_backoff(node, dri
     poll(svc)
     assert node.metrics()[-1][1].signal_id == "s-temp"
     assert ("source", True) in telemetry.events[-4:]
+
+
+def test_the_heartbeat_keeps_its_schedule_while_a_read_hangs(node, driver, monkeypatch):
+    """A slow or unreachable source holds the poll loop for its timeouts and
+    reconnects (a Modbus device that is off: tens of seconds per attempt). The
+    heartbeat says the connector is alive, so it must not wait for the read."""
+    clock = Clock()
+    svc = started(node, driver, monkeypatch, clock=clock, heartbeat_interval=0.05)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    bind(node, svc, HEARTBEAT_TAG_SOURCE, path="line1/hb", signal_id="s-hb")
+
+    async def scenario() -> list[str]:
+        released = asyncio.Event()
+        read = driver.read
+
+        async def hanging_read(targets):
+            await released.wait()
+            return await read(targets)
+
+        driver.read = hanging_read
+        polling = asyncio.ensure_future(svc._poll_iteration())
+        beating = asyncio.ensure_future(svc._heartbeat_forever())
+        for _ in range(3):
+            await asyncio.sleep(0.06)
+            clock.now += svc.heartbeat_interval
+        hung = [m.signal_id for _t, m in node.metrics()]
+        assert not polling.done(), "the read is still hanging"
+        released.set()
+        await polling
+        svc._stopping.set()
+        await beating
+        return hung
+
+    hung = asyncio.run(scenario())
+    assert hung.count("s-hb") >= 2 and "s-temp" not in hung, hung
+    assert "s-temp" in [m.signal_id for _t, m in node.metrics()]
 
 
 def test_exhausted_reconnects_stay_alive_and_try_again_next_poll(node, driver, monkeypatch):
