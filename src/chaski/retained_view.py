@@ -8,6 +8,14 @@ A view holds its contracts within one :class:`ViewScope`: the paths it reads.
 The snapshot reads only those paths, and the drain fetches only its contracts
 and paths, on every drain, so other records on the same stream never count as
 unread on its cursor. Records outside the scope are never applied.
+
+The view wakes on every growth of its streams, not only on its own contracts.
+A drain that finds nothing of its own still acks the offset it scanned to, so
+the cursor follows the stream head. Woken only for its contracts, the cursor
+stood still between relevant changes: the node's pruner, which never cuts
+below the lowest cursor, kept everything after it, and the cursor read as lag.
+Drains that found nothing of the view's start at most :data:`WALK_INTERVAL_S`
+apart, so a stream busy with other contracts costs a bounded request rate.
 """
 
 from __future__ import annotations
@@ -31,6 +39,13 @@ log = logging.getLogger(__name__)
 
 # The node accepts at most this many topic filters on one fetch.
 MAX_TOPIC_FILTERS = 1000
+
+#: Minimum spacing of drain starts after a drain that changed the view.
+DRAIN_INTERVAL_S = 0.1
+#: Minimum spacing of drain starts after a drain that only walked the cursor
+#: past records of other contracts or paths. A change of the view's own waits
+#: at most this long, and only while the stream is busy with others.
+WALK_INTERVAL_S = 1.0
 
 
 @dataclass(frozen=True, init=False)
@@ -147,7 +162,8 @@ class RetainedView:
         # (records outside the scope still advance the cursor).
         self._applied = Doorbell()
         self.on_change = on_change
-        self.watch = StreamChanges(door, self.streams, disconnected=self._unavailable, contracts=self.contracts)
+        # Every growth of the streams wakes the view (see the module docstring).
+        self.watch = StreamChanges(door, self.streams, disconnected=self._unavailable)
         self.thread = threading.Thread(target=self._run, daemon=True, name="retained-view")
 
     def start(self):
@@ -364,13 +380,15 @@ class RetainedView:
 
     def _run(self):
         backoff = Backoff()
-        batch = BatchWait(self.watch.changes, interval=0.1, stop=self.stop)
+        batch = BatchWait(self.watch.changes, interval=DRAIN_INTERVAL_S, stop=self.stop)
         while not self.stop.is_set():
             version = self.watch.changes.version
+            revision = self.revision
             try:
                 self._refresh_changed()
                 backoff.reset()
                 retry = None
+                batch.interval = DRAIN_INTERVAL_S if self.revision != revision else WALK_INTERVAL_S
             except Exception as exc:
                 self._unavailable()
                 log.warning("Retained view unavailable (%s)", type(exc).__name__)

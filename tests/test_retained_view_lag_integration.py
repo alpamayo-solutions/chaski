@@ -105,3 +105,63 @@ def test_a_restarted_view_replaces_the_filter_the_node_remembers_for_its_cursor(
         names = _wait(lagging)
         assert view.cursor not in names, names
         view.close()
+
+
+@pytest.fixture
+def fast_entities_retention(monkeypatch):
+    """Prune the entities stream every second down to records a second old."""
+    from chaski.node import Node
+
+    original = Node._write_config
+
+    def write_config(self):
+        original(self)
+        doc = self._load_existing()
+        doc["retention"] = {"interval": "1s", "streams": {"entities": {"max_age": "1s"}}}
+        self._config_path().write_text(json.dumps(doc), encoding="utf-8")
+
+    monkeypatch.setattr(Node, "_write_config", write_config)
+
+
+def test_records_of_other_contracts_walk_the_cursor_and_let_the_stream_be_pruned(tmp_path, fast_entities_retention):
+    """Records of other contracts wake the view too. Its drain finds nothing of
+    its own and acks the offset it scanned to, so the cursor follows the head:
+    it shows no lag and does not hold back the pruner."""
+    if not os.environ.get("COLCAD_BINARY"):
+        pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
+    with chaski.Node("view-walk", data_dir=tmp_path / "node") as node, node.service("worker") as svc:
+        door = svc._require_http("door")
+        view = svc.retained_view(
+            contracts=["_Signal"], streams=["entities"], cursor="view", scope=chaski.ViewScope.whole_node()
+        )
+        view.read()
+        svc.publish("temperature", 21)
+        _wait(lambda: any(e.path.split("/")[-1] == "temperature" for e in view.read()))
+
+        def pruned_to():
+            page = door.fetch("entities", "c/worker/probe", max=1)
+            return page.gap.to_offset if page.gap is not None else 0
+
+        # The pruner removed everything below the view's cursor and stops
+        # there; a moving low-water mark would wake the view on its own.
+        position = view.position("entities")
+        _wait(lambda: pruned_to() >= position, timeout=30)
+        time.sleep(2.5)
+        settled = pruned_to()
+        assert view.position("entities") == position
+
+        base = f"{topic_prefix()}_Finding/{svc.node_id}/{'/'.join(svc._hierarchy)}"
+        for i in range(20):
+            finding = {"reason": "test", "summary": str(i), "observed_at": time.time(), "suggested_severity": "info"}
+            svc.send(f"{base}/other-{i}", json.dumps(finding), retain=True)
+        head = _wait(lambda: (h := view.heads()["entities"]) >= settled + 20 and h)
+
+        # No record of the view's own arrives; its cursor still reaches the head
+        # and shows no lag.
+        assert view.wait_caught_up({"entities": head}, timeout=20), (view.position("entities"), head)
+        rows = {(row["cursor"], row["stream"]): row for row in door.backlog([view.cursor])}
+        assert rows[(view.cursor, "entities")]["position"] > head, rows
+
+        # The pruner passes the records the view skipped.
+        _wait(lambda: pruned_to() >= settled + 20, timeout=30)
+        view.close()

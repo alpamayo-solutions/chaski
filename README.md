@@ -167,7 +167,10 @@ holds itself and everything below it, not `line1/press30`. `depth` keeps
 entries at most that many segments below a prefix. The snapshot reads `/kv`
 per prefix, and the drain fetches with the view's contracts and matching topic
 filters, so records outside the scope are never applied and never count as
-unread on the view's cursor. A scope whose prefixes, contracts and depth need
+unread on the view's cursor. Every record on its streams wakes the view, also
+one of another contract: the drain then acks the offset it scanned to, so the
+cursor follows the head and never holds back the node's retention. Drains that
+find nothing of the view's start at most a second apart. A scope whose prefixes, contracts and depth need
 more than the node's 1000 topic filters is refused when the view is created.
 There is no empty scope: `chaski.ViewScope.whole_node()` reads every path and
 has to be asked for.
