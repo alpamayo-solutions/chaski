@@ -15,8 +15,8 @@ The driver protocol is four ``async`` methods (:class:`Driver`):
   register descriptor, a JSON pointer).
 * ``read(targets)`` — one poll of the bound targets: ``(topic, raw_value,
   signal)`` per reading. Raise :class:`SourceDisconnectedError` when the
-  source is gone; the loop flips ``is_connected``, keeps the heartbeat
-  going, and reconnects.
+  source is gone; the loop flips ``is_connected`` and reconnects. The
+  heartbeat keeps its own schedule meanwhile: it never waits for a read.
 * ``close()`` — release the source.
 
 and one optional method:
@@ -77,6 +77,7 @@ environment: the process that builds a connector reads its own.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import functools
 import json
@@ -610,11 +611,15 @@ class ConnectorService(Service):
         # the same as our pending buffer; Paho refuses changing it afterwards.
         self.telemetry.broker_healthy(True)
         writes: asyncio.Task | None = None
+        heartbeat: asyncio.Task | None = None
         try:
             await self._startup_discovery()
             writes = asyncio.ensure_future(self._serve_writes())
+            heartbeat = asyncio.ensure_future(self._heartbeat_forever())
             await self._poll_forever()
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
             if writes is not None:
                 self._stopping.set()
                 try:
@@ -740,10 +745,6 @@ class ConnectorService(Service):
         next one — see the module docstring's "Timing"."""
         change_version = self.clock.changes.version
         loop_start_perf = time.perf_counter()
-        # What every metric of this iteration carries: unix seconds
-        # (the contract's timestamp is a number; a datetime would encode
-        # to an ISO string the door refuses).
-        loop_start_epoch = datetime.datetime.now(datetime.UTC).timestamp()
         clock_status = self.clock.status()
         step_target = await asyncio.to_thread(self.step.ready) if self.step is not None else None
         sampling = step_target is not None if self.step is not None else clock_status.ready and clock_status.rate > 0
@@ -761,21 +762,17 @@ class ConnectorService(Service):
                 await self.clock.changes.wait_async(change_version, delay, stop=self._stopping)
                 return
 
-            heartbeat_id = self._started_catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
-            is_connected_id = self._started_catalogue.tag_id(IS_CONNECTED_TAG_SOURCE)
-            heartbeat_targets = [t for t in targets if t.signal.data_tag == heartbeat_id]
-            protocol_targets = [t for t in targets if t.signal.data_tag not in (heartbeat_id, is_connected_id)]
+            synthetic = self._synthetic_tag_ids()
+            protocol_targets = [t for t in targets if t.signal.data_tag not in synthetic]
 
             raw_batch: list[tuple[Topic, Any, SignalRecord] | Reading] = []
-            # A lost source must not cost the heartbeat: the connector is
-            # alive even when its source is not, and the heartbeat is what
-            # says so. Re-raised after publishing, for the reconnect path.
+            # Re-raised after publishing what was read, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
             if protocol_targets and sampling:
                 # Retry durable output before taking another PLC observation.
                 # This is backpressure; an outage never evicts older samples.
                 self._publish_batch([])
-                if len(protocol_targets) + len(heartbeat_targets) > self.max_pending:
+                if len(protocol_targets) > self.max_pending:
                     raise BufferError("max_pending cannot hold one complete acquisition cycle")
                 try:
                     async with self._source_lock:
@@ -787,11 +784,6 @@ class ConnectorService(Service):
                 except SourceDisconnectedError as exc:
                     source_lost = exc
                     self._set_source_healthy(False)
-
-            if heartbeat_targets:
-                heartbeat = self._current_heartbeat_value()
-                for target in heartbeat_targets:
-                    raw_batch.append((target.topic, heartbeat, target.signal))
 
             # Covers the first publish once a Signal is bound and one deferred by
             # a broker outage; a no-op when nothing changed.
@@ -806,14 +798,7 @@ class ConnectorService(Service):
                 if precision is not None and isinstance(value, (int, float)):
                     value = round_to_precision(value, precision)
                 key = str(topic)
-                last = self._latest_by_topic.get(key)
-                if signal.data_tag == heartbeat_id and last is not None and is_equal(last.value, value, precision):
-                    continue
-                timestamp = (
-                    loop_start_epoch
-                    if signal.data_tag == heartbeat_id
-                    else (step_target if self.step is not None else clock_status.factory_now)
-                )
+                timestamp = step_target if self.step is not None else clock_status.factory_now
                 if self.timestamp_source == "source" and source_timestamp is not None:
                     if not isfinite(source_timestamp):
                         raise ValueError("source timestamp must be finite")
@@ -867,12 +852,9 @@ class ConnectorService(Service):
         elapsed = time.perf_counter() - loop_start_perf
         if self.step is not None or not sampling:
             self.telemetry.poll_completed(elapsed, overrun=False)
-            # Wake for commits or the actual heartbeat/discovery deadline.
-            # An incomplete PLC read retries on its acquisition cadence.
+            # Wake for commits or the discovery deadline. An incomplete PLC
+            # read retries on its acquisition cadence.
             delay = None
-            if heartbeat_targets:
-                age = self._now() - self._heartbeat_start
-                delay = self.heartbeat_interval - (age % self.heartbeat_interval)
             if not self._discovered:
                 discovery = max(0.0, self._next_discovery_retry - self._now())
                 delay = discovery if delay is None else min(delay, discovery)
@@ -880,8 +862,7 @@ class ConnectorService(Service):
                 delay = self.interval if delay is None else min(delay, self.interval)
             if self.step is None and clock_status.ready and clock_status.factory_now is not None:
                 # A future definition can start without another message. Wake
-                # at that transition even when the next heartbeat is later
-                # (or no heartbeat is bound). A paused/completed clock without
+                # at that transition. A paused/completed clock without
                 # a scheduled transition returns None, so it stays event-driven.
                 clock_delay = self.clock.delay_until(clock_status.factory_now + max(self.interval, 1e-6))
                 if clock_delay is not None:
@@ -971,6 +952,42 @@ class ConnectorService(Service):
         pass
 
     # -- synthetic tags ---------------------------------------------------
+
+    async def _heartbeat_forever(self) -> None:
+        """The heartbeat on its own schedule. It says the connector is alive,
+        so it must not wait for a read: a slow or unreachable source holds the
+        poll loop for as long as its timeouts and reconnects take."""
+        while not self._stopping.is_set():
+            self._publish_heartbeat()
+            age = self._now() - self._heartbeat_start
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stopping.wait(), self.heartbeat_interval - (age % self.heartbeat_interval))
+
+    def _publish_heartbeat(self) -> None:
+        """Publish the current heartbeat value to every bound heartbeat
+        Signal whose last published value differs. A broker outage is the
+        poll loop's to handle; the next flip publishes again."""
+        heartbeat_id = self._started_catalogue.tag_id(HEARTBEAT_TAG_SOURCE)
+        with self._lock:
+            targets = [t for t in self._targets if t.signal.data_tag == heartbeat_id]
+        value = self._current_heartbeat_value()
+        timestamp = datetime.datetime.now(datetime.UTC).timestamp()
+        batch: list[tuple[Topic, Metric]] = []
+        for target in targets:
+            key = str(target.topic)
+            last = self._latest_by_topic.get(key)
+            if last is not None and last.value == value:
+                continue
+            batch.append((target.topic, Metric(value=value, timestamp=timestamp, signal_id=target.signal.id)))
+        if not batch:
+            return
+        try:
+            self._publish_batch(batch)
+        except (MqttDisconnectedError, httpx.HTTPError) as exc:
+            self._log.debug("Heartbeat deferred: %s", type(exc).__name__)
+            return
+        for topic, metric in batch:
+            self._latest_by_topic[str(topic)] = metric
 
     def _current_heartbeat_value(self) -> bool:
         """Flips every ``heartbeat_interval`` seconds since startup."""
