@@ -34,6 +34,7 @@ from typing import Any
 import httpx
 
 from chaski.doorbell import IDLE_DRAIN_S, Doorbell
+from chaski.outage import ColcaUnavailable
 
 log = logging.getLogger("chaski.door")
 
@@ -604,7 +605,7 @@ class Stream:
             ack_offset = page.ack_offset
             if ack_offset is None:
                 if page.next <= head:
-                    raise RuntimeError("stream stopped before its captured head")
+                    raise ColcaUnavailable("stream stopped before its captured head")
                 if not page.records and page.gap is None:
                     # Nothing after the cursor: it already stands at the head.
                     self._advance(page.next - 1)

@@ -32,6 +32,7 @@ from colca_data_contracts.root import topic_prefix
 from ._wakeup import Wakeup
 from .door import KvEntry
 from .doorbell import Doorbell
+from .outage import ColcaUnavailable, Outage
 from .retry import Backoff
 from .stream_changes import BatchWait, StreamChanges
 
@@ -162,6 +163,8 @@ class RetainedView:
         # (records outside the scope still advance the cursor).
         self._applied = Doorbell()
         self.on_change = on_change
+        # Logs a failing refresh once, and its recovery once, whichever caller recovers it.
+        self._outage = Outage(log, f"Retained view {cursor}")
         # Every growth of the streams wakes the view (see the module docstring).
         self.watch = StreamChanges(door, self.streams, disconnected=self._unavailable)
         self.thread = threading.Thread(target=self._run, daemon=True, name="retained-view")
@@ -269,7 +272,7 @@ class RetainedView:
             if not self.initialized:
                 return self.synchronize()
             if not self.available:
-                raise RuntimeError("Retained view unavailable; waiting for subscription recovery")
+                raise ColcaUnavailable("Retained view unavailable; waiting for subscription recovery")
             return self.revision, copy.deepcopy(list(self.entries.values()))
 
     def synchronize(self):
@@ -349,7 +352,7 @@ class RetainedView:
                         ack_offset = page.ack_offset
                         if ack_offset is None:
                             if page.next <= head:
-                                raise RuntimeError(f"{stream} stopped before its captured head")
+                                raise ColcaUnavailable(f"{stream} stopped before its captured head")
                             break
                         self.door.ack(stream, self.cursor, ack_offset)
                         self.positions[stream] = ack_offset
@@ -362,13 +365,14 @@ class RetainedView:
                     if not self.available:
                         self.revision += 1
                     self.available = True
+                    self._outage.recovered()
                     if self.revision != previous_revision:
                         self.changes.notify()
                         if self.on_change is not None:
                             self.on_change()
                     self._stream_versions.update(versions)
                     return (self.revision, copy.deepcopy(list(self.entries.values()))) if copy_result else None
-            raise RuntimeError("Retained view could not catch up; refusing stale state")
+            raise ColcaUnavailable("Retained view could not catch up; refusing stale state")
 
     def _refresh_changed(self):
         with self.lock:
@@ -391,8 +395,11 @@ class RetainedView:
                 batch.interval = DRAIN_INTERVAL_S if self.revision != revision else WALK_INTERVAL_S
             except Exception as exc:
                 self._unavailable()
-                log.warning("Retained view unavailable (%s)", type(exc).__name__)
+                if self.stop.is_set():
+                    break  # closing: a drain cut short is not an outage
                 retry = backoff.delay(exc)
+                if not self._outage.failed(exc, delay=retry):
+                    log.error("Retained view %s unavailable; retrying in %.1fs", self.cursor, retry, exc_info=exc)
             batch.wait(version, retry=retry)
 
     def close(self):

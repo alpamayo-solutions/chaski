@@ -112,6 +112,7 @@ from franzmq.errors import PublishRejected, PublishTimeout
 
 from .executor import Command, CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
 from .failures import Reject
+from .outage import Outage, expected_failure
 from .service import Service
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
@@ -519,9 +520,12 @@ class ConnectorService(Service):
 
         self._source_reconnects_total = 0
         self._mqtt_reconnects_total = 0
-        self._mqtt_down_since: float | None = None
-        self._mqtt_down_attempts = 0
-        self._mqtt_down_last_report = 0.0
+        # Broker or node away: one warning when it starts, a reminder every
+        # outage_reminder seconds, one line when it recovers.
+        self._mqtt_outage = Outage(self._log, "MQTT", remind_every=self.outage_reminder, now=lambda: self._now())
+        self._http_outage = Outage(
+            self._log, "Metric publication", remind_every=self.outage_reminder, now=lambda: self._now()
+        )
         self._summary_published = 0
         self._summary_polls = 0
         self._summary_last = self._now()
@@ -972,8 +976,10 @@ class ConnectorService(Service):
 
         except httpx.HTTPError as exc:
             self.telemetry.broker_healthy(False)
-            self._log.warning("Metric batch deferred: %s", type(exc).__name__)
-            await self._sleep(self._http_backoff.delay(exc))
+            delay = self._http_backoff.delay(exc)
+            if not self._http_outage.failed(exc, delay=delay):
+                self._log.error("Metric batch deferred; retrying in %.1fs", delay, exc_info=exc)
+            await self._sleep(delay)
             return
 
         except PublishRejected as exc:
@@ -1181,7 +1187,10 @@ class ConnectorService(Service):
             try:
                 self._client.publish(target.topic, metric, qos=1)
             except Exception as exc:
-                self._log.warning("[IS_CONNECTED] publish failed for %s, will retry: %s", key, exc)
+                # A broker outage is the poll loop's to report; this is retried next poll.
+                quiet = expected_failure(exc) is not None or not self._client.is_connected()
+                level = logging.DEBUG if quiet else logging.WARNING
+                self._log.log(level, "[IS_CONNECTED] publish failed for %s, will retry: %s", key, exc)
                 continue
             self._is_connected_published[key] = state
             self._log.info("[IS_CONNECTED] %s source connectivity -> %s", key, state)
@@ -1267,6 +1276,7 @@ class ConnectorService(Service):
                 raise undecided[0]
         self._deferral_reported = False
         self._http_backoff.reset()
+        self._http_outage.recovered()
         self._report_mqtt_recovered()
 
     def _set_aside(
@@ -1324,35 +1334,13 @@ class ConnectorService(Service):
     # -- outage reporting -------------------------------------------------
 
     def _report_mqtt_outage(self, error: Exception) -> None:
-        """Log a broker outage when it starts and then only every
+        """Log a broker outage when it starts (WARNING), then only every
         ``outage_reminder`` seconds, not on every poll."""
-        now = self._now()
-        if self._mqtt_down_since is None:
-            self._mqtt_down_since = now
-            self._mqtt_down_attempts = 1
-            self._mqtt_down_last_report = now
-            self._log.error("MQTT disconnected: %s — retrying until it answers", error)
-            return
-        self._mqtt_down_attempts += 1
-        if now - self._mqtt_down_last_report < self.outage_reminder:
-            return
-        self._mqtt_down_last_report = now
-        self._log.error(
-            "MQTT still disconnected after %.0fs and %d attempts: %s",
-            now - self._mqtt_down_since,
-            self._mqtt_down_attempts,
-            error,
-        )
+        self._mqtt_outage.note(f"disconnected: {error}")
 
     def _report_mqtt_recovered(self) -> None:
         """The other half: a lane that came back says so, once, with the cost."""
-        if self._mqtt_down_since is None:
-            return
-        down_for = self._now() - self._mqtt_down_since
-        attempts = self._mqtt_down_attempts
-        self._mqtt_down_since = None
-        self._mqtt_down_attempts = 0
-        self._log.info("MQTT reconnected after %.0fs and %d attempts", down_for, attempts)
+        self._mqtt_outage.recovered()
 
     # -- shutdown ---------------------------------------------------------
 

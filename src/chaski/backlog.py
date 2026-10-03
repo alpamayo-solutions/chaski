@@ -5,6 +5,7 @@ import threading
 import time
 
 from ._wakeup import Wakeup
+from .outage import ColcaUnavailable, Outage
 from .retry import Backoff
 
 log = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ class BacklogView:
     def __call__(self):
         with self.lock:
             if self.rows is None or not self.connected or time.monotonic() - self.last_hint > self.max_age:
-                raise RuntimeError("Queue telemetry unavailable or stale")
+                raise ColcaUnavailable("Queue telemetry unavailable or stale")
             return [dict(row) for row in self.rows]
 
     def fence_snapshot(self):
@@ -47,11 +48,13 @@ class BacklogView:
 
     def watch(self):
         backoff = Backoff()
+        outage = Outage(log, "Queue subscription")
         while not self.stop.is_set():
             error = None
             connected_at = time.monotonic()
             try:
                 for changed in self.door.watch_backlog(self.stop.is_set):
+                    outage.recovered()
                     if time.monotonic() - connected_at >= 30:
                         backoff.reset()
                     with self.lock:
@@ -62,11 +65,13 @@ class BacklogView:
                         self.wake.notify()
             except Exception as exc:
                 error = exc
-                log.warning("Queue subscription unavailable (%s)", type(exc).__name__)
             with self.lock:
                 self.connected = False
             self.changes.notify()
-            self.stop.wait(backoff.delay(error))
+            delay = backoff.delay(error)
+            if error is not None and not self.stop.is_set() and not outage.failed(error, delay=delay):
+                log.error("Queue subscription unavailable; reconnecting in %.1fs", delay, exc_info=error)
+            self.stop.wait(delay)
 
     def run(self):
         backoff = Backoff()

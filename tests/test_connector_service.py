@@ -874,9 +874,10 @@ def test_a_broker_outage_in_the_loop_reconnects_and_flushes_when_it_returns(node
         driver.values["Axis1/Temperature"] = 43.0
         poll(svc)
     assert [m.value for _t, m in node.metrics()] == [42.0, 43.0], "pending first, then this cycle's"
-    messages = [r.getMessage() for r in caplog.records if r.levelname in ("ERROR", "INFO")]
-    assert any("MQTT disconnected" in m for m in messages)
-    assert any("MQTT reconnected after" in m for m in messages)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("MQTT: disconnected" in m for m in warnings)
+    assert any("MQTT: reached Colca after" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR or r.exc_info], "an outage is not a defect"
 
 
 def test_a_refusal_with_nothing_admitted_remains_durable_and_fails_visibly(node, driver, monkeypatch):
@@ -906,8 +907,8 @@ def test_a_long_outage_reports_once_then_on_the_interval(node, driver, monkeypat
             svc._report_mqtt_outage(error)
     reported = [(r.levelname, r.getMessage()) for r in caplog.records]
     assert len(reported) == 2, reported
-    assert reported[0][0] == "ERROR" and "retrying until it answers" in reported[0][1]
-    assert "still disconnected" in reported[1][1] and "301 attempts" in reported[1][1]
+    assert reported[0][0] == "WARNING" and "retrying until it answers" in reported[0][1]
+    assert reported[1][0] == "INFO" and "still waiting (301 attempts, 300 s)" in reported[1][1]
 
 
 def test_recovery_is_reported_once_with_what_it_cost_and_a_second_outage_is_news_again(
@@ -929,7 +930,7 @@ def test_recovery_is_reported_once_with_what_it_cost_and_a_second_outage_is_news
         svc._report_mqtt_outage(RuntimeError("down again"))
     reported = [(r.levelname, r.getMessage()) for r in caplog.records]
     assert len(reported) == 2, reported
-    assert reported[0][0] == "INFO" and "42s" in reported[0][1] and "2 attempts" in reported[0][1]
+    assert reported[0][0] == "INFO" and "after 2 failed attempts / 42 s" in reported[0][1]
     assert "down again" in reported[1][1]
 
 

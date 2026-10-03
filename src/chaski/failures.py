@@ -5,7 +5,8 @@ runner retries the same input with bounded, jittered backoff
 (:class:`chaski.retry.Backoff`). Each consumer counts its consecutive
 failures in :class:`HandlerHealth`: one failure makes the service
 ``degraded``, ``unhealthy_after`` of them make it ``unhealthy``. The first
-success clears the count. Every failure is logged with its traceback.
+success clears the count. A failure is logged with its traceback, unless it is
+an expected, retried condition such as Colca being away (:mod:`chaski.outage`).
 
 To pass an input on purpose, a handler raises :class:`Reject`. The runner
 records the rejection durably, as the service's ``rejected_input``
@@ -20,6 +21,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from .outage import warn_failure
 
 log = logging.getLogger("chaski.failures")
 
@@ -126,8 +129,8 @@ class HandlerHealth:
             return
         try:
             self.on_change(self.status, self.summary())
-        except Exception:
-            log.warning("Could not report handler health", exc_info=True)
+        except Exception as exc:
+            warn_failure(log, exc, "Could not report handler health")
 
 
 def rejection_finding(consumer: str, subject: dict[str, Any], reject: Reject, *, rejected: int) -> dict[str, Any]:

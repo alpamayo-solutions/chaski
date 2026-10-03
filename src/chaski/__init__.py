@@ -38,6 +38,7 @@ from .doorbell import Doorbell
 from .executor import Command, CommandRejected, CommandResult
 from .failures import HandlerHealth, Reject
 from .node import Node
+from .outage import ColcaUnavailable
 from .retained_view import ViewScope
 from .retry import Backoff
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
@@ -49,6 +50,7 @@ __all__ = [
     "Clock",
     "ClockNotReady",
     "ClockStatus",
+    "ColcaUnavailable",
     "Command",
     "CommandRejected",
     "CommandResult",
