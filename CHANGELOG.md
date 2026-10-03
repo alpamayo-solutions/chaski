@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.4](https://github.com/alpamayo-solutions/chaski/compare/v0.20.3...v0.20.4) (2026-10-03)
+
+
+### Fixes
+
+* **connector:** set aside samples the node refuses for good ([#122](https://github.com/alpamayo-solutions/chaski/issues/122)) ([f94dee0](https://github.com/alpamayo-solutions/chaski/commit/f94dee042b55d3b6ec5f413e253b19af84df0b29))
+
 ## [0.20.3](https://github.com/alpamayo-solutions/chaski/compare/v0.20.2...v0.20.3) (2026-10-02)
 
 
