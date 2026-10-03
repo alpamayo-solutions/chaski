@@ -137,9 +137,11 @@ DISCOVERY_RETRY_SECONDS = 15.0
 #: ``rejected_input`` finding.
 REFUSED_SAMPLES_CONSUMER = "connector-samples"
 
-#: colca's rejection reasons (``colca_rejected_publishes_total{reason}``) that
-#: are a verdict on the record itself: sending it again gets the same answer.
-#: ``draining`` is temporary and any reason not listed here is retried.
+#: colca's refusal reasons that are a verdict on the record itself: sending it
+#: again gets the same answer. The rejection reasons of
+#: ``colca_rejected_publishes_total{reason}`` and ``too_large``. ``draining``
+#: is temporary, ``not_written`` (admitted, but the store did not write it) is
+#: the node's failure, and any reason not listed here is retried.
 FINAL_REFUSAL_REASONS = frozenset(
     {
         "validation",
@@ -152,6 +154,7 @@ FINAL_REFUSAL_REASONS = frozenset(
         "human_write",
         "time_sync",
         "not_producer",
+        "too_large",
     }
 )
 
@@ -333,8 +336,8 @@ def refusal_is_final(result: Mapping[str, Any], *, batch_admitted: bool) -> bool
     A result with an offset is no refusal. A result without an ``error`` is
     no verdict either (a reply that lost its offset): retry it. A result that
     names colca's ``reason`` is final when the reason is in
-    :data:`FINAL_REFUSAL_REASONS`. colca up to 0.27 names none in a batch;
-    then the batch decides: the node judges every record before it writes,
+    :data:`FINAL_REFUSAL_REASONS`; a named reason always decides. colca up to
+    0.27 names none in a batch; then, as a fallback, the batch decides: the node judges every record before it writes,
     and writes the admitted records of one stream in one append, so a refusal
     in a batch where another record was admitted (``batch_admitted``) was the
     node's verdict on that record, not a failed write. A connector's batch is

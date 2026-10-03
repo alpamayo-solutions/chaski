@@ -1158,6 +1158,20 @@ def test_a_named_reason_decides_even_with_nothing_admitted(node, driver, monkeyp
     assert svc._pending == _batch(2)
 
 
+def test_not_written_is_retried_even_beside_an_admitted_sample(node, driver, monkeypatch):
+    """A named reason wins over the batch fallback: not_written beside an
+    admitted sample is the node's failed write, kept and sent again."""
+    svc = started(node, driver, monkeypatch)
+    publish = node.publish_batch
+    node.publish_batch = _refusing(node, {1}, reason="not_written")
+    with pytest.raises(PublishRejected):
+        svc._publish_batch(_batch(3))
+    assert svc._pending == _batch(3)[1:2] and svc.refused_samples_total == 0
+    node.publish_batch = publish
+    svc._publish_batch([])
+    assert [m.value for _, m in node.metrics()] == [0.0, 2.0, 1.0]
+
+
 @pytest.mark.parametrize(
     ("result", "batch_admitted", "final"),
     [
@@ -1175,6 +1189,8 @@ def test_a_named_reason_decides_even_with_nothing_admitted(node, driver, monkeyp
         ({"error": "x", "reason": "not_producer"}, False, True),
         ({"error": "x", "reason": "registry_contract"}, False, True),
         ({"error": "x", "reason": "time_sync"}, False, True),
+        ({"error": "x", "reason": "too_large"}, False, True),
+        ({"error": "x", "reason": "not_written"}, True, False),
         ({"error": "x", "reason": "draining"}, True, False),
         ({"error": "x", "reason": "something_new"}, True, False),
     ],
