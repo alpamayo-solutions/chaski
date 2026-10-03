@@ -23,6 +23,10 @@ producer runtime.
   records.
 * **A code change replays**: :func:`replay_changed_producers`, keyed by
   :func:`~chaski.dataops.codehash.compute_code_hash`.
+* **History older than the stream is backfilled**: a producer that declares
+  ``backfill`` is run once over its horizon from the historian, in windows,
+  before its live dispatch starts (:mod:`chaski.dataops.backfill`);
+  :meth:`DataOpsService.request_backfill` repairs a range.
 * **``_Constant``/``_Signal`` are watched, not ingested**:
   :mod:`chaski.dataops.watch` subscribes ``@on_constant``/``@on_signal``
   triggers directly on the node's retained records — neither contract has a
@@ -40,8 +44,9 @@ Startup order inside :meth:`DataOpsService.serve`:
  4. run every producer's ``on_ready()`` — outputs are bound, and no trigger
     has fired yet, so this is where startup compute belongs
  5. check every input window against the broker's metrics retention
- 6. build the ``signal_id -> [handler]`` dispatch table and the set of input
-    signal ids
+ 6. record the first backfill of every producer that declares one and hold
+    its live triggers (:mod:`chaski.dataops.backfill`), then build the
+    ``signal_id -> [handler]`` dispatch table and the set of input signal ids
  7. replay every producer whose code hash changed, a new one included: reset
     its watermark to the earliest buffered point of its inputs and feed the
     buffered records through the live handlers. Unchanged producers are left
@@ -49,7 +54,7 @@ Startup order inside :meth:`DataOpsService.serve`:
  8. retire the previous generation's ingest cursor, if one is known
  9. start the ingest task, and resolve again whenever the live index changes
     (:func:`follow_index`); without one, whenever a ``_Signal`` record under
-    the service changes, and after every reconnect
+    the service changes, and after every reconnect; start the backfill runner
  10. subscribe every ``@on_constant``/``@on_signal`` trigger
      (:mod:`chaski.dataops.watch`); the input topics that wake the ingest
      are subscribed when its stream opens (step 8)
@@ -92,6 +97,8 @@ from chaski.retained_view import ViewScope
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
+from .backfill import DEFAULT_BUSY, DEFAULT_RATE, BackfillRunner
+from .backfill import request as record_backfill_request
 from .base import Producer, Runtime, restore_checkpoint, runtime_now, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, consumer_name
@@ -218,6 +225,8 @@ def off_loop(method):
 
     @functools.wraps(method)
     def job() -> None:
+        if _held(instance):
+            return  # its backfill runs this tick at its instant
         health = getattr(instance._runtime, "handler_health", None)
         try:
             with instance._lock:
@@ -598,6 +607,8 @@ def make_handler(method, *, time_domain="application"):
     into a ``Metric``. Holds the producer's lock, like :func:`off_loop`."""
 
     async def _handler(record: Record) -> None:
+        if record.offset >= 0 and _held(method.__self__):
+            return  # buffered; its backfill handles it before live dispatch resumes
         metric = decode_metric(record)
         clock = getattr(method.__self__.runtime, "clock", None)
         instant = (
@@ -629,6 +640,18 @@ def make_handler(method, *, time_domain="application"):
 
     _handler.consumer = f"{method.__self__.name}.{method.__name__}"
     return _handler
+
+
+def _held(instance: Producer) -> bool:
+    """Whether the runtime holds ``instance``'s live triggers for its first backfill."""
+    holds = getattr(instance._runtime, "backfill_holds", None)
+    return holds is not None and holds(instance.name)
+
+
+def _epoch_of(value: Any) -> float:
+    from .outputs import _epoch
+
+    return _epoch(value)
 
 
 def decode_metric(record: Record) -> Metric:
@@ -675,7 +698,8 @@ async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) 
     goes on. Any other failure stops recovery: the producer's watermark and
     code hash are not marked complete, a checkpointed producer's state is put
     back, and the exception propagates, so the caller retries the replay.
-    Handlers must make repeated effects idempotent.
+    Handlers must make repeated effects idempotent. A producer whose first
+    backfill is still running is skipped; the backfill covers the buffer.
     """
     # One KV read for the whole sweep; the per-producer passes below reuse it.
     with resolve.one_pass(runtime.door):
@@ -685,6 +709,8 @@ async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) 
 async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
     buffer = runtime.buffer
     for instance in instances:
+        if _held(instance):
+            continue  # its first backfill covers the buffer too
         cls = type(instance)
         new_hash = codehash.compute_code_hash(cls)
         old_hash = buffer.code_hash(instance.name)
@@ -796,8 +822,10 @@ class DataOpsService(Service):
     against; ``historian`` an optional read-only
     :class:`~chaski.dataops.inputs.Historian`; ``retry_min``/
     ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
-    ``health_port`` the health door (``0`` for an ephemeral port). Every
-    other keyword is the base class's.
+    ``health_port`` the health door (``0`` for an ephemeral port);
+    ``backfill_rate`` (windows per second) and ``backfill_busy`` (share of
+    wall time) the most a backfill may take (:mod:`chaski.dataops.backfill`).
+    Every other keyword is the base class's.
     """
 
     def __init__(
@@ -812,8 +840,14 @@ class DataOpsService(Service):
         retry_min: float = 1.0,
         trim_interval: float = 3600.0,
         health_port: int = health.PORT_DEFAULT,
+        backfill_rate: float = DEFAULT_RATE,
+        backfill_busy: float = DEFAULT_BUSY,
         **service_kw: Any,
     ) -> None:
+        if backfill_rate <= 0:
+            raise ValueError("backfill_rate must be positive")
+        if not 0 < backfill_busy <= 1:
+            raise ValueError("backfill_busy must be in (0, 1]")
         super().__init__(name, mount, node=node, **service_kw)
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
@@ -821,6 +855,9 @@ class DataOpsService(Service):
         self._retry_min_s = retry_min
         self._trim_interval_s = trim_interval
         self._health_port = health_port
+        self._backfill_rate = backfill_rate
+        self._backfill_busy = backfill_busy
+        self._backfill: BackfillRunner | None = None
         self._producers: dict[str, type[Producer]] = {}
         self._local_buffer: Buffer | None = None
         self._ingest: Ingest | None = None
@@ -933,6 +970,36 @@ class DataOpsService(Service):
     @property
     def data_dir(self) -> Path:
         return self._data_dir
+
+    # -- backfill --------------------------------------------------------
+
+    def backfill_holds(self, producer: str) -> bool:
+        """Whether ``producer``'s live triggers are held while its first
+        backfill runs (:mod:`chaski.dataops.backfill`)."""
+        runner = self._backfill
+        return runner is not None and runner.holds(producer)
+
+    def request_backfill(self, producer: str, start: Any, end: Any) -> str:
+        """Run ``producer`` again over ``[start, end)`` (unix seconds or
+        datetimes), to repair what it emitted there. The job is recorded in the
+        buffer and runs on a separate instance, throttled like every backfill,
+        also after a restart. Returns the job id. Requires :meth:`start`; a
+        producer exposes it to the node with its own ``@on_command`` handler
+        calling ``self.runtime.request_backfill(self.name, start, end)``."""
+        producer_cls = self._producers.get(producer)
+        if producer_cls is None:
+            raise KeyError(f"no producer {producer!r} runs in this service")
+        runner = self._backfill
+        if runner is not None:
+            return runner.request(producer, _epoch_of(start), _epoch_of(end))
+        return record_backfill_request(self.buffer, producer_cls, start, end)
+
+    def _backfill_finding_topic(self) -> str:
+        from colca_data_contracts import topic_prefix
+
+        from .backfill import FINDING
+
+        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{FINDING}"
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1213,7 +1280,20 @@ class DataOpsService(Service):
                 historian_configured=self._historian is not None,
             )
 
-            # 6) The on_metric dispatch table and the declared input signal ids.
+            # 6) Record and hold the first backfill of every producer that
+            #    declares one, then the on_metric dispatch table and the
+            #    declared input signal ids.
+            if any(type(instance).backfill is not None for instance in instances) and (
+                self.step is not None or self.clock.definition_topic
+            ):
+                raise ValueError(
+                    "A producer declares a backfill, which runs on the node's own clock; "
+                    "this service runs on a factory clock or in coordinated steps"
+                )
+            backfill = BackfillRunner(self, instances, rate=self._backfill_rate, busy=self._backfill_busy)
+            await asyncio.to_thread(backfill.plan)
+            self._backfill = backfill
+            health_state.backfill = backfill.status
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
             # 7) Replay producers whose code changed. A failure is counted in
@@ -1283,6 +1363,12 @@ class DataOpsService(Service):
                         "%d declared input(s) unresolved — resolving again when they are commissioned.", unresolved
                     )
 
+            # Backfills run beside live intake, throttled; a producer whose first
+            # backfill runs has its live triggers held until it hands over.
+            backfill_task: asyncio.Task | None = None
+            if self.step is None:
+                backfill_task = supervised("backfill", lambda: backfill.run(stop))
+
             # 10) Every @on_constant/@on_signal subscription, and the @on_command
             #     executor.
             self._watch_constants_and_signals(instances)
@@ -1336,6 +1422,9 @@ class DataOpsService(Service):
                     # `stop` is already set, so the loop returns on its next wait;
                     # cancel covers the case where it is mid-KV-read.
                     reresolve_task.cancel()
+                if backfill_task is not None:
+                    backfill_task.cancel()
+                    await asyncio.gather(backfill_task, return_exceptions=True)
                 if commands_task is not None:
                     try:
                         await asyncio.wait_for(commands_task, timeout=10.0)
@@ -1362,6 +1451,7 @@ class DataOpsService(Service):
                         else:
                             log.warning("Teardown of %s could not finish: %s", instance.name, reason)
                 self._ingest = None
+                self._backfill = None
 
         finally:
             if health_server is not None:

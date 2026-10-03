@@ -532,6 +532,71 @@ the drains of `Service.consume`, DataOps ingest and the command executor resume
 on: they retry at once instead of waiting out their own backoff, which spaces
 retries only while the link stays up.
 
+### Backfill history older than the stream
+
+The metrics stream holds only the node's stream retention. A producer that
+must also cover older history, from a historian, declares a backfill. It runs
+once, on the producer's first start, with the same handlers as live:
+
+```python
+from chaski.dataops import AnnotationOutput, Backfill, DataOpsService, Producer, SignalRangeInput, on_metric
+
+class Cycles(Producer):
+    name = "cycles"
+    system_element_name = "press"
+    backfill = Backfill(horizon="400d", window="6h")
+
+    state = SignalRangeInput("state", window="1h")
+    cycle = AnnotationOutput("cycle")
+
+    @on_metric("state")
+    async def on_state(self, metric) -> None:
+        ...  # self.cycle.write_interval(start, end, value): the id derives from the interval
+
+DataOpsService("dataops", historian=my_historian, backfill_rate=1.0, backfill_busy=0.5).add(Cycles).run()
+```
+
+- **Range.** From `now - horizon` to the live edge, the newest point the
+  ingest has buffered for the producer's inputs. Older points come from the
+  `historian` (the `Historian` port; chaski ships no implementation). Without
+  a historian the backfill covers what the buffer holds.
+- **Same code path.** Each window's records go, in timestamp order, through the
+  producer's `@on_metric` handlers, and its `@every`/`@cron` ticks fire at
+  their instants (interval ticks on multiples of the interval, cron in UTC).
+  `self.now` is the record's timestamp or the tick's instant. Inputs read
+  source-transparently, as live.
+- **Handover.** While the backfill runs, the producer's live `@on_metric` and
+  `@every`/`@cron` triggers are held; the ingest keeps buffering. At the live
+  edge the backfill takes the ingest's page lock, processes the rest of the
+  buffer and releases the producer. Each record is handled once, by one
+  instance, in order: no gap and no double emission.
+- **Resumable.** Progress is committed per window, with the producer's
+  checkpoint when it sets `state_version`. A restart resumes at the last
+  committed window. A code change restarts the job from its start.
+- **Throttled.** At most `backfill_rate` windows per second, and busy at most
+  `backfill_busy` of the wall time.
+- **Progress.** The health door reports `backfill` (job, range, position,
+  share done, whether live is held). A retained `backfill` `_Finding` stands
+  while a job runs and is retired when none is left. A failure is retried with
+  backoff and reported in `handler_health` as `task backfill`.
+- **Repair.** `svc.request_backfill("cycles", start, end)` runs the producer
+  again over `[start, end)` on a separate instance, throttled the same way and
+  resumable. Output identities are deterministic (annotation ids from the
+  interval, samples by signal and timestamp), so a range live processing
+  already covered is overwritten, not duplicated. To trigger it from the node,
+  a producer can expose a command:
+
+```python
+@on_command("press/cycles/repair")
+async def repair(self, command) -> str:
+    job = self.runtime.request_backfill(self.name, command.params["from"], command.params["to"])
+    return f"backfill {job} queued"
+```
+
+A backfill runs on the node's own clock: a service on a factory clock or in
+coordinated steps refuses a producer that declares one. Handlers must not read
+past their record's timestamp; live, that data does not exist yet.
+
 ## Run a node
 
 ```python

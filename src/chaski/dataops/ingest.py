@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from random import SystemRandom
@@ -153,6 +154,12 @@ class Ingest:
         self._stream = open_stream(self._cursor_name, self._signal_ids)
         self._previous_generation = previous_generation
         self._bell = Doorbell()
+        #: Held while one page is appended and dispatched. A backfill hands a
+        #: producer over to live dispatch under it, between two pages
+        #: (:mod:`chaski.dataops.backfill`).
+        self.page_lock = threading.Lock()
+        #: Rung each time a drain reaches the head and the loop starts to wait.
+        self.caught_up = Doorbell()
         self._window_started = time.monotonic()
         self._last_drain_at = self._window_started
         self._window_records = 0
@@ -303,7 +310,7 @@ class Ingest:
         self._failed = None
         # One commit per page: the page is acked only after it, and a crash
         # before the ack appends the page again.
-        with self._buffer.one_commit():
+        with self.page_lock, self._buffer.one_commit():
             for record in page.records:
                 signal_id = self._append(record)
                 if signal_id is not None and self._dispatch.get(signal_id):
@@ -647,6 +654,7 @@ class Ingest:
                 continue
 
             self.waiting = True
+            self.caught_up.ring()
             wake_task = asyncio.ensure_future(self._bell.after(seen))
             stop_task = asyncio.ensure_future(stop.wait())
             try:

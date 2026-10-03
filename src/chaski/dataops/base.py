@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from chaski.door import Door
 
+    from .backfill import Backfill
     from .buffer import Buffer
     from .inputs import Historian
 
@@ -100,6 +101,11 @@ class Producer(ABC):
     # values are part of the code hash, so changing one triggers a replay like
     # a code change does.
     config_keys: ClassVar[tuple[str, ...]] = ()
+
+    # Opt in to process history older than live intake, once, before live
+    # dispatch starts: ``backfill = Backfill(horizon="400d", window="6h")``.
+    # See chaski.dataops.backfill.
+    backfill: ClassVar[Backfill | None] = None
 
     # Opt in for state changed by on_metric handlers. Both hooks are required.
     # Timers/commands with state need their own explicit recovery transaction.

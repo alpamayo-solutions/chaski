@@ -1,0 +1,529 @@
+"""The DataOps backfill (``chaski.dataops.backfill``) against a fake door, a
+fake historian and a real buffer.
+
+The historian here is a stand-in for the ``Historian`` port: chaski ships no
+implementation, and a real one needs a database. The broker-backed checks are
+in ``test_dataops_backfill_integration.py``.
+
+The reference for "what live processing produces" is the producer's own
+``@on_metric`` handler called once per record, in timestamp order, on a fresh
+instance over the whole history: the order live ingest dispatches in-order data.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+
+import pandas as pd
+import pytest
+from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry, run_async, signal_entry
+
+from chaski.clock import Clock
+from chaski.dataops import AnnotationOutput, Backfill, Producer, SignalRangeInput, every, on_metric
+from chaski.dataops.backfill import INITIAL, BackfillRunner, tick_instants
+from chaski.dataops.buffer import Buffer
+from chaski.dataops.outputs import bind_annotation_outputs
+from chaski.dataops.service import make_handler, replay_changed_producers, synthetic_record
+from chaski.dataops.triggers import CronSpec, IntervalSpec
+from chaski.door import Record
+from chaski.doorbell import Doorbell
+
+SIGNAL = "sig-state"
+DAY = 86400.0
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registry():
+    saved = dict(Producer._registry)
+    yield
+    Producer._registry.clear()
+    Producer._registry.update(saved)
+
+
+class FakeHistorian:
+    """The ``Historian`` port over an in-memory point list, like a historian
+    that kept what the stream no longer holds."""
+
+    def __init__(self, points: dict[str, list[tuple[float, object]]]) -> None:
+        self.points = {sid: sorted(rows) for sid, rows in points.items()}
+        self.windows: list[tuple[float, float]] = []
+
+    def window(self, signal_id, start, end):
+        self.windows.append((start, end))
+        rows = [(ts, v) for ts, v in self.points.get(signal_id, []) if start <= ts < end]
+        return pd.DataFrame({"ts": [r[0] for r in rows], "value": [r[1] for r in rows]}, columns=["ts", "value"])
+
+    def latest_before(self, signal_id, before):
+        rows = [(ts, v) for ts, v in self.points.get(signal_id, []) if ts <= before]
+        return rows[-1] if rows else None
+
+
+class FakeService(FakeRuntime):
+    """What the runner needs from a ``DataOpsService``."""
+
+    def __init__(self, door, buffer, historian) -> None:
+        super().__init__(door, buffer, historian)
+        self._ingest = None
+        self.rejected: list[tuple[str, dict]] = []
+        self.runner: BackfillRunner | None = None
+
+    def backfill_holds(self, producer: str) -> bool:
+        return self.runner is not None and self.runner.holds(producer)
+
+    def reject(self, consumer, subject, rejected) -> None:
+        self.rejected.append((consumer, subject))
+
+    def _backfill_finding_topic(self) -> str:
+        return f"colca/v1/_Finding/{NODE_ID}/dataops/backfill"
+
+
+def _door() -> FakeDoor:
+    return FakeDoor(
+        [
+            signal_entry(SIGNAL, "state"),
+            kv_entry(f"colca/v1/_AnnotationType/{NODE_ID}/cycle", {"id": "at-cycle", "name": "cycle"}),
+        ]
+    )
+
+
+def _history(start: float, count: int, step: float = 600.0) -> list[tuple[float, int]]:
+    """A machine state signal: two samples running, one stopped, repeating."""
+    return [(start + i * step, 0 if i % 3 == 0 else 1) for i in range(count)]
+
+
+def segmenter(horizon="10d", window="6h"):
+    """A producer that cuts cycles from a state signal, with in-memory state
+    and source-transparent reads, like a cycle segmenter."""
+
+    class Segmenter(Producer):
+        name = "segmenter"
+        system_element_name = "press"
+        state_version = 1
+        backfill = Backfill(horizon=horizon, window=window)
+
+        state = SignalRangeInput("state", window="1h")
+        cycle = AnnotationOutput("cycle")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.open: float | None = None
+            self.handled: list[float] = []
+
+        def snapshot_state(self):
+            return {"open": self.open}
+
+        def restore_state(self, state) -> None:
+            self.open = state["open"]
+
+        @on_metric("state")
+        async def on_state(self, metric) -> None:
+            self.handled.append(metric.timestamp)
+            previous = self.state.latest_value_before(metric.timestamp - 1e-6)
+            if metric.value and not previous:
+                self.open = metric.timestamp
+                self.cycle.write_interval(self.open, None, "running")
+            elif not metric.value and previous and self.open is not None:
+                self.cycle.write_interval(self.open, metric.timestamp, "done")
+                self.open = None
+
+    return Segmenter
+
+
+def _attach(cls, service):
+    instance = cls().attach(service)
+    bind_annotation_outputs([instance], node_id=NODE_ID, mount="")
+    return instance
+
+
+def _annotations(door: FakeDoor) -> dict[str, dict]:
+    """The last write per annotation id, as a consumer keeps them."""
+    kept: dict[str, dict] = {}
+    for topic, payload in door.published:
+        if "/_Annotation/" in topic:
+            body = json.loads(payload)
+            kept[body["annotation_id"]] = {k: body[k] for k in ("time_start", "time_end", "value")}
+    return kept
+
+
+def _annotation_writes(door: FakeDoor) -> list[str]:
+    return [json.loads(p)["annotation_id"] for t, p in door.published if "/_Annotation/" in t]
+
+
+async def _reference(cls, history, tmp_path) -> dict[str, dict]:
+    """What a single live pass over the whole history emits."""
+    buffer = Buffer(tmp_path / "reference.sqlite3")
+    try:
+        door = _door()
+        service = FakeService(door, buffer, None)
+        instance = _attach(cls, service)
+        handler = make_handler(instance.on_state)
+        for offset, (ts, value) in enumerate(history, start=1):
+            buffer.append(SIGNAL, ts, value)
+            record = synthetic_record(SIGNAL, ts, value)
+            await handler(Record(**{**record.__dict__, "offset": offset}))
+        return _annotations(door)
+    finally:
+        buffer.close()
+
+
+class _Ingest:
+    """The two things the runner reads from the ingest."""
+
+    def __init__(self) -> None:
+        self.page_lock = threading.Lock()
+        self.caught_up = Doorbell()
+        self.caught_up.ring()
+
+
+def _setup(cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0):
+    """A service whose historian holds ``archive`` + ``buffered`` and whose
+    buffer holds ``buffered``, as after the ingest drained the stream."""
+    buffer = Buffer(tmp_path / name)
+    for ts, value in buffered:
+        buffer.append(SIGNAL, ts, value)
+    service = FakeService(_door(), buffer, FakeHistorian({SIGNAL: [*archive, *buffered]}))
+    service._ingest = _Ingest()
+    instance = _attach(cls, service)
+    runner = BackfillRunner(service, [instance], rate=rate, busy=busy)
+    service.runner = runner
+    runner.plan()
+    return service, instance, runner, buffer
+
+
+async def _run_until_done(runner, name="segmenter", timeout=20.0):
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    deadline = time.monotonic() + timeout
+    while runner.holds(name) or runner.status() or runner._buffer.backfill_jobs(pending_only=True):
+        assert not task.done() or task.exception() is None, task.exception()
+        assert time.monotonic() < deadline, "backfill did not finish"
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+
+
+# ─── the first backfill ────────────────────────────────────────────────────
+
+
+@run_async
+async def test_backfill_emits_what_one_live_pass_over_the_same_history_emits(tmp_path):
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    cls = segmenter()
+    archive, buffered = history[:300], history[300:]
+    service, instance, runner, buffer = _setup(cls, tmp_path, archive=archive, buffered=buffered)
+    assert runner.holds("segmenter")
+
+    await _run_until_done(runner)
+
+    expected = await _reference(segmenter(), history, tmp_path)
+    assert _annotations(service.door) == expected
+    assert len(expected) > 50
+    # Every record handled once, in order, by the one instance.
+    assert instance.handled == [ts for ts, _ in history]
+    job = buffer.backfill_job("segmenter", INITIAL)
+    assert job is not None and job["done"]
+    # Handed over like a replay: the next start does not replay the buffer again.
+    assert buffer.watermark("segmenter") == history[-1][0]
+    buffer.close()
+
+
+@run_async
+async def test_live_triggers_are_held_until_the_handover_and_then_dispatch_once(tmp_path):
+    now = time.time()
+    history = _history(now - 2 * DAY, 2 * 144)
+    cls = segmenter()
+    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:200], buffered=history[200:250])
+    live = make_handler(instance.on_state)
+    ingest = service._ingest
+
+    def live_record(offset, ts, value):
+        return Record(**{**synthetic_record(SIGNAL, ts, value).__dict__, "offset": offset})
+
+    # The ingest is mid-page: the handover waits for it.
+    ingest.page_lock.acquire()
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while not (runner.status().get("running") or {}).get("progress", 0) > 0.9:
+        await asyncio.sleep(0.01)
+    # Records of that page: buffered, but not dispatched while the producer is held.
+    for offset, (ts, value) in enumerate(history[250:260], start=1000):
+        buffer.append(SIGNAL, ts, value)
+        await live(live_record(offset, ts, value))
+    assert runner.holds("segmenter")
+    ingest.page_lock.release()
+
+    while runner.holds("segmenter"):
+        await asyncio.sleep(0.01)
+    # Later pages are dispatched live.
+    for offset, (ts, value) in enumerate(history[260:], start=2000):
+        buffer.append(SIGNAL, ts, value)
+        await live(live_record(offset, ts, value))
+    stop.set()
+    await task
+
+    assert instance.handled == [ts for ts, _ in history]
+    assert _annotations(service.door) == await _reference(segmenter(), history, tmp_path)
+    buffer.close()
+
+
+@run_async
+async def test_a_restart_mid_backfill_resumes_at_the_last_committed_window(tmp_path):
+    now = time.time()
+    history = _history(now - 4 * DAY, 4 * 144)
+    archive, buffered = history[:500], history[500:]
+    service, instance, runner, buffer = _setup(segmenter(), tmp_path, archive=archive, buffered=buffered, rate=50.0)
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while (buffer.backfill_job("segmenter", INITIAL) or {}).get("windows", 0) < 5:
+        await asyncio.sleep(0.005)
+    stop.set()
+    await task
+    job = buffer.backfill_job("segmenter", INITIAL)
+    assert job is not None and not job["done"]
+    position = job["position"]
+    first_run = list(instance.handled)
+    buffer.close()
+
+    # A new process: same buffer file, a fresh instance.
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    service2 = FakeService(service.door, buffer, service.historian)
+    service2._ingest = _Ingest()
+    resumed = _attach(segmenter(), service2)
+    runner2 = BackfillRunner(service2, [resumed], rate=1000.0, busy=1.0)
+    service2.runner = runner2
+    runner2.plan()
+    assert runner2.holds("segmenter")
+    await _run_until_done(runner2)
+
+    # It went on at the committed window, with the checkpointed state.
+    assert resumed.handled[0] >= position
+    assert sorted(set(first_run) | set(resumed.handled)) == [ts for ts, _ in history]
+    assert _annotations(service.door) == await _reference(segmenter(), history, tmp_path)
+    buffer.close()
+
+
+@run_async
+async def test_without_a_historian_the_backfill_covers_what_the_buffer_holds(tmp_path):
+    now = time.time()
+    history = _history(now - DAY, 144)
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    for ts, value in history:
+        buffer.append(SIGNAL, ts, value)
+    service = FakeService(_door(), buffer, None)
+    service._ingest = _Ingest()
+    instance = _attach(segmenter(horizon="30d"), service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+
+    await _run_until_done(runner)
+
+    assert instance.handled == [ts for ts, _ in history]
+    buffer.close()
+
+
+@run_async
+async def test_a_held_producer_is_left_out_of_the_code_change_replay(tmp_path):
+    now = time.time()
+    history = _history(now - DAY, 50)
+    service, instance, _runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=history)
+
+    await replay_changed_producers(service, [instance])
+
+    assert instance.handled == []
+    assert buffer.code_hash("segmenter") is None
+    buffer.close()
+
+
+@run_async
+async def test_a_finished_backfill_is_not_run_again_on_the_next_start(tmp_path):
+    now = time.time()
+    history = _history(now - DAY, 50)
+    service, _instance, runner, buffer = _setup(segmenter(), tmp_path, archive=history, buffered=[])
+    await _run_until_done(runner)
+    writes = len(service.door.published)
+
+    again = _attach(segmenter(), service)
+    runner2 = BackfillRunner(service, [again], rate=1000.0, busy=1.0)
+    service.runner = runner2
+    runner2.plan()
+
+    assert not runner2.holds("segmenter")
+    await _run_until_done(runner2)
+    assert again.handled == []
+    assert len([t for t, _ in service.door.published[writes:] if "/_Annotation/" in t]) == 0
+    buffer.close()
+
+
+# ─── repair ────────────────────────────────────────────────────────────────
+
+
+@run_async
+async def test_a_repair_over_a_processed_range_rewrites_the_same_annotations(tmp_path):
+    now = time.time()
+    history = _history(now - 2 * DAY, 2 * 144)
+    service, instance, runner, buffer = _setup(segmenter(), tmp_path, archive=history[:100], buffered=history[100:])
+    await _run_until_done(runner)
+    before = _annotations(service.door)
+    writes = len(_annotation_writes(service.door))
+
+    job = runner.request("segmenter", history[0][0], history[-1][0] + 1)
+    assert job.startswith("repair-")
+    await _run_until_done(runner)
+
+    # The same ids again, nothing new: overlap with live output is idempotent.
+    assert _annotations(service.door) == before
+    rewritten = _annotation_writes(service.door)[writes:]
+    assert rewritten and set(rewritten) <= set(before)
+    # The live instance was not used, and live dispatch was never held.
+    assert instance.handled == [ts for ts, _ in history]
+    assert not runner.holds("segmenter")
+    done = buffer.backfill_job("segmenter", job)
+    assert done is not None and done["done"]
+    buffer.close()
+
+
+def test_a_repair_needs_a_known_producer_and_a_forward_range(tmp_path):
+    _service, _instance, runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=[])
+    with pytest.raises(KeyError):
+        runner.request("nope", 0.0, 1.0)
+    with pytest.raises(ValueError):
+        runner.request("segmenter", 2.0, 1.0)
+    buffer.close()
+
+
+# ─── throttle ──────────────────────────────────────────────────────────────
+
+
+@run_async
+async def test_the_rate_limits_windows_per_second(tmp_path):
+    now = time.time()
+    history = _history(now - 10 * 3600, 60)
+    cls = segmenter(horizon="10h", window="1h")
+    _service, _instance, runner, buffer = _setup(cls, tmp_path, archive=history, buffered=[], rate=20.0)
+
+    began = time.monotonic()
+    await _run_until_done(runner)
+    elapsed = time.monotonic() - began
+
+    windows = buffer.backfill_job("segmenter", INITIAL)["windows"]
+    assert windows >= 10
+    # Each window but the handover is followed by its pause.
+    assert elapsed >= (windows - 1) / 20.0
+    buffer.close()
+
+
+@run_async
+async def test_the_busy_share_limits_how_much_of_the_time_it_works(tmp_path):
+    now = time.time()
+    history = _history(now - 6 * 3600, 36)
+    cls = segmenter(horizon="6h", window="1h")
+
+    class Slow(cls):  # type: ignore[valid-type, misc]
+        @on_metric("state")
+        async def on_state(self, metric) -> None:
+            time.sleep(0.01)
+            await super().on_state(metric)
+
+    _service, _instance, runner, buffer = _setup(Slow, tmp_path, archive=history, buffered=[], busy=0.25)
+    began = time.monotonic()
+    await _run_until_done(runner)
+    elapsed = time.monotonic() - began
+
+    busy = 0.01 * len(history)
+    # At most a quarter of the time is work; the last window has no pause.
+    assert elapsed >= busy + 3 * (busy - 0.01 * 6)
+    buffer.close()
+
+
+# ─── ticks, progress ───────────────────────────────────────────────────────
+
+
+def test_tick_instants_tile_a_range_without_gaps_or_repeats():
+    spec = IntervalSpec(seconds=900.0)
+    start, mid, end = 1_700_000_123.0, 1_700_003_333.3, 1_700_010_000.0
+    tiled = tick_instants(spec, start, mid) + tick_instants(spec, mid, end)
+    assert tiled == tick_instants(spec, start, end)
+    assert all(t % 900 == 0 for t in tiled)
+    hourly = CronSpec("0 * * * *")
+    tiled = tick_instants(hourly, start, mid) + tick_instants(hourly, mid, end)
+    assert tiled == tick_instants(hourly, start, end) == [1_700_002_800.0, 1_700_006_400.0]
+
+
+@run_async
+async def test_ticks_fire_at_their_instants_between_the_records(tmp_path):
+    now = time.time()
+    start = (now - 3 * 3600) // 3600 * 3600
+
+    class Hourly(Producer):
+        name = "hourly"
+        system_element_name = "press"
+        backfill = Backfill(horizon="4h", window="1h")
+        state = SignalRangeInput("state", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[tuple[str, float]] = []
+
+        @on_metric("state")
+        async def on_state(self, metric) -> None:
+            self.seen.append(("metric", metric.timestamp))
+
+        @every("1h")
+        async def tick(self) -> None:
+            self.seen.append(("tick", self.now))
+
+    history = [(start + 1800.0 + i * 3600, 1) for i in range(3)]
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    service = FakeService(_door(), buffer, FakeHistorian({SIGNAL: history}))
+    service.clock = Clock()
+    service._ingest = _Ingest()
+    instance = Hourly().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+    await _run_until_done(runner, "hourly")
+
+    job = buffer.backfill_job("hourly", INITIAL)
+    expected = tick_instants(IntervalSpec(seconds=3600.0), job["start"], job["position"])
+    assert [ts for kind, ts in instance.seen if kind == "tick"] == expected
+    assert [ts for kind, ts in instance.seen if kind == "metric"] == [ts for ts, _ in history]
+    order = [ts for _, ts in instance.seen]
+    assert order == sorted(order)
+    buffer.close()
+
+
+@run_async
+async def test_progress_is_reported_and_the_finding_retired_when_done(tmp_path):
+    now = time.time()
+    history = _history(now - 2 * DAY, 2 * 144)
+    service, _instance, runner, buffer = _setup(
+        segmenter(), tmp_path, archive=history[:200], buffered=history[200:], rate=200.0
+    )
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    seen = None
+    while seen is None:
+        running = runner.status().get("running")
+        if running and running["windows"] > 0:
+            seen = running
+        await asyncio.sleep(0.005)
+    assert seen["producer"] == "segmenter"
+    assert seen["job"] == INITIAL
+    assert seen["to"] == "live edge"
+    assert seen["holds_live"] is True
+    assert 0 < seen["progress"] < 1
+    while runner.holds("segmenter") or runner.status():
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+
+    findings = [(t, p) for t, p in service.door.published if t.endswith("/_Finding/n-1/dataops/backfill")]
+    assert findings[0][1] and json.loads(findings[0][1])["reason"] == "backfill"
+    assert findings[-1][1] == ""  # retracted
+    buffer.close()

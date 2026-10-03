@@ -57,6 +57,10 @@ class HealthState:
     ``starting`` and ``not_ready`` naming what startup waits for: a node that
     cannot be reached (``cannot reach Colca at ...``), its clock, its
     definitions. The door answers from the first moment, before the node does.
+
+    ``backfill`` reports a running backfill (:mod:`chaski.dataops.backfill`):
+    the job, its range, position and share done. A backfill in progress is
+    healthy; one that fails is counted in ``handlers`` like any task.
     """
 
     started_at: float = field(default_factory=time.time)
@@ -78,6 +82,8 @@ class HealthState:
     handlers: HandlerHealth | None = None
     #: What startup waits for while not ``ready``.
     not_ready: Callable[[], str] | None = None
+    #: The running backfill and how many are pending, ``{}`` while none is.
+    backfill: Callable[[], dict] | None = None
     _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
@@ -151,6 +157,9 @@ class HealthState:
             body["not_ready"] = self.not_ready()
         if self.ingest_task is not None and self.last_drain_at is not None:
             body["since_drain_s"] = round(self._since_drain(), 1)
+        backfill = self.backfill() if self.backfill is not None else {}
+        if backfill:
+            body["backfill"] = backfill
         if lag:
             body["cursor_lag"] = lag
         if conflict:

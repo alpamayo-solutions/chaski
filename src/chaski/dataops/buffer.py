@@ -4,7 +4,8 @@ One file under the service's data directory. ``points`` (the
 retained window per input signal), ``watermarks`` (replay progress per
 producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
 (the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
-its own), and ``pending_outputs`` (computed samples waiting for a signal binding
+its own), ``backfill_jobs`` (each backfill's range and committed position, see
+:mod:`chaski.dataops.backfill`), and ``pending_outputs`` (computed samples waiting for a signal binding
 or a successful publish), and ``command_ledger`` (the commands this service
 started executing and the answer each got, so a restart neither runs a command
 twice nor answers it twice).
@@ -67,6 +68,19 @@ CREATE TABLE IF NOT EXISTS command_ledger (
     correlation_id TEXT PRIMARY KEY,
     started_at     REAL NOT NULL,
     answer         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    producer    TEXT NOT NULL,
+    job         TEXT NOT NULL,
+    start       REAL NOT NULL,
+    "end"       REAL,
+    position    REAL NOT NULL,
+    windows     INTEGER NOT NULL DEFAULT 0,
+    code_hash   TEXT NOT NULL,
+    done        INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (producer, job)
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -369,6 +383,12 @@ class Buffer:
             row = self._conn.execute("SELECT MIN(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
+    def latest(self, signal_id: str) -> float | None:
+        """``MAX(ts)`` for ``signal_id``, or ``None`` if the buffer holds nothing for it."""
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def trim(self, horizons: dict[str, float], *, now: float | None = None) -> int:
         """Trim history while retaining the value in force at each window start.
 
@@ -445,3 +465,54 @@ class Buffer:
                 (source, start, end),
             ).fetchall()
         return [(r[0], r[1]) for r in rows]
+
+    # ------------------------------------------------------------------ backfill jobs
+
+    def backfill_jobs(self, *, pending_only: bool = False) -> list[dict[str, Any]]:
+        """Every backfill job, oldest first: ``producer``, ``job``, ``start``,
+        ``end`` (``None`` for a producer's first backfill, which ends at the
+        live edge), ``position``, ``windows``, ``code_hash``, ``done``."""
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT producer, job, start, "end", position, windows, code_hash, done, created_at '
+                "FROM backfill_jobs WHERE done = 0 OR ? ORDER BY created_at, producer, job",
+                (0 if pending_only else 1,),
+            ).fetchall()
+        keys = ("producer", "job", "start", "end", "position", "windows", "code_hash", "done", "created_at")
+        return [{**dict(zip(keys, row, strict=True)), "done": bool(row[7])} for row in rows]
+
+    def backfill_job(self, producer: str, job: str) -> dict[str, Any] | None:
+        """One job (see :meth:`backfill_jobs`), or ``None``."""
+        return next((j for j in self.backfill_jobs() if j["producer"] == producer and j["job"] == job), None)
+
+    def add_backfill_job(
+        self, producer: str, job: str, start: float, end: float | None, code_hash: str, *, created_at: float
+    ) -> bool:
+        """Record a job at its start. A job that exists is left as it is;
+        returns whether this call created it."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                'INSERT OR IGNORE INTO backfill_jobs (producer, job, start, "end", position, windows, code_hash, '
+                "done, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)",
+                (producer, job, start, end, start, code_hash, created_at),
+            )
+            return cur.rowcount > 0
+
+    def backfill_progress(self, producer: str, job: str, position: float, windows: int, code_hash: str) -> None:
+        """Record the end of the last window a job completed. Committed at
+        once, or with the enclosing :meth:`one_commit` (the producer's
+        checkpoint goes in the same commit)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE backfill_jobs SET position = ?, windows = ?, code_hash = ? WHERE producer = ? AND job = ?",
+                (position, windows, code_hash, producer, job),
+            )
+            if not self._deferred:
+                self._conn.commit()
+
+    def finish_backfill(self, producer: str, job: str) -> None:
+        """Mark a job done. Committed at once, or with the enclosing :meth:`one_commit`."""
+        with self._lock:
+            self._conn.execute("UPDATE backfill_jobs SET done = 1 WHERE producer = ? AND job = ?", (producer, job))
+            if not self._deferred:
+                self._conn.commit()
