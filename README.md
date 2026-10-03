@@ -255,6 +255,14 @@ the source offers), `read(targets)` (one poll of the bound tags) and `close()`.
 publishing on change, a heartbeat, buffering through a broker outage and
 reconnecting with backoff.
 
+A sample the node refuses for good (its schema, its topic rules, a missing
+grant, another producer's signal) does not hold up the samples behind it. The
+connector records it in its `rejected_input` `_Finding`, counts it
+(`refused_samples_total`, `Telemetry.sample_refused`) and drops it. A NaN or
+infinite reading is refused the same way before it is buffered, since JSON
+cannot carry it. Each signal is logged once per spell of refusals. Transport
+failures and refusals the node did not decide are kept and retried.
+
 ```python
 from chaski import ConnectorService, Driver
 
