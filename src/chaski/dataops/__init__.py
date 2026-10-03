@@ -13,6 +13,7 @@ node sees one more local service, not a kind of its own.
 
 from chaski.failures import Reject
 
+from .backfill import Backfill
 from .base import Producer, Runtime, save_checkpoint
 from .buffer import Buffer
 from .commands import Command, CommandRejected, CommandResult
@@ -24,6 +25,7 @@ from .triggers import cron, every, on_command, on_constant, on_metric, on_signal
 
 __all__ = [
     "AnnotationOutput",
+    "Backfill",
     "Buffer",
     "Command",
     "CommandRejected",
