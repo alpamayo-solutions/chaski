@@ -15,8 +15,9 @@ producer runtime.
   :class:`~chaski.dataops.buffer.Buffer` under ``data_dir`` holds input
   windows and watermarks; :func:`trim_buffer` prunes it.
 * **The historian is optional and read-only**: pass a
-  :class:`~chaski.dataops.inputs.Historian` as ``historian=``. The SDK ships
-  no database driver.
+  :class:`~chaski.dataops.inputs.Historian` as ``historian=``, or let the
+  service build a :class:`~chaski.dataops.NodeHistorian` over the node's API
+  from a service account's environment. The SDK ships no database driver.
 * **Outputs are catalogued**: :func:`~chaski.dataops.outputs.build_catalogue`
   declares them into the service's own catalogue, which is published as a
   ``_DataTags`` record like a connector's; annotations are ``_Annotation``
@@ -820,7 +821,10 @@ class DataOpsService(Service):
     directory, ``~/.colca/services/<name>``); ``retention`` is the broker's
     metrics retention in seconds, what a declared window is validated
     against; ``historian`` an optional read-only
-    :class:`~chaski.dataops.inputs.Historian`; ``retry_min``/
+    :class:`~chaski.dataops.inputs.Historian` -- without one, a
+    :class:`~chaski.dataops.NodeHistorian` over the node's API when
+    ``PREKIT_URL``, ``PREKIT_CLIENT_ID`` and ``PREKIT_CLIENT_SECRET`` are set
+    (:meth:`NodeHistorian.from_env`); ``retry_min``/
     ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
     ``health_port`` the health door (``0`` for an ephemeral port);
     ``backfill_rate`` (windows per second) and ``backfill_busy`` (share of
@@ -851,6 +855,14 @@ class DataOpsService(Service):
         super().__init__(name, mount, node=node, **service_kw)
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
+        self._owns_historian = False
+        if historian is None:
+            from .node_historian import NodeHistorian
+
+            historian = NodeHistorian.from_env()
+            if historian is not None:
+                self._owns_historian = True
+                log.info("Historian: the node API at %s, as service account %r", historian.url, historian.client_id)
         self._historian = historian
         self._retry_min_s = retry_min
         self._trim_interval_s = trim_interval
@@ -1023,6 +1035,8 @@ class DataOpsService(Service):
         if self._local_buffer is not None:
             self._local_buffer.close()
             self._local_buffer = None
+        if self._owns_historian:
+            cast(Any, self._historian).close()
 
     def instantiate(self) -> list[Producer]:
         """Instantiate every added producer and attach it to this runtime —
