@@ -356,3 +356,84 @@ def test_a_consumer_whose_handler_has_a_bug_logs_its_traceback(caplog):
         worker.join(5)
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1 and errors[0].exc_info is not None
+
+
+class _View:
+    """A definition cache whose view goes away and comes back, like
+    :class:`chaski.dataops.resolve.LiveIndex` over its retained view."""
+
+    def __init__(self) -> None:
+        from chaski._wakeup import Wakeup
+
+        self.changes = Wakeup()
+        self.live = True
+
+    def set_live(self, live: bool) -> None:
+        self.live = live
+        self.changes.notify()
+
+
+@run_async
+async def test_definition_bindings_rebind_as_soon_as_the_view_is_available_again():
+    """Resume on the prerequisite's event: the backoff step reached during the
+    outage does not delay the rebind once the view is available."""
+    import chaski.dataops.service as service_module
+
+    view = _View()
+    runtime = SimpleNamespace(door=SimpleNamespace(_dataops_definitions=view))
+    calls: list[float] = []
+    rebound = asyncio.Event()
+
+    def build(*_):
+        calls.append(time.monotonic())
+        if not view.live:
+            raise ColcaUnavailable("Retained view unavailable; waiting for subscription recovery")
+        return {}, [], 0
+
+    def rebind(*_):
+        if len(calls) > 1:
+            rebound.set()
+
+    stop = asyncio.Event()
+    with patch.object(service_module, "build_dispatch", build):
+        task = asyncio.create_task(
+            service_module.reresolve_loop(runtime, [], SimpleNamespace(rebind=rebind), stop, lambda: None)
+        )
+        await asyncio.sleep(0.05)
+        view.set_live(False)  # Colca away: the next pass fails
+        await asyncio.sleep(0.05)
+        assert len(calls) == 2, "a pass while the view is down fails once, then waits for the view"
+        await asyncio.sleep(2.0)  # longer than the first backoff steps
+        assert len(calls) == 2, "no retries on a timer while the view is down"
+        back = time.monotonic()
+        view.set_live(True)
+        await asyncio.wait_for(rebound.wait(), 1.0)
+        stop.set()
+        await asyncio.wait_for(task, 5)
+    assert calls[-1] - back < 0.5
+
+
+@run_async
+async def test_definition_bindings_back_off_while_the_view_is_available():
+    import chaski.dataops.service as service_module
+
+    view = _View()
+    runtime = SimpleNamespace(door=SimpleNamespace(_dataops_definitions=view))
+    calls: list[float] = []
+
+    def build(*_):
+        calls.append(time.monotonic())
+        raise RuntimeError("bug in a producer's input declaration")
+
+    stop = asyncio.Event()
+    with patch.object(service_module, "build_dispatch", build):
+        task = asyncio.create_task(
+            service_module.reresolve_loop(runtime, [], SimpleNamespace(rebind=lambda *_: None), stop, lambda: None)
+        )
+        await asyncio.sleep(0.3)
+        assert len(calls) == 1, "a failure while the view is up waits out its backoff (at least 0.5 s)"
+        view.changes.notify()  # a definition change retries at once
+        await asyncio.sleep(0.1)
+        assert len(calls) == 2
+        stop.set()
+        await asyncio.wait_for(task, 5)

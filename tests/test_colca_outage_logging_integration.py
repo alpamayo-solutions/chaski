@@ -100,12 +100,20 @@ def test_a_colca_outage_logs_one_warning_per_loop_and_no_traceback(tmp_path, fix
         stack.enter_context(_serving_dataops(dataops, asyncio.Event()))
         _wait(lambda: _healthy(health_port), timeout=30, what="DataOps healthy")
         assert TICKED.wait(10), "the timer never ran"
+        definitions = dataops._definition_cache
+        available_again: list[float] = []
+
+        def changed() -> None:
+            if definitions.live and not available_again:
+                available_again.append(time.time())
 
         with caplog.at_level(logging.DEBUG):
             first = len(caplog.records)
             node.stop()
             # Several retries of every loop while the node is away.
             time.sleep(6)
+            assert not definitions.live
+            definitions.add_listener(changed)
             node.start()
             _wait(lambda: _healthy(health_port), timeout=60, what="DataOps healthy again")
             TICKED.clear()
@@ -129,6 +137,10 @@ def test_a_colca_outage_logs_one_warning_per_loop_and_no_traceback(tmp_path, fix
 
     # The two loops that logged a traceback per retry before: one warning each.
     assert len(warnings("ticker.tick:")) == 1, warnings("ticker.tick:")
-    assert len(warnings("Definition bindings:")) <= 1, warnings("Definition bindings:")
+    assert len(warnings("Definition bindings:")) == 1, warnings("Definition bindings:")
+    # The bindings rebind on the view becoming available, not on a later backoff step.
+    rebound = [r.created for r in records if r.getMessage().startswith("Definition bindings: reached Colca after")]
+    assert available_again and rebound, (available_again, rebound)
+    assert rebound[0] - available_again[0] < 1.0, rebound[0] - available_again[0]
     # Every loop that warned said when it worked again, the timer included.
     assert "ticker.tick" in _started(records) <= _recovered(records), (_started(records), _recovered(records))

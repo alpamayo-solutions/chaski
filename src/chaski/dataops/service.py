@@ -474,7 +474,14 @@ async def supervise(
 
 
 async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> None:
-    """Rebind on definition updates, including reconnect and late commissioning."""
+    """Rebind on definition updates, including reconnect and late commissioning.
+
+    A pass that fails while the definition view is unavailable (Colca away)
+    waits for the view to become available again and retries at once: the
+    view's recovery is the event it resumes on, not a backoff step. A pass
+    that fails while the view is available retries with backoff, or at once
+    when the definitions change meanwhile.
+    """
     cache = getattr(runtime.door, "_dataops_definitions", None)
     if cache is None:
         raise RuntimeError("DataOps requires its subscribed definition cache")
@@ -496,11 +503,28 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             outage.recovered()
             await cache.changes.wait_async(version, stop=stop)
         except Exception as exc:
+            if not getattr(cache, "live", True):
+                # Colca away: resume when the view is available again.
+                if not outage.failed(exc):
+                    log.error(
+                        "Could not refresh definition bindings; retrying once definitions are available", exc_info=exc
+                    )
+                seen = version
+                while not stop.is_set() and not getattr(cache, "live", True):
+                    await cache.changes.wait_async(seen, stop=stop)
+                    seen = cache.changes.version
+                continue
+            if cache.changes.version != version:
+                # The view recovered or changed during the pass: retry with it now.
+                if not outage.failed(exc):
+                    log.error(
+                        "Could not refresh definition bindings; retrying with the changed definitions", exc_info=exc
+                    )
+                continue
             delay = retry.delay(exc)
             if not outage.failed(exc, delay=delay):
                 log.error("Could not refresh definition bindings; retrying in %.1fs", delay, exc_info=exc)
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=delay)
+            await cache.changes.wait_async(version, delay, stop=stop)
 
 
 def compute_trim_horizons(
