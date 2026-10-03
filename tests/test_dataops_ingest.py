@@ -501,9 +501,10 @@ async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
 
     delays = []
 
-    async def wait(delay, event):
+    async def wait(delay, event, *_wake):
         delays.append(delay)
         event.set()
+        return False
 
     ingest._step = refused
     ingest._sleep_or_stop = wait

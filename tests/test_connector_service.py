@@ -43,6 +43,7 @@ from chaski.connector import (
     refusal_is_final,
 )
 from chaski.door import KvEntry
+from chaski.doorbell import Doorbell
 
 NODE = "n-edge1"
 NAME = "connector-opcua"
@@ -66,6 +67,7 @@ class FakeNode:
         self.connected = True
         self.reject: Exception | None = None
         self.reconnects = 0
+        self.link_up = Doorbell()
         self.on_connect = None
         self.on_disconnect = None
         self.node_id = None

@@ -387,6 +387,7 @@ class RetainedView:
         batch = BatchWait(self.watch.changes, interval=DRAIN_INTERVAL_S, stop=self.stop)
         while not self.stop.is_set():
             version = self.watch.changes.version
+            resumed_seen = self.watch.reconnected.version
             revision = self.revision
             try:
                 self._refresh_changed()
@@ -400,7 +401,8 @@ class RetainedView:
                 retry = backoff.delay(exc)
                 if not self._outage.failed(exc, delay=retry):
                     log.error("Retained view %s unavailable; retrying in %.1fs", self.cursor, retry, exc_info=exc)
-            batch.wait(version, retry=retry)
+            if batch.wait(version, retry=retry, resume=self.watch.reconnected, resume_since=resumed_seen):
+                backoff.reset()  # the subscription is back: refresh now, back off afresh
 
     def close(self):
         self.stop.set()

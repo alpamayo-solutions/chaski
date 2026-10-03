@@ -25,6 +25,9 @@ class _NoNodeDoor:
         self.base_url = base_url
         self.service = service
         self.cert = cert
+        from chaski.doorbell import Doorbell
+
+        self.link_up = Doorbell()
 
     def close(self) -> None:
         pass
