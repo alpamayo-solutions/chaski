@@ -46,6 +46,7 @@ foreign system and ``publish()``-es what it learns, and follows a stream with
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import datetime
@@ -99,6 +100,14 @@ from .door import Door, KvEntry, Record, Stream
 from .doorbell import IDLE_DRAIN_S
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .pending import PendingSamples
+from .startup import (
+    STARTUP_LOG_REMINDER_S,
+    STARTUP_RETRY_MAX_S,
+    STARTUP_RETRY_MIN_S,
+    BrokerRefused,
+    Readiness,
+    colca_unreachable,
+)
 from .subscriptions import Subscriptions
 from .topic_wakeup import TopicFanout, TopicWakeup
 
@@ -600,6 +609,7 @@ class Service:
         # connection (monotonic), and the timer that retires the conflict.
         self._taken_over_at: float | None = None
         self._conflict_timer: threading.Timer | None = None
+        self._readiness = Readiness("not-started", "start() has not been called")
 
         if isinstance(node, LocalDoor):
             self._external = False
@@ -632,16 +642,30 @@ class Service:
         Outside a deployment, a refused CONNECT (the identity is not yet
         enrolled) raises :class:`NotEnrolled` — see :meth:`wait_enrolled` to
         poll instead of raising once.
+
+        One attempt: a node that cannot be reached raises. A long-running
+        service calls :meth:`start_when_reachable` instead, which retries.
+        :attr:`readiness` says how the attempt went.
         """
         if self._client is not None:
             return self
+        attempts = self._readiness.attempts + 1
+        if self._readiness.state == "waiting":
+            self._readiness = Readiness("waiting", self._readiness.reason, attempts)
+        else:
+            self._readiness = Readiness("connecting", f"connecting to Colca at {self._colca_address()}", attempts)
         try:
             if self._external:
                 self._start_external(connect_timeout)
             else:
                 self._start_local(connect_timeout)
-        except Exception:
+        except Exception as exc:
             self._reset_after_failed_connect()
+            if colca_unreachable(exc):
+                reason = f"cannot reach Colca at {self._colca_address()}: {type(exc).__name__}: {exc}"
+                self._readiness = Readiness("waiting", reason, attempts)
+            else:
+                self._readiness = Readiness("failed", f"{type(exc).__name__}: {exc}", attempts)
             raise
         if (self._state_dir / "pending-samples.sqlite3").exists():
             with self._lock:
@@ -655,7 +679,85 @@ class Service:
             if catalogue is not None:
                 self._publish_catalogue(catalogue)
             self._pending_wake.notify()
+        self._readiness = Readiness("ready", "", attempts)
         return self
+
+    @property
+    def readiness(self) -> Readiness:
+        """Whether :meth:`start` reached the node, and the reason while it has
+        not (see :class:`chaski.startup.Readiness`). A health door reports it
+        from the first moment, before the node answers. Once ready, the live
+        broker link is :meth:`is_broker_connected`."""
+        return self._readiness
+
+    def _colca_address(self) -> str:
+        """Where this service looks for its node, for a reason a person reads."""
+        if self._external:
+            return str(self._node_url)
+        door = self._local_door()
+        return f"{door.host} (http :{door.http_port}, mqtt :{door.mqtt_port})"
+
+    def start_when_reachable(self, stop: threading.Event | None = None, *, connect_timeout: float = 10.0) -> bool:
+        """:meth:`start`, retried while the node cannot be reached.
+
+        For a long-running service whose node may be down when it starts or
+        come up after it: it never gives up on an unreachable node. Between
+        attempts it waits a jittered backoff of at most
+        :data:`~chaski.startup.STARTUP_RETRY_MAX_S` seconds, longer when the
+        node answers ``429`` with ``Retry-After``, and :attr:`readiness`
+        reports ``waiting`` with the reason. Any other failure (a
+        configuration error) is raised at once.
+
+        Returns True once started, False if ``stop`` was set (or the service
+        closed) first.
+        """
+        from .retry import Backoff
+
+        stop = stop or threading.Event()
+        backoff = Backoff(minimum=STARTUP_RETRY_MIN_S, maximum=STARTUP_RETRY_MAX_S)
+        logged_reason, logged_at = "", -math.inf
+        while not stop.is_set() and not self._closed:
+            try:
+                self.start(connect_timeout=connect_timeout)
+            except Exception as exc:
+                if not colca_unreachable(exc):
+                    logger.error("chaski.Service: %s cannot start: %s", self.name, self._readiness.reason)
+                    raise
+                delay = backoff.delay(exc)
+                reason, now = self._readiness.reason, time.monotonic()
+                if reason != logged_reason or now - logged_at >= STARTUP_LOG_REMINDER_S:
+                    logger.warning(
+                        "chaski.Service: %s not ready: %s; retrying (attempt %d, next in %.1fs)",
+                        self.name,
+                        reason,
+                        self._readiness.attempts,
+                        delay,
+                    )
+                    logged_reason, logged_at = reason, now
+                stop.wait(delay)
+                continue
+            if self._readiness.attempts > 1:
+                logger.info("chaski.Service: %s reached Colca after %d attempts", self.name, self._readiness.attempts)
+            return True
+        return False
+
+    async def start_when_reachable_async(
+        self, stop: asyncio.Event | None = None, *, connect_timeout: float = 10.0
+    ) -> bool:
+        """:meth:`start_when_reachable` off the event loop, stopped by an
+        :class:`asyncio.Event`; the loop (and a health door on it) keeps
+        answering meanwhile."""
+        halt = threading.Event()
+        relay: asyncio.Future[Any] | None = None
+        if stop is not None:
+            relay = asyncio.ensure_future(stop.wait())
+            relay.add_done_callback(lambda _done: halt.set())
+        try:
+            return await asyncio.to_thread(self.start_when_reachable, halt, connect_timeout=connect_timeout)
+        finally:
+            halt.set()
+            if relay is not None:
+                relay.cancel()
 
     def _start_local(self, connect_timeout: float) -> None:
         door = self._local_door()
@@ -680,7 +782,9 @@ class Service:
                 mqtt_port=door.mqtt_port,
                 mount=self._mount,
                 identity=identity,
-                publish_logs=self.logs,
+                # Attached once connected below: an attempt that fails must not
+                # leave a log handler behind on a client that never connects.
+                publish_logs=False,
                 will=(self._details_topic, will_payload),
                 max_queued_messages=self._max_queued_messages,
             )
@@ -693,6 +797,8 @@ class Service:
         except Exception:
             self._reset_after_failed_connect()
             raise
+        if self.logs:
+            attach_log_publisher(client, self._hierarchy)
         self._after_connect()
 
     def _start_external(self, connect_timeout: float) -> None:
@@ -760,7 +866,7 @@ class Service:
             if self._external:
                 node_url, _ = self._external_identity()
                 raise NotEnrolled(self.name, node_url, self.enroll_hint())
-            raise RuntimeError(f"chaski.Service: broker refused CONNECT ({reason_code})")
+            raise BrokerRefused(reason_code)
         self._connected = True
 
     def _on_connect(self, client: Any, _userdata: Any, flags: Any, reason_code: Any, _properties: Any = None) -> None:

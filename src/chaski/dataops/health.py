@@ -52,6 +52,11 @@ class HealthState:
     ``handlers`` counts failing handlers: while one is retried the answer
     says ``degraded`` and names it; once one failed ``unhealthy_after`` times
     in a row it is a 503.
+
+    Until startup is done (``ready``) the answer is a 503 with ``ingest``
+    ``starting`` and ``not_ready`` naming what startup waits for: a node that
+    cannot be reached (``cannot reach Colca at ...``), its clock, its
+    definitions. The door answers from the first moment, before the node does.
     """
 
     started_at: float = field(default_factory=time.time)
@@ -71,6 +76,8 @@ class HealthState:
     #: Another process runs as this service, "" while none does.
     identity_conflict: Callable[[], str] | None = None
     handlers: HandlerHealth | None = None
+    #: What startup waits for while not ``ready``.
+    not_ready: Callable[[], str] | None = None
     _broker_down_since: float | None = field(default=None, repr=False)
 
     def _ingest(self) -> str:
@@ -140,6 +147,8 @@ class HealthState:
             "generation": self.generation,
             "uptime_s": round(time.time() - self.started_at, 1),
         }
+        if not self.ready and self.not_ready is not None:
+            body["not_ready"] = self.not_ready()
         if self.ingest_task is not None and self.last_drain_at is not None:
             body["since_drain_s"] = round(self._since_drain(), 1)
         if lag:
