@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -35,8 +36,11 @@ from chaski.connector import (
     Discovery,
     Driver,
     MqttDisconnectedError,
+    Reading,
     SourceDisconnectedError,
     Telemetry,
+    has_non_finite,
+    refusal_is_final,
 )
 from chaski.door import KvEntry
 
@@ -137,7 +141,7 @@ class FakeNode:
             raise PublishTimeout(str(topic), 10.0)
         self.published.append((str(topic), payload))
         if retain:
-            self.retained[str(topic)] = payload.__dict__
+            self.retained[str(topic)] = json.loads(payload) if isinstance(payload, str) else payload.__dict__
 
     def publish_tombstone(self, topic, qos: int = 0, wait: bool = True) -> None:
         pass
@@ -177,6 +181,9 @@ class FakeNode:
 
     def details(self) -> list[ServiceDetails]:
         return [p for _t, p in self.published if isinstance(p, ServiceDetails)]
+
+    def findings(self) -> list[dict]:
+        return [json.loads(p) for t, p in self.published if "/_Finding/" in t]
 
 
 class FakeDriver(Driver):
@@ -247,6 +254,9 @@ class RecordingTelemetry(Telemetry):
 
     def publish_rejected(self, reason_code: int) -> None:
         self.events.append(("rejected", reason_code))
+
+    def sample_refused(self, signal_id: str, reason: str) -> None:
+        self.events.append(("refused", signal_id, reason))
 
     def poll_completed(self, duration_s: float, *, overrun: bool) -> None:
         self.events.append(("poll", overrun))
@@ -869,7 +879,9 @@ def test_a_broker_outage_in_the_loop_reconnects_and_flushes_when_it_returns(node
     assert any("MQTT reconnected after" in m for m in messages)
 
 
-def test_a_rejected_metric_remains_durable_and_fails_visibly(node, driver, monkeypatch):
+def test_a_refusal_with_nothing_admitted_remains_durable_and_fails_visibly(node, driver, monkeypatch):
+    """Nothing in the batch was admitted, so the refusal may be a failed write
+    at the node: the sample stays and the failure is raised, not dropped."""
     telemetry = RecordingTelemetry()
     svc = started(node, driver, monkeypatch, telemetry=telemetry)
     node.reject = PublishRejected(0x99, "colca/v1/_Metric/x")
@@ -877,6 +889,7 @@ def test_a_rejected_metric_remains_durable_and_fails_visibly(node, driver, monke
         svc._publish_batch(_batch(1))
     assert svc._pending == _batch(1)
     assert ("rejected", 0x80) in telemetry.events
+    assert svc.refused_samples_total == 0 and node.findings() == []
 
 
 # ── an outage is a state ────────────────────────────────────────────────
@@ -1064,20 +1077,231 @@ def test_connector_outage_journal_survives_process_restart(node, driver, monkeyp
     resumed.close()
 
 
-def test_batch_partial_refusal_retries_only_unaccepted_samples(node, driver, monkeypatch):
-    svc = started(node, driver, monkeypatch)
+def _refusing(node: FakeNode, refused: set[int], reason: str | None = None):
+    """``node.publish_batch`` refusing the samples at the given positions."""
     publish = node.publish_batch
 
     def partial(rows):
-        return publish(rows[:1]) + [{"error": "invalid binding"} for _ in rows[1:]]
+        results = []
+        for i, row in enumerate(rows):
+            if i in refused:
+                result = {"error": "_Metric: payload failed the contract schema"}
+                if reason is not None:
+                    result["reason"] = reason
+                results.append(result)
+            else:
+                results += publish([row])
+        return results
 
-    node.publish_batch = partial
+    return partial
+
+
+def test_a_refusal_beside_an_admitted_sample_is_final_and_set_aside_once(node, driver, monkeypatch, caplog):
+    """The node admitted the rest of the batch, so it judged the refused
+    sample and refuses it for good: recorded, counted, removed. A second
+    refusal of the same signal in the same spell is counted, not recorded
+    again; an admitted sample of that signal ends the spell."""
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry)
+    publish = node.publish_batch
+    node.publish_batch = _refusing(node, {1})
+    with caplog.at_level(logging.INFO):
+        svc._publish_batch(_batch(3))
+        assert svc._pending == []
+        assert [m.value for _, m in node.metrics()] == [0.0, 2.0]
+        assert svc.refused_samples_total == 1
+        assert ("refused", "sig-1", "refused") in telemetry.events
+        [finding] = node.findings()
+        assert finding["reason"] == "rejected_input"
+        assert finding["detail"]["signal_id"] == "sig-1"
+        assert "contract schema" in finding["summary"]
+
+        svc._publish_batch(_batch(3))
+        assert svc._pending == [] and svc.refused_samples_total == 2
+        assert len(node.findings()) == 1, "once per signal per spell"
+        assert svc.refusing()["sig-1"].refused == 2
+
+        node.publish_batch = publish
+        svc._publish_batch(_batch(3))
+    assert "sig-1" not in svc.refusing()
+    assert any("admitted again after 2 refused samples" in r.getMessage() for r in caplog.records)
+    rejected = [r for r in caplog.records if "connector-samples rejected" in r.getMessage()]
+    assert len(rejected) == 1
+
+
+def test_a_refused_sample_that_cannot_be_recorded_stays_in_the_journal(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch)
+    node.publish_batch = _refusing(node, {1})
+    real_publish = node.publish
+
+    def no_findings(topic, payload, **kwargs):
+        if "/_Finding/" in str(topic):
+            raise PublishTimeout(str(topic), 10.0)
+        return real_publish(topic, payload, **kwargs)
+
+    node.publish = no_findings
+    with pytest.raises(MqttDisconnectedError):
+        svc._publish_batch(_batch(3))
+    assert svc._pending == _batch(3)[1:2], "admitted samples retire; the unrecorded refusal stays"
+    assert svc.refused_samples_total == 0
+
+
+def test_a_named_reason_decides_even_with_nothing_admitted(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch)
+    node.publish_batch = _refusing(node, {0}, reason="not_producer")
+    svc._publish_batch(_batch(1))
+    assert svc._pending == [] and svc.refused_samples_total == 1
+
+    node.publish_batch = _refusing(node, {0, 1}, reason="draining")
+    with pytest.raises(PublishRejected):
+        svc._publish_batch(_batch(2))
+    assert svc._pending == _batch(2)
+
+
+def test_not_written_is_retried_even_beside_an_admitted_sample(node, driver, monkeypatch):
+    """A named reason wins over the batch fallback: not_written beside an
+    admitted sample is the node's failed write, kept and sent again."""
+    svc = started(node, driver, monkeypatch)
+    publish = node.publish_batch
+    node.publish_batch = _refusing(node, {1}, reason="not_written")
     with pytest.raises(PublishRejected):
         svc._publish_batch(_batch(3))
-    assert svc._pending == _batch(3)[1:]
+    assert svc._pending == _batch(3)[1:2] and svc.refused_samples_total == 0
     node.publish_batch = publish
     svc._publish_batch([])
-    assert [m.value for _, m in node.metrics()] == [0, 1, 2]
+    assert [m.value for _, m in node.metrics()] == [0.0, 2.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("result", "batch_admitted", "final"),
+    [
+        ({"stream": "metrics", "offset": 3}, False, False),
+        ({"stream": "metrics", "offset": 3}, True, False),
+        ({}, True, False),
+        ({"error": "_Metric: field value missing"}, True, True),
+        ({"error": "_Metric: field value missing"}, False, False),
+        ({"error": "pebble: disk full"}, False, False),
+        ({"error": "x", "reason": "validation"}, False, True),
+        ({"error": "x", "reason": "grammar"}, False, True),
+        ({"error": "x", "reason": "node_id"}, False, True),
+        ({"error": "x", "reason": "identity"}, False, True),
+        ({"error": "x", "reason": "write_denied"}, False, True),
+        ({"error": "x", "reason": "not_producer"}, False, True),
+        ({"error": "x", "reason": "registry_contract"}, False, True),
+        ({"error": "x", "reason": "time_sync"}, False, True),
+        ({"error": "x", "reason": "too_large"}, False, True),
+        ({"error": "x", "reason": "not_written"}, True, False),
+        ({"error": "x", "reason": "draining"}, True, False),
+        ({"error": "x", "reason": "something_new"}, True, False),
+    ],
+)
+def test_refusal_classification(result, batch_admitted, final):
+    assert refusal_is_final(result, batch_admitted=batch_admitted) is final
+
+
+@pytest.mark.parametrize(
+    ("value", "non_finite"),
+    [
+        (1.5, False),
+        (0, False),
+        (True, False),
+        ("nan", False),
+        (None, False),
+        (math.nan, True),
+        (math.inf, True),
+        (-math.inf, True),
+        ([1.0, math.nan], True),
+        ({"a": {"b": -math.inf}}, True),
+        ([1.0, {"a": 2.0}], False),
+    ],
+)
+def test_non_finite_detection(value, non_finite):
+    assert has_non_finite(value) is non_finite
+
+
+def test_a_non_finite_reading_is_refused_before_the_journal(node, driver, monkeypatch, caplog):
+    """NaN and ±Inf cannot be written as JSON: the reading is set aside at
+    acquisition, once per spell, and the readings after it go out."""
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry)
+    poll(svc)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    with caplog.at_level(logging.INFO):
+        for value in (math.nan, math.inf, -math.inf):
+            driver.values["Axis1/Temperature"] = value
+            poll(svc)
+        assert svc._pending == [] and node.metrics() == []
+        assert svc.refused_samples_total == 3
+        assert telemetry.events.count(("refused", "s-temp", "non_finite")) == 3
+        [finding] = node.findings()
+        assert finding["detail"]["signal_id"] == "s-temp" and "non-finite" in finding["summary"]
+
+        driver.values["Axis1/Temperature"] = 42.5
+        poll(svc)
+    assert [m.value for _, m in node.metrics()] == [42.5]
+    assert svc.refusing() == {}
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+class SourceTimestampDriver(FakeDriver):
+    """Returns each reading with the source timestamp in ``stamp``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stamp = 1000.0
+
+    async def read(self, targets):
+        return [Reading(topic, value, signal, self.stamp) for topic, value, signal in await super().read(targets)]
+
+
+def test_a_non_finite_source_timestamp_is_refused_before_the_journal(node, monkeypatch, caplog):
+    driver = SourceTimestampDriver()
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry, timestamp_source="source")
+    poll(svc)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    with caplog.at_level(logging.INFO):
+        for stamp in (math.nan, math.inf):
+            driver.stamp = stamp
+            poll(svc)
+        assert svc._pending == [] and node.metrics() == []
+        assert svc.refused_samples_total == 2
+        assert telemetry.events.count(("refused", "s-temp", "non_finite_timestamp")) == 2
+        [finding] = node.findings()
+        assert "non-finite source timestamp" in finding["summary"]
+
+        driver.stamp = 1234.5
+        poll(svc)
+    assert [m.timestamp for _, m in node.metrics()] == [1234.5]
+    assert svc.refusing() == {}
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_a_journal_holding_only_refusals_still_acquires_so_the_next_sample_decides(node, driver, monkeypatch):
+    """Everything the node was sent was refused: undecided. The loop still
+    acquires one more cycle; the node admits that sample, which makes the
+    older refusal final."""
+    svc = started(node, driver, monkeypatch)
+    poll(svc)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    stale = (Topic(payload_type=Metric, node_id=NODE, context=("line1", "gone")), Metric(1.0, 0.0, signal_id="gone"))
+    svc._open_metric_queue().append_batch([(str(stale[0]), json.loads(stale[1].encode()), 0.0, None)], 10)
+    publish = node.publish_batch
+
+    def refuse_gone(rows):
+        results = []
+        for row in rows:
+            if json.loads(row[1])["signal_id"] == "gone":
+                results.append({"error": "_Metric: payload failed the contract schema"})
+            else:
+                results += publish([row])
+        return results
+
+    node.publish_batch = refuse_gone
+    poll(svc)
+    assert svc._pending == []
+    assert [m.value for _, m in node.metrics()] == [42.0]
+    assert svc.refused_samples_total == 1
 
 
 def test_batch_throttling_preserves_samples_and_server_retry_deadline(node, driver, monkeypatch):
