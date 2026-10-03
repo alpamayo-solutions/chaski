@@ -240,7 +240,8 @@ async def test_a_backfill_through_the_node_api_reads_windows_larger_than_a_page(
     window holds 36 samples and the API answers 5 per page, so every window
     is read over several pages, and the result is that of one live pass."""
     now = time.time()
-    history = _history(now - 3 * DAY, 3 * 144)
+    # Microsecond timestamps, what the historian stores and the API returns.
+    history = [(round(ts, 6), value) for ts, value in _history(now - 3 * DAY, 3 * 144)]
     archive, buffered = history[:300], history[300:]
     api = FakeNodeApi()
     api.add(SIGNAL, [*archive, *buffered])
