@@ -266,45 +266,95 @@ async def test_read_ahead_drains_a_backlog_faster_when_fetch_ack_and_processing_
     assert elapsed[True] < 0.75 * elapsed[False], elapsed
 
 
-class GrowingDoor(CursorDoor):
-    """A stream that gains one record every 5 ms, as a live input does."""
+class FakeClock:
+    """Application of the ingest's pacing to a clock the test owns: time moves
+    only when the ingest sleeps to pace a fetch, or when the test says so."""
 
-    def __init__(self) -> None:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, seconds)
+        await _real_sleep(0)
+
+
+_real_sleep = asyncio.sleep
+
+
+class _PacedAsyncio:
+    """The ``asyncio`` the ingest module sees: real, except ``sleep`` moves the fake clock."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.sleep = clock.sleep
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+class GrowingDoor(CursorDoor):
+    """A stream that gains one record every 5 ms of the fake clock, as a live input does."""
+
+    def __init__(self, clock: FakeClock) -> None:
         super().__init__(0)
-        self._t0 = time.monotonic()
+        self._clock = clock
+        self._t0 = clock.now
 
     def fetch(self, stream, cursor, *, max=1000, signal_ids=None, from_offset=None):
         with self._lock:
             have = len(self.records)
-            due = int((time.monotonic() - self._t0) / 0.005)
+            due = round((self._clock.now - self._t0) / 0.005)
             self.records.extend(_record(i) for i in range(have + 1, due + 1))
         return super().fetch(stream, cursor, max=max, signal_ids=signal_ids, from_offset=from_offset)
 
 
 @run_async
-async def test_drain_starts_are_batched_and_empty_head_reads_are_immediate(tmp_path):
+async def test_drain_starts_are_batched_and_empty_head_reads_are_immediate(tmp_path, monkeypatch):
     """A live stream at 200 records/s, read with 1000-record pages: every page
     is partial, so fetches are spaced by the interval and pages grow instead.
-    Every record rings the bell, as its MQTT message would."""
-    door = GrowingDoor()
+    Every record rings the bell, as its MQTT message would.
+
+    Time is the test's: records arrive and the pacing interval passes on a
+    fake clock, so how much arrives while a page is processed does not depend
+    on how fast the machine running the test is."""
+    from chaski.dataops import ingest as ingest_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(ingest_module, "time", clock)
+    monkeypatch.setattr(ingest_module, "asyncio", _PacedAsyncio(clock))
+    door = GrowingDoor(clock)
     ingest, buffer = _ingest(door, tmp_path, page=1000, min_fetch_interval_s=0.1)
     stop = asyncio.Event()
     task = asyncio.ensure_future(ingest.run_forever(stop))
 
-    async def mqtt() -> None:
-        while not stop.is_set():
-            ingest.wake()
-            await asyncio.sleep(0.005)
+    async def waiting_after(fetches: int) -> None:
+        while not (ingest.waiting and len(door.fetches) > fetches):
+            assert not task.done(), task
+            await _real_sleep(0.001)
 
-    bell = asyncio.ensure_future(mqtt())
-    await asyncio.sleep(1.0)
+    await waiting_after(0)
+    pages: list[int] = []
+    while clock.now < door._t0 + 1.0:
+        # One record arrives; its MQTT message rings the bell.
+        before = len(door.fetches)
+        clock.now += 0.005
+        ingest.wake()
+        await waiting_after(before)
+        pages.append(len(door.fetches) - before)
+
     stop.set()
-    await bell
     ingest.wake()
     await asyncio.wait_for(task, timeout=5.0)
     buffer.close()
 
-    # Each batched start drains the nonempty page, then proves the head with
-    # an immediate empty read. No delay is inserted between these two pages.
-    assert 10 <= len(door.fetches) <= 26, door.fetches
-    assert door.position > 150, "the loop fell behind the stream"
+    # Each start waits out the interval, drains the nonempty page, then proves
+    # the head with an immediate empty read: two fetches, no third.
+    assert pages == [2] * len(pages), pages
+    assert len(pages) == 10, pages
+    # Every start reads 20 records (0.1 s at 200/s) from where the previous
+    # empty head read ended, and the empty read follows from the page's end.
+    starts = [1 + 20 * k for k in range(10)]
+    assert door.fetches == [None, *(offset for start in starts for offset in (start, start + 20))], door.fetches
+    assert door.position == 201
