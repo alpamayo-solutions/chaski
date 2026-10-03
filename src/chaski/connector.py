@@ -45,7 +45,8 @@ the service's retained ``rejected_input`` finding, counted
 (:attr:`ConnectorService.refused_samples_total`, :meth:`Telemetry.sample_refused`)
 and only then removed from the journal. A non-finite reading (NaN, ±Inf) is
 refused the same way before it is journaled: JSON has no such numbers, so no
-contract can carry one. Each signal is logged and recorded once per spell of
+contract can carry one. So is a reading whose source timestamp is not finite
+(with ``timestamp_source="source"``). Each signal is logged and recorded once per spell of
 refusals; the spell ends when one of its samples is admitted again.
 
 **Signal writes.** The standard way to set a signal is a ``_CmdParam``
@@ -296,7 +297,7 @@ class Telemetry:
     def sample_refused(self, signal_id: str, reason: str) -> None:
         """One sample set aside: the node refused it for good
         (``reason`` is colca's reason, or ``refused`` when the node did not
-        name one) or it was ``non_finite``."""
+        name one), or it was ``non_finite`` or had a ``non_finite_timestamp``."""
 
     def poll_completed(self, duration_s: float, *, overrun: bool) -> None: ...
 
@@ -899,7 +900,15 @@ class ConnectorService(Service):
                 timestamp = step_target if self.step is not None else clock_status.factory_now
                 if self.timestamp_source == "source" and source_timestamp is not None:
                     if not isfinite(source_timestamp):
-                        raise ValueError("source timestamp must be finite")
+                        self._set_aside(
+                            signal.id,
+                            signal.id,
+                            "non_finite_timestamp",
+                            f"non-finite source timestamp {source_timestamp!r} at {key}: the sample has no time",
+                            {"signal_id": signal.id, "topic": key, "timestamp": repr(source_timestamp)},
+                            must_record=False,
+                        )
+                        continue
                     timestamp = source_timestamp
                 if has_non_finite(value):
                     self._set_aside(

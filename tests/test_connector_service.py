@@ -36,6 +36,7 @@ from chaski.connector import (
     Discovery,
     Driver,
     MqttDisconnectedError,
+    Reading,
     SourceDisconnectedError,
     Telemetry,
     has_non_finite,
@@ -1222,6 +1223,40 @@ def test_a_non_finite_reading_is_refused_before_the_journal(node, driver, monkey
         driver.values["Axis1/Temperature"] = 42.5
         poll(svc)
     assert [m.value for _, m in node.metrics()] == [42.5]
+    assert svc.refusing() == {}
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+class SourceTimestampDriver(FakeDriver):
+    """Returns each reading with the source timestamp in ``stamp``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stamp = 1000.0
+
+    async def read(self, targets):
+        return [Reading(topic, value, signal, self.stamp) for topic, value, signal in await super().read(targets)]
+
+
+def test_a_non_finite_source_timestamp_is_refused_before_the_journal(node, monkeypatch, caplog):
+    driver = SourceTimestampDriver()
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry, timestamp_source="source")
+    poll(svc)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    with caplog.at_level(logging.INFO):
+        for stamp in (math.nan, math.inf):
+            driver.stamp = stamp
+            poll(svc)
+        assert svc._pending == [] and node.metrics() == []
+        assert svc.refused_samples_total == 2
+        assert telemetry.events.count(("refused", "s-temp", "non_finite_timestamp")) == 2
+        [finding] = node.findings()
+        assert "non-finite source timestamp" in finding["summary"]
+
+        driver.stamp = 1234.5
+        poll(svc)
+    assert [m.timestamp for _, m in node.metrics()] == [1234.5]
     assert svc.refusing() == {}
     assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
