@@ -336,6 +336,8 @@ class CommandExecutor:
             if stop.is_set():
                 return
             self._wake.clear()
+            link = getattr(self._door, "link_up", None)
+            link_seen = link.generation if link is not None else 0
             try:
                 await self.drain()
                 retry.reset()
@@ -348,11 +350,27 @@ class CommandExecutor:
                     log.error(
                         "commands: drain failed (attempt %d); retrying in %.1fs", retry.failures, backoff, exc_info=exc
                     )
-                if await self._stopped_within(backoff):
+                # The node's link coming back ends the wait; the backoff
+                # spaces retries while it stays up.
+                if await self._stopped_within(backoff, link, link_seen):
                     return
+                if link is not None and link.generation != link_seen:
+                    retry.reset()
                 self._wake.set()
 
-    async def _stopped_within(self, seconds: float) -> bool:
+    async def _stopped_within(self, seconds: float, wake: Any = None, since: int = 0) -> bool:
+        """Wait up to ``seconds``, or until ``wake`` (a :class:`chaski.Doorbell`)
+        rang after ``since``. True when the service stopped."""
+        if wake is not None:
+            stop_task = asyncio.ensure_future(self._stop.wait())
+            wake_task = asyncio.ensure_future(wake.after(since))
+            try:
+                await asyncio.wait({stop_task, wake_task}, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (stop_task, wake_task):
+                    if not task.done():
+                        task.cancel()
+            return self._stop.is_set()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
         return self._stop.is_set()

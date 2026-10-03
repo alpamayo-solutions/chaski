@@ -55,7 +55,9 @@ def consume(
     (:data:`chaski.doorbell.IDLE_DRAIN_S`; ``None`` waits for the bell alone).
 
     A pruned range raises :class:`chaski.door.StreamGapError`; a failed
-    fetch or ack is retried with the same backoff as a failed handler.
+    fetch or ack is retried with the same backoff as a failed handler. A
+    retry waiting out its backoff runs at once when the node's link comes back
+    (the door's ``link_up``), and the backoff starts over.
     """
     stop = stop or threading.Event()
     name = consumer or stream.cursor
@@ -68,9 +70,20 @@ def consume(
 
         watch = StreamChanges(stream._door, [stream.name], stop=stop).start()
         bell = watch[stream.name]
+    # The node's link coming back ends a retry wait; the backoff spaces
+    # retries while it stays up.
+    link = getattr(stream._door, "link_up", None)
+
+    def retry_after(delay: float, since: int) -> None:
+        if link is None:
+            stop.wait(delay)
+        elif link.wait_after(since, delay, stop=stop):
+            backoff.reset()
+
     try:
         while not stop.is_set():
             seen = bell.generation
+            link_seen = link.generation if link is not None else 0
             try:
                 _drain(stream, handler, stop, health, reject, name)
             except StreamGapError:
@@ -87,13 +100,13 @@ def consume(
                         delay,
                         exc_info=failed.cause,
                     )
-                stop.wait(delay)
+                retry_after(delay, link_seen)
                 continue
             except Exception as exc:
                 delay = backoff.delay(exc)
                 if not reading.failed(exc, delay=delay):
                     log.error("%s: reading %s failed; retrying in %.1fs", name, stream.name, delay, exc_info=exc)
-                stop.wait(delay)
+                retry_after(delay, link_seen)
                 continue
             backoff.reset()
             reading.recovered()

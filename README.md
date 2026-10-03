@@ -527,9 +527,10 @@ re-resolution, clock-driven ticks) runs supervised: an exception is logged at
 once, reported in `handler_health` (degraded, then unhealthy) and the task is
 restarted with backoff. The MQTT client reconnects at most 1 s (jittered) after
 the node on its local door is back, at most 5 s after a node across the
-network. That reconnect is the event stream subscriptions and retained views
-resume on: they reconnect at once instead of waiting out their own backoff,
-which spaces retries only while the link stays up.
+network. That reconnect is the event stream subscriptions, retained views and
+the drains of `Service.consume`, DataOps ingest and the command executor resume
+on: they retry at once instead of waiting out their own backoff, which spaces
+retries only while the link stays up.
 
 ## Run a node
 

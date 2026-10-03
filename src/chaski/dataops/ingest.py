@@ -452,7 +452,7 @@ class Ingest:
         failed, self._failed = self._failed, None
         return failed
 
-    async def _handler_failed(self, exc: Exception, retry: Backoff, stop: asyncio.Event) -> bool:
+    async def _handler_failed(self, exc: Exception, retry: Backoff, stop: asyncio.Event, link_seen: int = 0) -> bool:
         """Account for a handler failure that ended a step; False when it was not one."""
         failed = self.take_failure()
         if failed is None:
@@ -480,7 +480,8 @@ class Ingest:
                 backoff,
                 exc_info=exc,
             )
-        await self._sleep_or_stop(backoff, stop)
+        if await self._sleep_or_stop(backoff, stop, self._link(), link_seen):
+            retry.reset()  # the node's link is back: retry now, back off afresh
         return True
 
     @staticmethod
@@ -566,14 +567,25 @@ class Ingest:
         base = min(self.ERROR_BACKOFF_S * (2 ** (attempt - 1)), self.ERROR_BACKOFF_MAX_S)
         return base * (1.0 + _jitter.uniform(0.0, 0.2))
 
-    async def _sleep_or_stop(self, seconds: float, stop: asyncio.Event) -> None:
-        """Sleep up to ``seconds``, waking early if ``stop`` is set."""
+    def _link(self) -> Doorbell | None:
+        """The door's ``link_up``: rung when the node's link is back."""
+        return getattr(getattr(self._stream, "_door", None), "link_up", None)
+
+    async def _sleep_or_stop(
+        self, seconds: float, stop: asyncio.Event, wake: Doorbell | None = None, since: int = 0
+    ) -> bool:
+        """Sleep up to ``seconds``, waking early if ``stop`` is set or ``wake``
+        rang after ``since``. True when ``wake`` ended the sleep."""
         stop_task = asyncio.ensure_future(stop.wait())
+        wake_task = asyncio.ensure_future(wake.after(since)) if wake is not None else None
+        tasks = {stop_task} if wake_task is None else {stop_task, wake_task}
         try:
-            await asyncio.wait({stop_task}, timeout=seconds)
+            await asyncio.wait(tasks, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+            return wake_task is not None and wake_task.done() and not stop.is_set()
         finally:
-            if not stop_task.done():
-                stop_task.cancel()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """Process pages until ``stop`` is set.
@@ -605,10 +617,12 @@ class Ingest:
                 # Taken before the fetch: a wake from here on means another drain.
                 seen = self._bell.generation
             self.waiting = False
+            link = self._link()
+            link_seen = link.generation if link is not None else 0
             try:
                 processed = await self._step()
             except Exception as exc:
-                if await self._handler_failed(exc, retry, stop):
+                if await self._handler_failed(exc, retry, stop, link_seen):
                     continue
                 if not isinstance(exc, (httpx.HTTPError, BufferError)):
                     raise
@@ -618,7 +632,10 @@ class Ingest:
                     log.error(
                         "Ingest drain failed (attempt %d); retrying in %.1fs", retry.failures, backoff, exc_info=exc
                     )
-                await self._sleep_or_stop(backoff, stop)
+                # The node's link coming back ends the wait; the backoff
+                # spaces retries while it stays up.
+                if await self._sleep_or_stop(backoff, stop, link, link_seen):
+                    retry.reset()
                 continue
 
             retry.reset()
