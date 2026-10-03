@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.7](https://github.com/alpamayo-solutions/chaski/compare/v0.20.6...v0.20.7) (2026-10-03)
+
+
+### Fixes
+
+* **service:** reconnect stream subscriptions when the node's link comes back ([#128](https://github.com/alpamayo-solutions/chaski/issues/128)) ([932b972](https://github.com/alpamayo-solutions/chaski/commit/932b972ed409edda422ef3d2fa8ee289c31ded29))
+
 ## [0.20.6](https://github.com/alpamayo-solutions/chaski/compare/v0.20.5...v0.20.6) (2026-10-03)
 
 
