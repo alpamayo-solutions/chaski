@@ -87,6 +87,7 @@ from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
 from chaski.failures import HandlerHealth, Reject
+from chaski.outage import Outage, expected_failure
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
@@ -213,6 +214,7 @@ def off_loop(method):
 
     instance = method.__self__
     consumer = f"{instance.name}.{method.__name__}"
+    outage = Outage(log, consumer, recovered_as="succeeded again")
 
     @functools.wraps(method)
     def job() -> None:
@@ -224,12 +226,17 @@ def off_loop(method):
                 except Reject as rejected:
                     record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
         except Exception as exc:
-            # APScheduler logs it; the next tick runs the method again.
+            # The next tick runs the method again. An expected failure (Colca
+            # away) is logged here without a traceback; anything else is
+            # raised for APScheduler to log with its traceback.
             if health is not None:
                 health.failed(consumer, exc)
+            if outage.failed(exc):
+                return
             raise
         if health is not None:
             health.succeeded(consumer)
+        outage.recovered()
 
     return job
 
@@ -432,6 +439,7 @@ async def supervise(
 
     consumer = f"task {name}"
     retry = Backoff(minimum=0.5, maximum=backoff_max_s)
+    outage = Outage(log, name, recovered_as="running again")
     while True:
         task = asyncio.ensure_future(start())
         try:
@@ -440,9 +448,11 @@ async def supervise(
                 if not done:
                     health.succeeded(consumer)
                     retry.reset()
+                    outage.recovered()
             await task
             if retry.failures:
                 health.succeeded(consumer)
+            outage.recovered()
             return
         except asyncio.CancelledError:
             task.cancel()
@@ -455,7 +465,8 @@ async def supervise(
                 return
             count = health.failed(consumer, exc)
             delay = retry.delay(exc)
-            log.error("%s crashed (%d in a row); restarting it in %.1fs", name, count, delay, exc_info=exc)
+            if not outage.failed(exc, delay=delay):
+                log.error("%s crashed (%d in a row); restarting it in %.1fs", name, count, delay, exc_info=exc)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=delay)
             if stop.is_set():
@@ -470,6 +481,7 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
     from chaski.retry import Backoff
 
     retry = Backoff()
+    outage = Outage(log, "Definition bindings")
     active_dispatch = None
     while not stop.is_set():
         version = cache.changes.version
@@ -481,11 +493,14 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
                 if signal_ids:
                     ensure_running()
             retry.reset()
+            outage.recovered()
             await cache.changes.wait_async(version, stop=stop)
         except Exception as exc:
-            log.exception("Could not refresh definition bindings; retrying")
+            delay = retry.delay(exc)
+            if not outage.failed(exc, delay=delay):
+                log.error("Could not refresh definition bindings; retrying in %.1fs", delay, exc_info=exc)
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=retry.delay(exc))
+                await asyncio.wait_for(stop.wait(), timeout=delay)
 
 
 def compute_trim_horizons(
@@ -792,6 +807,7 @@ class DataOpsService(Service):
 
         self._wake_backoff = Backoff(minimum=min(WAKE_RETRY_S, WAKE_RETRY_MAX_S), maximum=WAKE_RETRY_MAX_S)
         self._wake_retry: asyncio.TimerHandle | None = None
+        self._wake_outage = Outage(log, "Input topics to wake on")
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
@@ -980,18 +996,20 @@ class DataOpsService(Service):
         except httpx.HTTPError as exc:
             self._wake_failures += 1
             delay = self._wake_backoff.delay(exc)
-            log.warning(
-                "Could not read the input topics to wake on (attempt %d): %s — keeping %d topic(s), retrying in %.0fs",
-                self._wake_failures,
-                exc,
-                len(self._wake_topics),
-                delay,
-            )
+            if not self._wake_outage.failed(exc, delay=delay):
+                log.warning(
+                    "Could not read the input topics to wake on (attempt %d): %s — keeping %d topic(s), retrying in %.0fs",
+                    self._wake_failures,
+                    exc,
+                    len(self._wake_topics),
+                    delay,
+                )
             if self._loop is not None:
                 self._wake_retry = self._loop.call_later(delay, self._wake_on_inputs, list(signal_ids))
             return
         self._wake_failures = 0
         self._wake_backoff.reset()
+        self._wake_outage.recovered()
         if len(topics) < len(signal_ids):
             log.debug("%d input signal(s) have no known topic yet", len(signal_ids) - len(topics))
         added = sorted(topics - self._wake_topics)
@@ -1313,8 +1331,12 @@ class DataOpsService(Service):
                 for instance in instances:
                     try:
                         await instance.teardown()
-                    except Exception:
-                        log.exception("Error during teardown of %s", instance.name)
+                    except Exception as exc:
+                        reason = expected_failure(exc)
+                        if reason is None:
+                            log.exception("Error during teardown of %s", instance.name)
+                        else:
+                            log.warning("Teardown of %s could not finish: %s", instance.name, reason)
                 self._ingest = None
 
         finally:
@@ -1329,6 +1351,7 @@ class DataOpsService(Service):
         from ..retry import Backoff
 
         backoff = Backoff()
+        outage = Outage(log, "Coordinated window", recovered_as="succeeded again")
         active_dispatch = None
         while not stop.is_set():
             version = self.clock.changes.version
@@ -1366,17 +1389,19 @@ class DataOpsService(Service):
                 name = failed[0] if failed is not None else "coordinated window"
                 count = self.handler_health.failed(name, exc)
                 delay = backoff.delay(exc)
-                log.error(
-                    "Coordinated window failed in %s (%d in a row); progress not acknowledged, retrying in %.1fs",
-                    name,
-                    count,
-                    delay,
-                    exc_info=exc,
-                )
+                if not outage.failed(exc, delay=delay):
+                    log.error(
+                        "Coordinated window failed in %s (%d in a row); progress not acknowledged, retrying in %.1fs",
+                        name,
+                        count,
+                        delay,
+                        exc_info=exc,
+                    )
                 await ingest._sleep_or_stop(delay, stop)
                 continue
             self.handler_health.succeeded("coordinated window")
             backoff.reset()
+            outage.recovered()
             self._step_loop_last = time.monotonic()
             self._step_waiting = True
             await self.clock.changes.wait_async(version, self.step.wait_delay())

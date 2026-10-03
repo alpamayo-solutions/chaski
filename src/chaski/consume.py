@@ -19,6 +19,7 @@ from typing import Any
 from .door import Record, Stream, StreamGapError
 from .doorbell import IDLE_DRAIN_S
 from .failures import HandlerHealth, Reject, record_subject
+from .outage import Outage, expected_failure
 from .retry import Backoff
 
 log = logging.getLogger("chaski.consume")
@@ -59,6 +60,8 @@ def consume(
     stop = stop or threading.Event()
     name = consumer or stream.cursor
     backoff = retry or Backoff()
+    reading = Outage(log, f"{name}: reading {stream.name}")
+    handling = Outage(log, name, recovered_as="succeeded again")
     watch = None
     if bell is None:
         from .stream_changes import StreamChanges
@@ -75,22 +78,26 @@ def consume(
             except _HandlerFailed as failed:
                 count = health.failed(name, failed.cause)
                 delay = backoff.delay(failed.cause)
-                log.error(
-                    "%s failed at offset=%d (%d in a row); not acknowledged, retrying in %.1fs",
-                    name,
-                    failed.record.offset,
-                    count,
-                    delay,
-                    exc_info=failed.cause,
-                )
+                if not handling.failed(failed.cause, delay=delay):
+                    log.error(
+                        "%s failed at offset=%d (%d in a row); not acknowledged, retrying in %.1fs",
+                        name,
+                        failed.record.offset,
+                        count,
+                        delay,
+                        exc_info=failed.cause,
+                    )
                 stop.wait(delay)
                 continue
             except Exception as exc:
                 delay = backoff.delay(exc)
-                log.warning("%s: reading %s failed (%s); retrying in %.1fs", name, stream.name, exc, delay)
+                if not reading.failed(exc, delay=delay):
+                    log.error("%s: reading %s failed; retrying in %.1fs", name, stream.name, delay, exc_info=exc)
                 stop.wait(delay)
                 continue
             backoff.reset()
+            reading.recovered()
+            handling.recovered()
             if stop.is_set():
                 return
             # Setting stop ends the wait too: a consumer rescoped to nothing
@@ -127,6 +134,12 @@ def _drain(
         if current.offset > 1:
             try:
                 stream.ack(current.offset - 1)
-            except Exception:
-                log.warning("%s: could not acknowledge up to offset=%d", name, current.offset - 1, exc_info=True)
+            except Exception as ack_error:
+                log.warning(
+                    "%s: could not acknowledge up to offset=%d: %s",
+                    name,
+                    current.offset - 1,
+                    ack_error,
+                    exc_info=expected_failure(ack_error) is None,
+                )
         raise failed from exc

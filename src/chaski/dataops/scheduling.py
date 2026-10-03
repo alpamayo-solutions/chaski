@@ -11,6 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from chaski.clock import Clock, ClockNotReady
 from chaski.failures import Reject
+from chaski.outage import Outage, warn_failure
 from chaski.retry import Backoff
 
 from .base import Producer
@@ -78,6 +79,7 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
     consumer = f"{instance.name}.{method_name}"
     health = getattr(instance.runtime, "handler_health", None)
     retry = Backoff()
+    outage = Outage(log, consumer, recovered_as="succeeded again")
     while (due := next_tick(spec, previous)) is not None:
         await clock.sleep_until(due)
 
@@ -95,26 +97,28 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
         except Exception as exc:
             count = health.failed(consumer, exc) if health is not None else retry.failures + 1
             delay = retry.delay(exc)
-            log.error(
-                "Factory callback %s failed at %.6f (%d in a row); retrying the same tick in %.1fs",
-                consumer,
-                due,
-                count,
-                delay,
-                exc_info=exc,
-            )
+            if not outage.failed(exc, delay=delay):
+                log.error(
+                    "Factory callback %s failed at %.6f (%d in a row); retrying the same tick in %.1fs",
+                    consumer,
+                    due,
+                    count,
+                    delay,
+                    exc_info=exc,
+                )
             await asyncio.sleep(delay)
             continue
         if health is not None:
             health.succeeded(consumer)
         retry.reset()
+        outage.recovered()
         previous = due
         report = getattr(instance.runtime, "report_progress", None)
         if report is not None:
             try:
                 await asyncio.to_thread(report, due)
-            except Exception:
-                log.warning("Could not report factory callback progress", exc_info=True)
+            except Exception as exc:
+                warn_failure(log, exc, "Could not report factory callback progress")
         await asyncio.sleep(0)
 
 

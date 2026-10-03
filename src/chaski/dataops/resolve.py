@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from chaski.outage import ColcaUnavailable
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -242,7 +244,7 @@ def _live_index(door: Door) -> _Index | None:
         return None
     current = index.current()
     if current is None:
-        raise RuntimeError("Resolution index unavailable; waiting for subscription recovery")
+        raise ColcaUnavailable("Resolution index unavailable; waiting for subscription recovery")
     return current
 
 

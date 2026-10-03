@@ -49,6 +49,7 @@ from colca_data_contracts.payload import Constant, Signal
 from franzmq import Topic
 
 from chaski.failures import HandlerHealth, Reject
+from chaski.outage import Outage
 from chaski.retry import Backoff
 
 from . import resolve
@@ -157,6 +158,14 @@ class _Bursts:
         # (handler, topic) -> generation of the newest record handed over.
         self._latest: dict[tuple[Any, str], int] = {}
         self._generation = 0
+        # handler name -> its outage, shared by its dispatches (see _dispatch)
+        self._outages: dict[str, Outage] = {}
+
+    def outage(self, name: str) -> Outage:
+        outage = self._outages.get(name)
+        if outage is None:
+            outage = self._outages[name] = Outage(log, name, recovered_as="succeeded again")
+        return outage
 
     def callback(self, handler: Callable) -> Callable[[Any], None]:
         def _on_message(message: Any) -> None:
@@ -209,15 +218,16 @@ async def _dispatch(
         except Exception as exc:
             count = bursts._health.failed(name, exc)
             delay = retry.delay(exc)
-            log.error(
-                "%s failed handling %s at %s (%d in a row); retrying in %.1fs unless a newer record replaces it",
-                name,
-                "a retired record" if record is None else type(record).__name__,
-                topic,
-                count,
-                delay,
-                exc_info=exc,
-            )
+            if not bursts.outage(name).failed(exc, delay=delay):
+                log.error(
+                    "%s failed handling %s at %s (%d in a row); retrying in %.1fs unless a newer record replaces it",
+                    name,
+                    "a retired record" if record is None else type(record).__name__,
+                    topic,
+                    count,
+                    delay,
+                    exc_info=exc,
+                )
             await asyncio.sleep(delay)
             if bursts.superseded(handler, topic, generation):
                 return  # a newer record at this topic took over; its dispatch reports health
@@ -225,4 +235,5 @@ async def _dispatch(
             snapshot = resolve.Snapshot(bursts._door)
             continue
         bursts._health.succeeded(name)
+        bursts.outage(name).recovered()
         return

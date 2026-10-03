@@ -317,10 +317,12 @@ class CommandExecutor:
             await asyncio.to_thread(watch.close)
 
     async def _serve(self, stop: asyncio.Event) -> None:
+        from chaski.outage import Outage
         from chaski.retry import Backoff
 
         self._stop = stop
         retry = Backoff(minimum=0.5, maximum=_ERROR_BACKOFF_MAX_S)
+        outage = Outage(log, "commands: drain")
         self._wake.set()
         while not stop.is_set():
             wake_task = asyncio.ensure_future(self._wake.wait())
@@ -337,11 +339,15 @@ class CommandExecutor:
             try:
                 await self.drain()
                 retry.reset()
+                outage.recovered()
             except _Stopping:
                 return
             except httpx.HTTPError as exc:
                 backoff = retry.delay(exc)
-                log.warning("commands: drain failed (attempt %d): %s — retrying in %.1fs", retry.failures, exc, backoff)
+                if not outage.failed(exc, delay=backoff):
+                    log.error(
+                        "commands: drain failed (attempt %d); retrying in %.1fs", retry.failures, backoff, exc_info=exc
+                    )
                 if await self._stopped_within(backoff):
                     return
                 self._wake.set()
@@ -612,9 +618,11 @@ class CommandExecutor:
         away it waits for the link; a failed attempt is retried with jittered
         backoff. Raises :class:`_Stopping` when the service stops first: the
         cursor then stays before the command, and the ledger holds the answer."""
+        from chaski.outage import Outage
         from chaski.retry import Backoff
 
         retry = Backoff(minimum=min(0.5, ANSWER_BACKOFF_MAX_S), maximum=ANSWER_BACKOFF_MAX_S)
+        outage = Outage(log, f"commands: answer {correlation_id} on {topic}")
         while True:
             if not self._link.is_set():
                 await self._wait_for_link()
@@ -623,19 +631,21 @@ class CommandExecutor:
             except Exception as exc:
                 delay = retry.delay(exc)
                 count = self._health.failed(ANSWER_CONSUMER, exc) if self._health is not None else retry.failures
-                log.error(
-                    "commands: answer %s on %s not confirmed (%d in a row): %s — sending it again in %.1fs",
-                    correlation_id,
-                    topic,
-                    count,
-                    exc,
-                    delay,
-                )
+                if not outage.failed(exc, delay=delay):
+                    log.error(
+                        "commands: answer %s on %s not confirmed (%d in a row): %s — sending it again in %.1fs",
+                        correlation_id,
+                        topic,
+                        count,
+                        exc,
+                        delay,
+                    )
                 if await self._stopped_within(delay):
                     raise _Stopping from exc
                 continue
             if retry.failures and self._health is not None:
                 self._health.succeeded(ANSWER_CONSUMER)
+            outage.recovered()
             self._remember(correlation_id)
             return
 

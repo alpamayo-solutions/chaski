@@ -28,7 +28,7 @@ import httpx
 STARTUP_RETRY_MIN_S = 0.5
 STARTUP_RETRY_MAX_S = 5.0
 
-#: How long the same reason for waiting may repeat before it is logged again.
+#: How often a service still waiting for its node logs "still waiting" (INFO).
 STARTUP_LOG_REMINDER_S = 60.0
 
 #: HTTP statuses that mean "not now" rather than "never".
@@ -51,7 +51,8 @@ class BrokerRefused(RuntimeError):
         return getattr(self.reason_code, "value", self.reason_code) in TRANSIENT_CONNACK
 
 
-def _transient_status(status: int) -> bool:
+def transient_status(status: int) -> bool:
+    """Whether an HTTP ``status`` means "not now" rather than "never"."""
     return status in TRANSIENT_HTTP or status >= 500
 
 
@@ -59,9 +60,9 @@ def colca_unreachable(exc: BaseException) -> bool:
     """Whether ``exc`` from :meth:`chaski.Service.start` says the node cannot
     be reached yet (retry) rather than that the service is misconfigured."""
     if isinstance(exc, urllib.error.HTTPError):
-        return _transient_status(exc.code)
+        return transient_status(exc.code)
     if isinstance(exc, httpx.HTTPStatusError):
-        return _transient_status(exc.response.status_code)
+        return transient_status(exc.response.status_code)
     if isinstance(exc, BrokerRefused):
         return exc.transient
     # OSError covers urllib's URLError, refused and reset connections, a name

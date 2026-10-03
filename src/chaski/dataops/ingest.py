@@ -70,6 +70,7 @@ import httpx
 from chaski.door import Gap, Page, Record, Stream, StreamGapError
 from chaski.doorbell import IDLE_DRAIN_S, Doorbell
 from chaski.failures import HandlerHealth, Reject, record_subject
+from chaski.outage import Outage
 from chaski.retry import Backoff
 
 from .buffer import Buffer
@@ -168,6 +169,9 @@ class Ingest:
         self._behind = False
         self._last_fetch_at = 0.0
         self._min_fetch_interval_s = min_fetch_interval_s
+        # Colca away: one warning when the drain starts failing, one line when it recovers.
+        self._outage = Outage(log, f"Ingest drain on cursor={self._cursor_name}")
+        self._handler_outages: dict[str, Outage] = {}
 
     def rebind(self, dispatch: dict[str, list], signal_ids: Iterable[str] | None) -> None:
         """Swap what this loop dispatches and fetches, mid-run.
@@ -392,7 +396,8 @@ class Ingest:
                 self._ack_error = exc
                 self._ack_want = None
                 self.wake()
-                log.warning("Ack of offset=%d failed on cursor=%s: %s", offset, stream.cursor, exc)
+                if not self._outage.failed(exc):
+                    log.warning("Ack of offset=%d failed on cursor=%s: %s", offset, stream.cursor, exc)
                 return
 
     async def _restart_from_cursor(self) -> None:
@@ -459,17 +464,22 @@ class Ingest:
             try:
                 await asyncio.to_thread(self._stream.ack, record.offset - 1)
             except (httpx.HTTPError, BufferError) as ack_error:
-                log.warning("Could not acknowledge up to offset=%d: %s", record.offset - 1, ack_error)
+                if not self._outage.failed(ack_error):
+                    log.warning("Could not acknowledge up to offset=%d: %s", record.offset - 1, ack_error)
         count = self._health.failed(name, exc)
         backoff = retry.delay(exc)
-        log.error(
-            "on_metric handler %s failed at offset=%d (%d in a row); not acknowledged, retrying in %.1fs",
-            name,
-            record.offset,
-            count,
-            backoff,
-            exc_info=exc,
-        )
+        outage = self._handler_outages.get(name)
+        if outage is None:
+            outage = self._handler_outages[name] = Outage(log, name, recovered_as="succeeded again")
+        if not outage.failed(exc, delay=backoff):
+            log.error(
+                "on_metric handler %s failed at offset=%d (%d in a row); not acknowledged, retrying in %.1fs",
+                name,
+                record.offset,
+                count,
+                backoff,
+                exc_info=exc,
+            )
         await self._sleep_or_stop(backoff, stop)
         return True
 
@@ -574,8 +584,10 @@ class Ingest:
 
         A failed handler is retried at its record with backoff, never
         acknowledged (see the module docstring). ``httpx.HTTPError`` (colca
-        restarting, a timeout, 429, 5xx) is logged and retried with backoff;
-        the unacked page is simply fetched again. Any other exception, a
+        restarting, a timeout, 429, 5xx) is retried with backoff, and logged
+        once when it starts and once when it recovers
+        (:class:`chaski.outage.Outage`); the unacked page is simply fetched
+        again. Any other exception, a
         retention gap included, propagates, ends the task and turns the health
         door to 503.
         """
@@ -602,16 +614,17 @@ class Ingest:
                     raise
                 await self._restart_from_cursor()
                 backoff = retry.delay(exc)
-                log.warning(
-                    "Ingest drain failed (attempt %d): %s — retrying in %.1fs",
-                    retry.failures,
-                    exc,
-                    backoff,
-                )
+                if not self._outage.failed(exc, delay=backoff):
+                    log.error(
+                        "Ingest drain failed (attempt %d); retrying in %.1fs", retry.failures, backoff, exc_info=exc
+                    )
                 await self._sleep_or_stop(backoff, stop)
                 continue
 
             retry.reset()
+            self._outage.recovered()
+            for outage in self._handler_outages.values():
+                outage.recovered()
             self._note_drain(processed)
             if processed > 0 or self._behind:
                 continue

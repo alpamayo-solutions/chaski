@@ -281,6 +281,16 @@ on its health door, with the reason under `not_ready`. Only a configuration
 error ends startup. `svc.readiness` says where startup is; a plain `Service`
 gets the same retries from `svc.start_when_reachable()`.
 
+Every retry loop in chaski logs a node that is away the same way: one WARNING
+with the reason when it starts, a DEBUG line per retry and an INFO
+`still waiting (N attempts, M s)` line every minute while it lasts, and one INFO
+`reached Colca after N failed attempts / M s` when it recovers (`succeeded
+again after ...` for a handler or timer), all without a traceback. A handler or
+timer that fails this way still counts in `handler_health`. Expected here means Colca cannot be reached, answers `408`, `425`,
+`429` or `5xx`, a durable queue is full, or the node's state is not available
+yet (`chaski.ColcaUnavailable`). Any other exception is logged at ERROR with
+its traceback.
+
 A driver whose client needs the running event loop at construction (pymodbus's
 `AsyncModbusTcpClient`, for one) builds the connector in a factory instead:
 
@@ -636,7 +646,8 @@ the replay after a producer's code changed, and `Service.consume()`:
   30 s). An `@on_constant`/`@on_signal` retry ends early when a newer record at
   the same topic replaces the failed one. A wall-clock `@every`/`@cron` tick has
   no input; its next tick is the retry.
-- Each failure is logged with its traceback and counted per handler in
+- Each failure is logged with its traceback (a failure because Colca is away
+  only once, as described under the connector's startup) and counted per handler in
   `svc.handler_health`. One failure makes the service `degraded`; five in a row
   (`HandlerHealth(unhealthy_after=...)`) make it `unhealthy`. The first success
   clears the count. The DataOps health door reports `handlers` and `failing`

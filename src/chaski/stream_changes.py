@@ -7,6 +7,7 @@ import threading
 import time
 
 from ._wakeup import Wakeup
+from .outage import Outage
 from .retry import Backoff
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class StreamChanges:
 
     def _run(self):
         backoff = Backoff()
+        outage = Outage(log, f"Stream subscription {', '.join(self.signals)}")
         while not self.stop.is_set():
             error = None
             connected_at = time.monotonic()
@@ -52,6 +54,7 @@ class StreamChanges:
                     self.signals, stop=self.stop.is_set, contracts=self.contracts, interval_ms=0
                 ):
                     self.connected = True
+                    outage.recovered()
                     if time.monotonic() - connected_at >= 30:
                         backoff.reset()
                     for stream in hint.streams:
@@ -62,12 +65,14 @@ class StreamChanges:
                         self.on_change()
             except Exception as exc:
                 error = exc
-                log.warning("Stream subscription disconnected (%s); reconnecting", type(exc).__name__)
             self.connected = False
             if self.disconnected is not None:
                 self.disconnected()
             if not self.stop.is_set():
-                self.stop.wait(backoff.delay(error))
+                delay = backoff.delay(error)
+                if error is not None and not outage.failed(error, delay=delay):
+                    log.error("Stream subscription disconnected; reconnecting in %.1fs", delay, exc_info=error)
+                self.stop.wait(delay)
         self.changes.notify()
         for signal in self.signals.values():
             signal.notify()

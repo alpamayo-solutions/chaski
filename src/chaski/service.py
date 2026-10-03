@@ -99,6 +99,7 @@ from .coordination import StepGate
 from .door import Door, KvEntry, Record, Stream
 from .doorbell import IDLE_DRAIN_S
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
+from .outage import Outage, warn_failure
 from .pending import PendingSamples
 from .startup import (
     STARTUP_LOG_REMINDER_S,
@@ -156,6 +157,14 @@ class NotSent(RuntimeError):
     """A write refused before it was handed to the MQTT client, because its
     deadline had passed or the broker link was down. Nothing was queued, so
     nothing is sent after a reconnect."""
+
+    #: True when the broker link was down: an expected, retried condition
+    #: (:func:`chaski.outage.expected_failure`), not a defect.
+    colca_unavailable = False
+
+    def __init__(self, message: str, *, link_down: bool = False) -> None:
+        super().__init__(message)
+        self.colca_unavailable = link_down
 
 
 @contextlib.contextmanager
@@ -715,7 +724,7 @@ class Service:
 
         stop = stop or threading.Event()
         backoff = Backoff(minimum=STARTUP_RETRY_MIN_S, maximum=STARTUP_RETRY_MAX_S)
-        logged_reason, logged_at = "", -math.inf
+        outage = Outage(logger, f"chaski.Service: {self.name}", remind_every=STARTUP_LOG_REMINDER_S)
         while not stop.is_set() and not self._closed:
             try:
                 self.start(connect_timeout=connect_timeout)
@@ -724,20 +733,10 @@ class Service:
                     logger.error("chaski.Service: %s cannot start: %s", self.name, self._readiness.reason)
                     raise
                 delay = backoff.delay(exc)
-                reason, now = self._readiness.reason, time.monotonic()
-                if reason != logged_reason or now - logged_at >= STARTUP_LOG_REMINDER_S:
-                    logger.warning(
-                        "chaski.Service: %s not ready: %s; retrying (attempt %d, next in %.1fs)",
-                        self.name,
-                        reason,
-                        self._readiness.attempts,
-                        delay,
-                    )
-                    logged_reason, logged_at = reason, now
+                outage.note(f"not ready: {self._readiness.reason}", delay=delay)
                 stop.wait(delay)
                 continue
-            if self._readiness.attempts > 1:
-                logger.info("chaski.Service: %s reached Colca after %d attempts", self.name, self._readiness.attempts)
+            outage.recovered()
             return True
         return False
 
@@ -908,30 +907,37 @@ class Service:
         try:
             self._reannounce(client, fresh)
         except Exception as exc:
-            logger.exception("chaski.Service: re-announcing %s after a reconnect failed; retrying", self.name)
+            outage = Outage(logger, f"chaski.Service: {self.name}: re-announcing after a reconnect")
+            if not outage.failed(exc):
+                logger.exception("chaski.Service: re-announcing %s after a reconnect failed; retrying", self.name)
             threading.Thread(
                 target=self._retry_reannounce,
-                args=(client, self._reannounce_stop, exc, fresh),
+                args=(client, self._reannounce_stop, exc, fresh, outage),
                 daemon=True,
                 name=f"{self.name}-registration-retry",
             ).start()
 
-    def _retry_reannounce(self, client: Any, cancelled: threading.Event, error=None, fresh=False) -> None:
+    def _retry_reannounce(
+        self, client: Any, cancelled: threading.Event, error=None, fresh=False, outage: Outage | None = None
+    ) -> None:
         # MQTT may accept connections before the HTTP registration door is ready.
         # Retry only this failed operation; do not wait on the network thread or
         # introduce a recurring registration poll once it succeeds.
         from .retry import Backoff
 
         retry = Backoff()
+        outage = outage or Outage(logger, f"chaski.Service: {self.name}: re-announcing after a reconnect")
         while not cancelled.wait(retry.delay(error)):
             if self._closed:
                 return
             try:
                 self._reannounce(client, fresh)
+                outage.recovered()
                 return
             except Exception as exc:
                 error = exc
-                logger.warning("chaski.Service: registration retry for %s failed", self.name, exc_info=True)
+                if not outage.failed(exc):
+                    logger.warning("chaski.Service: registration retry for %s failed", self.name, exc_info=True)
 
     def _on_disconnect(
         self, _client: Any = None, _userdata: Any = None, _flags: Any = None, reason_code: Any = None, *_rest: Any
@@ -980,8 +986,8 @@ class Service:
             return  # the reconnect announces the composed status
         try:
             self._publish_status()
-        except Exception:
-            logger.warning("chaski.Service: could not publish %s's status", self.name, exc_info=True)
+        except Exception as exc:
+            warn_failure(logger, exc, "chaski.Service: could not publish %s's status", self.name)
 
     @property
     def identity_conflict(self) -> str:
@@ -1372,6 +1378,7 @@ class Service:
         from .retry import Backoff
 
         retry = Backoff()
+        outage = Outage(logger, f"chaski.Service: {self.name}: pending sample publication")
         while not self._pending_stop.is_set():
             version = self._pending_wake.version
             progressed = False
@@ -1398,9 +1405,14 @@ class Service:
                             self._pending_sources.discard(path)
                     progressed |= bool(rows)
                 retry.reset()
+                outage.recovered()
             except Exception as exc:
-                logger.warning("Pending sample publication failed; retaining rows: %s", type(exc).__name__)
-                self._pending_stop.wait(retry.delay(exc))
+                delay = retry.delay(exc)
+                if not outage.failed(exc, delay=delay):
+                    logger.error(
+                        "Pending sample publication failed; retaining rows, retrying in %.1fs", delay, exc_info=exc
+                    )
+                self._pending_stop.wait(delay)
                 continue
             if not progressed:
                 self._pending_wake.wait(version)
@@ -1442,7 +1454,7 @@ class Service:
             if time.time() >= deadline:
                 raise NotSent(f"{topic}: not sent, its deadline had passed")
             if not client.is_connected():
-                raise NotSent(f"{topic}: not sent, the broker link is down")
+                raise NotSent(f"{topic}: not sent, the broker link is down", link_down=True)
         return client
 
     def send_command(
@@ -1739,8 +1751,8 @@ class Service:
             # needs a real-time heartbeat, even during accelerated simulation.
             if details is not None:
                 self._publish_details(details)
-        except Exception:
-            logger.warning("Could not publish application clock progress", exc_info=True)
+        except Exception as exc:
+            warn_failure(logger, exc, "Could not publish application clock progress")
             return False
         return True
 
@@ -1786,8 +1798,8 @@ class Service:
         def publish() -> None:
             try:
                 self._publish_status()
-            except Exception:
-                logger.warning("chaski.Service: could not publish handler health", exc_info=True)
+            except Exception as exc:
+                warn_failure(logger, exc, "chaski.Service: could not publish handler health")
 
         threading.Thread(target=publish, name=f"{self.name}-handler-health", daemon=True).start()
 
