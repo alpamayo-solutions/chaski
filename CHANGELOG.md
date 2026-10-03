@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.5](https://github.com/alpamayo-solutions/chaski/compare/v0.20.4...v0.20.5) (2026-10-03)
+
+
+### Fixes
+
+* **service:** start without Colca and report not ready until it answers ([#124](https://github.com/alpamayo-solutions/chaski/issues/124)) ([801bf53](https://github.com/alpamayo-solutions/chaski/commit/801bf535ead1864655142866c8e31ae55039cc41))
+
 ## [0.20.4](https://github.com/alpamayo-solutions/chaski/compare/v0.20.3...v0.20.4) (2026-10-03)
 
 
