@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/alpamayo-solutions/chaski/compare/v0.20.7...v0.21.0) (2026-10-03)
+
+
+### Features
+
+* **dataops:** backfill history older than the stream ([#130](https://github.com/alpamayo-solutions/chaski/issues/130)) ([0e81bff](https://github.com/alpamayo-solutions/chaski/commit/0e81bff6cb969a05a649e44540d8bf0b140ff0a3))
+
 ## [0.20.7](https://github.com/alpamayo-solutions/chaski/compare/v0.20.6...v0.20.7) (2026-10-03)
 
 
