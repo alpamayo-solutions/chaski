@@ -183,6 +183,10 @@ class Door:
         if cert is not None:
             kwargs["verify"] = _external_ssl_context(*cert)
         self._client = httpx.Client(**kwargs)
+        #: Rung when the node is reachable again: the owning service's MQTT
+        #: link reconnected. A loop waiting out a backoff after the node went
+        #: away retries on it at once (see :class:`chaski.stream_changes.StreamChanges`).
+        self.link_up = Doorbell()
 
     def close(self) -> None:
         self._client.close()

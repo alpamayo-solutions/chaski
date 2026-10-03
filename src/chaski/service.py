@@ -356,9 +356,16 @@ def _connect_external_mqtt(
     return client
 
 
-#: Longest wait between two reconnect attempts. A broker that is back is
-#: reached within this, so commands sent right after an outage do not expire.
+#: Longest wait between two reconnect attempts to a node across the network.
+#: A broker that is back is reached within this, so commands sent right after
+#: an outage do not expire.
 RECONNECT_MAX_S = 5.0
+
+#: Longest wait between two reconnect attempts to the node on the local door
+#: (same host or compose network, where a refused connect costs nothing). The
+#: reconnect is the event every stream subscription and retained view resumes
+#: on, so a local node that is back is followed within about a second.
+LOCAL_RECONNECT_MAX_S = 1.0
 
 
 def bound_reconnect(client: Any, maximum: float = RECONNECT_MAX_S) -> Any:
@@ -367,7 +374,7 @@ def bound_reconnect(client: Any, maximum: float = RECONNECT_MAX_S) -> Any:
     Returns the :class:`~chaski.retry.Backoff`; reset it on a CONNACK."""
     from .retry import Backoff
 
-    backoff = Backoff(minimum=1.0, maximum=maximum)
+    backoff = Backoff(minimum=min(1.0, maximum), maximum=maximum)
     wait = getattr(client, "_reconnect_wait", None)
     if wait is None or not hasattr(client, "reconnect_delay_set"):
         return backoff
@@ -855,7 +862,7 @@ class Service:
         # right after CONNACK, ahead of any subscription made in this run
         tolerate_undecodable(client)
         guard_network_thread(client, self.name)
-        self._reconnect_backoff = bound_reconnect(client)
+        self._reconnect_backoff = bound_reconnect(client, RECONNECT_MAX_S if self._external else LOCAL_RECONNECT_MAX_S)
         self._subscriptions = Subscriptions(client)
         client.loop_start()
         if not self._connected_event.wait(connect_timeout):
@@ -898,6 +905,10 @@ class Service:
         else:
             logger.info("chaski.Service: %s reconnected; the broker kept the session", self.name)
         self._broker_state_changed(True)
+        if self._http is not None:
+            # The node answers again: stream subscriptions reconnect now
+            # instead of waiting out their backoff.
+            self._http.link_up.ring()
         with self._lock:
             wakeups = list(self._wakeups)
         for wakeup in wakeups:

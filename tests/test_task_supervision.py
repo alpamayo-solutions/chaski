@@ -10,7 +10,7 @@ from dataops_fakes import run_async
 
 from chaski.dataops.service import supervise
 from chaski.failures import HandlerHealth
-from chaski.service import RECONNECT_MAX_S, bound_reconnect
+from chaski.service import LOCAL_RECONNECT_MAX_S, RECONNECT_MAX_S, bound_reconnect
 
 
 @run_async
@@ -99,3 +99,12 @@ def test_reconnect_waits_at_most_five_seconds_with_jitter():
     backoff.reset()
     client._reconnect_wait()
     assert client.delays[-1][0] <= 1.0, "a CONNACK starts the backoff over"
+
+
+def test_a_local_node_is_reconnected_within_a_second():
+    client = _PahoLike()
+    bound_reconnect(client, LOCAL_RECONNECT_MAX_S)
+    for _ in range(20):
+        client._reconnect_wait()
+    waits = [low for low, high in client.delays if low == high]
+    assert all(0 < w <= LOCAL_RECONNECT_MAX_S == 1.0 for w in waits)
