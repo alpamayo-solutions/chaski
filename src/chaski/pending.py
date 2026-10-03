@@ -33,6 +33,10 @@ class PendingSamples:
                 raise BufferError("connector durable sample queue is full; acquisition must wait")
             self.db.executemany("INSERT INTO samples(source,value,ts,unit) VALUES (?,?,?,?)", encoded)
 
+    def count(self):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+
     def page_all(self, limit=1000):
         with self.lock:
             return [

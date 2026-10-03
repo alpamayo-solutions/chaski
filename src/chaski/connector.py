@@ -36,6 +36,18 @@ journals every metric before publication. It drains that bounded journal before
 acquiring again, and preserves it through restart. Queue saturation is visible
 backpressure, never eviction.
 
+**Refused samples.** Transport failures and anything the node did not decide
+are retried; the journal keeps the samples. A sample the node definitively
+refuses (its schema, its topic rules, a missing grant, another producer's
+signal; see :func:`refusal_is_final`) can never be admitted, so retrying it
+would only block the samples behind it. It is set aside instead: recorded as
+the service's retained ``rejected_input`` finding, counted
+(:attr:`ConnectorService.refused_samples_total`, :meth:`Telemetry.sample_refused`)
+and only then removed from the journal. A non-finite reading (NaN, ±Inf) is
+refused the same way before it is journaled: JSON has no such numbers, so no
+contract can carry one. Each signal is logged and recorded once per spell of
+refusals; the spell ends when one of its samples is admitted again.
+
 **Signal writes.** The standard way to set a signal is a ``_CmdParam``
 command at the signal's own path (``<element path>/<signal>``), with
 ``{"command": {"value": ...}}``. The connector that holds the signal's
@@ -98,6 +110,7 @@ from franzmq import Topic
 from franzmq.errors import PublishRejected, PublishTimeout
 
 from .executor import Command, CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
+from .failures import Reject
 from .service import Service
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
@@ -118,6 +131,28 @@ WRITE_CURSOR = "signal-writes"
 #: is a full connect + discover, not just a reconnect: a browse-based driver
 #: that started while its source was still booting has no catalogue at all.
 DISCOVERY_RETRY_SECONDS = 15.0
+
+#: The consumer name a refused sample is recorded under in the service's
+#: ``rejected_input`` finding.
+REFUSED_SAMPLES_CONSUMER = "connector-samples"
+
+#: colca's rejection reasons (``colca_rejected_publishes_total{reason}``) that
+#: are a verdict on the record itself: sending it again gets the same answer.
+#: ``draining`` is temporary and any reason not listed here is retried.
+FINAL_REFUSAL_REASONS = frozenset(
+    {
+        "validation",
+        "grammar",
+        "node_id",
+        "identity",
+        "write_denied",
+        "cmd_denied",
+        "registry_contract",
+        "human_write",
+        "time_sync",
+        "not_producer",
+    }
+)
 
 _MISSING = object()
 
@@ -258,6 +293,11 @@ class Telemetry:
 
     def publish_rejected(self, reason_code: int) -> None: ...
 
+    def sample_refused(self, signal_id: str, reason: str) -> None:
+        """One sample set aside: the node refused it for good
+        (``reason`` is colca's reason, or ``refused`` when the node did not
+        name one) or it was ``non_finite``."""
+
     def poll_completed(self, duration_s: float, *, overrun: bool) -> None: ...
 
 
@@ -284,6 +324,49 @@ def round_to_precision(value: float, precision: int) -> float:
         return float(Decimal(value).quantize(quantum, rounding=ROUND_HALF_UP))
     except Exception:
         return value
+
+
+def refusal_is_final(result: Mapping[str, Any], *, batch_admitted: bool) -> bool:
+    """Whether a ``POST /publish/batch`` result refuses its record for good.
+
+    A result with an offset is no refusal. A result without an ``error`` is
+    no verdict either (a reply that lost its offset): retry it. A result that
+    names colca's ``reason`` is final when the reason is in
+    :data:`FINAL_REFUSAL_REASONS`. colca up to 0.27 names none in a batch;
+    then the batch decides: the node judges every record before it writes,
+    and writes the admitted records of one stream in one append, so a refusal
+    in a batch where another record was admitted (``batch_admitted``) was the
+    node's verdict on that record, not a failed write. A connector's batch is
+    all ``_Metric``, one stream. With nothing admitted, a refusal may be a
+    storage failure and is retried.
+    """
+    if result.get("offset") is not None or not result.get("error"):
+        return False
+    reason = result.get("reason")
+    if reason:
+        return reason in FINAL_REFUSAL_REASONS
+    return batch_admitted
+
+
+def has_non_finite(value: Any) -> bool:
+    """Whether ``value`` is or holds a NaN or infinite float, which JSON
+    cannot carry."""
+    if isinstance(value, float):
+        return not isfinite(value)
+    if isinstance(value, (list, tuple)):
+        return any(has_non_finite(item) for item in value)
+    if isinstance(value, dict):
+        return any(has_non_finite(item) for item in value.values())
+    return False
+
+
+class RefusalSpell(NamedTuple):
+    """A signal whose samples are being refused: since when (unix seconds),
+    how many, and the latest reason."""
+
+    since: float
+    refused: int
+    reason: str
 
 
 def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandler]:
@@ -430,6 +513,13 @@ class ConnectorService(Service):
         self._summary_published = 0
         self._summary_polls = 0
         self._summary_last = self._now()
+        #: Samples set aside since start: refused by the node for good, or
+        #: non-finite. Each one is also reported to Telemetry.sample_refused.
+        self.refused_samples_total = 0
+        # Per signal (its id, or the topic when a sample has none): the spell
+        # of refusals it is in. Logged and recorded when one starts.
+        self._refusal_spells: dict[str, RefusalSpell] = {}
+        self._deferral_reported = False
 
     # -- the base class's hooks -----------------------------------------
 
@@ -769,11 +859,19 @@ class ConnectorService(Service):
             # Re-raised after publishing what was read, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
             if protocol_targets and sampling:
-                # Retry durable output before taking another PLC observation.
-                # This is backpressure; an outage never evicts older samples.
-                self._publish_batch([])
                 if len(protocol_targets) > self.max_pending:
                     raise BufferError("max_pending cannot hold one complete acquisition cycle")
+                # Retry durable output before taking another PLC observation.
+                # This is backpressure; an outage never evicts older samples.
+                try:
+                    self._publish_batch([])
+                except PublishRejected:
+                    # The node answered and refused every sample it was sent,
+                    # which is either its verdict or a failed write. The
+                    # next cycle's samples tell which (see refusal_is_final),
+                    # so acquire while the journal holds one more cycle.
+                    if not self._journal_has_room(len(protocol_targets)):
+                        raise
                 try:
                     async with self._source_lock:
                         raw_batch = list(await self.driver.read(protocol_targets))
@@ -803,6 +901,16 @@ class ConnectorService(Service):
                     if not isfinite(source_timestamp):
                         raise ValueError("source timestamp must be finite")
                     timestamp = source_timestamp
+                if has_non_finite(value):
+                    self._set_aside(
+                        signal.id,
+                        signal.id,
+                        "non_finite",
+                        f"non-finite reading {value!r} at {key}: JSON cannot carry it",
+                        {"signal_id": signal.id, "topic": key, "timestamp": timestamp, "value": repr(value)},
+                        must_record=False,
+                    )
+                    continue
                 metric = Metric(value=value, timestamp=timestamp, signal_id=signal.id)
                 self._latest_by_topic[key] = metric
                 batch.append((topic, metric))
@@ -827,6 +935,15 @@ class ConnectorService(Service):
         except httpx.HTTPError as exc:
             self.telemetry.broker_healthy(False)
             self._log.warning("Metric batch deferred: %s", type(exc).__name__)
+            await self._sleep(self._http_backoff.delay(exc))
+            return
+
+        except PublishRejected as exc:
+            # Undecided refusals: kept and retried, reported once until the
+            # journal drains again.
+            if not self._deferral_reported:
+                self._deferral_reported = True
+                self._log.warning("Metric batch deferred, the node refused every sample it was sent: %s", exc)
             await self._sleep(self._http_backoff.delay(exc))
             return
 
@@ -983,7 +1100,7 @@ class ConnectorService(Service):
             return
         try:
             self._publish_batch(batch)
-        except (MqttDisconnectedError, httpx.HTTPError) as exc:
+        except (MqttDisconnectedError, httpx.HTTPError, PublishRejected) as exc:
             self._log.debug("Heartbeat deferred: %s", type(exc).__name__)
             return
         for topic, metric in batch:
@@ -1050,12 +1167,19 @@ class ConnectorService(Service):
             for _, topic, payload, _, _ in self._metric_queue.page_all(self.max_pending)
         ]
 
+    def _journal_has_room(self, samples: int) -> bool:
+        queue = self._open_metric_queue()
+        return queue.count() + samples <= self.max_pending
+
     def _publish_batch(self, batch: list[tuple[Topic, Metric]]) -> None:
         """One durable acquisition cycle, one broker append per stream.
 
         The HTTP door uses the same admission and MQTT fanout as individual
-        publishes. Per-record results decide which journal entries may retire;
-        transport failure or a lost reply leaves them available for replay.
+        publishes. Per-record results decide which journal entries may retire:
+        an admitted sample retires, a final refusal (:func:`refusal_is_final`)
+        retires once it is recorded, and anything else stays for replay and
+        raises :class:`PublishRejected`. A transport failure or a lost reply
+        leaves every entry for replay.
         """
         if not batch and self._metric_queue is None and not (self._state_dir / "connector-samples.sqlite3").exists():
             return
@@ -1072,21 +1196,86 @@ class ConnectorService(Service):
             if len(results) != len(rows):
                 raise RuntimeError("broker batch receipt length does not match acquisition batch")
             accepted = []
-            refused = []
+            failed = []
             for row, result in zip(rows, results, strict=True):
                 identity, topic, payload, _, _ = row
                 if result.get("error") or "offset" not in result:
-                    refused.append(PublishRejected(0x80, topic, str(result.get("error", "missing durable offset"))))
+                    failed.append((row, result))
                 else:
                     accepted.append(identity)
                     self._summary_published += 1
                     self.telemetry.published(Metric(**payload), node_id=self._node_id or "")
+                    self._refusal_spell_ended(payload.get("signal_id") or topic)
             queue.ack(accepted)
-            if refused:
-                self.telemetry.publish_rejected(refused[0].reason_code)
-                raise refused[0]
+            undecided = []
+            for row, result in failed:
+                identity, topic, payload, timestamp, _ = row
+                if not refusal_is_final(result, batch_admitted=bool(accepted)):
+                    undecided.append(PublishRejected(0x80, topic, str(result.get("error", "missing durable offset"))))
+                    continue
+                signal_id = payload.get("signal_id") or ""
+                reason = result.get("reason") or "refused"
+                self._set_aside(
+                    signal_id,
+                    signal_id or topic,
+                    reason,
+                    f"the node refused a sample of {topic}: {result['error']}",
+                    {"signal_id": signal_id, "topic": topic, "timestamp": timestamp, "reason": reason},
+                    must_record=True,
+                )
+                queue.ack([identity])
+            if undecided:
+                self.telemetry.publish_rejected(undecided[0].reason_code)
+                raise undecided[0]
+        self._deferral_reported = False
         self._http_backoff.reset()
         self._report_mqtt_recovered()
+
+    def _set_aside(
+        self, signal_id: str, key: str, reason: str, summary: str, subject: dict[str, Any], *, must_record: bool
+    ) -> None:
+        """Count one refused sample. The first of a spell (per ``key``, or
+        after the reason changed) is logged and recorded in the
+        ``rejected_input`` finding. With ``must_record`` the sample is still in
+        the journal and must not leave it unrecorded: a failed record raises.
+        """
+        spell = self._refusal_spells.get(key)
+        if spell is None or spell.reason != reason:
+            try:
+                self.reject(REFUSED_SAMPLES_CONSUMER, subject, Reject(summary, detail={"reason": reason}))
+            except Exception as exc:
+                if must_record:
+                    if isinstance(exc, (ConnectionError, PublishTimeout)):
+                        raise MqttDisconnectedError(f"could not record a refused sample: {exc}") from exc
+                    raise
+                # A non-finite reading cannot be journaled; it is counted and
+                # logged, and the next one of the spell tries the record again.
+                self._log.warning("[REFUSED] %s (not recorded in the finding: %s)", summary, exc)
+                self._count_refusal(signal_id, reason)
+                return
+            spell = RefusalSpell(time.time(), 0, reason)
+        self._refusal_spells[key] = spell._replace(refused=spell.refused + 1)
+        self._count_refusal(signal_id, reason)
+
+    def _count_refusal(self, signal_id: str, reason: str) -> None:
+        self.refused_samples_total += 1
+        self.telemetry.sample_refused(signal_id, reason)
+
+    def _refusal_spell_ended(self, key: str) -> None:
+        spell = self._refusal_spells.pop(key, None)
+        if spell is not None:
+            self._log.info(
+                "[REFUSED] %s is admitted again after %d refused samples (%s) over %.0fs",
+                key,
+                spell.refused,
+                spell.reason,
+                time.time() - spell.since,
+            )
+
+    def refusing(self) -> dict[str, RefusalSpell]:
+        """The signals whose samples are being refused, keyed by signal id
+        (or topic, for a sample without one)."""
+        return dict(self._refusal_spells)
 
     def close(self) -> None:
         super().close()
