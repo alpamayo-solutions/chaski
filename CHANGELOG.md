@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.6](https://github.com/alpamayo-solutions/chaski/compare/v0.20.5...v0.20.6) (2026-10-03)
+
+
+### Fixes
+
+* **logging:** log an expected Colca outage once instead of a traceback per retry ([#126](https://github.com/alpamayo-solutions/chaski/issues/126)) ([c0f0ba5](https://github.com/alpamayo-solutions/chaski/commit/c0f0ba50449a4b2530954e34063b28a923b63f46))
+
 ## [0.20.5](https://github.com/alpamayo-solutions/chaski/compare/v0.20.4...v0.20.5) (2026-10-03)
 
 
