@@ -1091,27 +1091,33 @@ class DataOpsService(Service):
         # The infrastructure stays live while a fresh deployment waits for its
         # first timeline/beacon. Producer setup may read application time, so it
         # must not run in a different clock domain or be skipped at startup.
+        # The health door answers before anything else, and says what startup
+        # waits for: the node (reason from readiness), then its clock, then
+        # the definition index.
+        waiting_for = ["Colca"]
+
+        def not_ready() -> str:
+            readiness = self.readiness
+            if not readiness.ready:
+                return readiness.reason
+            return f"waiting for {waiting_for[0]}"
+
         health_state = health.HealthState(
             ready=False,
             broker_connected=self.is_broker_connected,
             cursor_lag=lambda: self.cursor_lag,
             identity_conflict=lambda: self.identity_conflict,
+            not_ready=not_ready,
         )
         health_server = None
         try:
             health_server = await health.serve(health_state, port=self._health_port)
-            from ..retry import Backoff
-
-            startup_backoff = Backoff()
-            while not stop.is_set():
-                try:
-                    await asyncio.to_thread(self.start)
-                    health_state.generation = self.buffer.generation
-                    break
-                except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
-                    log.warning("DataOps startup waiting for Colca (%s)", type(exc).__name__)
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(stop.wait(), startup_backoff.delay(exc))
+            # Never gives up on a node that is down or not up yet; raises a
+            # configuration error.
+            if not await self.start_when_reachable_async(stop):
+                return
+            health_state.generation = self.buffer.generation
+            waiting_for[0] = "the node's clock"
             while not stop.is_set():
                 version = self.clock.changes.version
                 if self.clock.status().ready:
@@ -1121,6 +1127,7 @@ class DataOpsService(Service):
                 return
             if self._definition_cache is None:
                 raise RuntimeError("DataOps definition subscription was not initialized")
+            waiting_for[0] = "the node's signal and element definitions"
             while not stop.is_set():
                 version = self._definition_cache.changes.version
                 if self._definition_cache.view.available:

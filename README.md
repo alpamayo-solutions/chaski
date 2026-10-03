@@ -272,8 +272,16 @@ class MyDriver(Driver):
 ConnectorService("oven-connector", mount="site1/ovens", driver=MyDriver()).run()
 ```
 
-`run()` serves the connector with `/is_healthy` on port 8888. A driver whose
-client needs the running event loop at construction (pymodbus's
+`run()` serves the connector with `/is_healthy` on port 8888. The endpoint
+answers from the start: while the node's Colca cannot be reached it answers 503
+with the reason (`not ready: cannot reach Colca at ...`), and the connector
+retries with a jittered backoff of at most 5 s (longer when the node answers
+`429` with `Retry-After`) instead of exiting. A `DataOpsService` does the same
+on its health door, with the reason under `not_ready`. Only a configuration
+error ends startup. `svc.readiness` says where startup is; a plain `Service`
+gets the same retries from `svc.start_when_reachable()`.
+
+A driver whose client needs the running event loop at construction (pymodbus's
 `AsyncModbusTcpClient`, for one) builds the connector in a factory instead:
 
 ```python

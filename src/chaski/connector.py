@@ -373,9 +373,11 @@ class RefusalSpell(NamedTuple):
     reason: str
 
 
-def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandler]:
+def _health_handler(
+    is_healthy: Callable[[], bool], reason: Callable[[], str] | None = None
+) -> type[BaseHTTPRequestHandler]:
     """``/is_healthy``: 200 while ``is_healthy`` says so, 503 while it does
-    not; see :func:`run` for what it checks."""
+    not, with ``reason`` in the body; see :func:`run` for what it checks."""
 
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -385,9 +387,10 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
                     self.end_headers()
                     self.wfile.write(b"ok")
                 else:
+                    why = reason() if reason is not None else ""
                     self.send_response(503)
                     self.end_headers()
-                    self.wfile.write(b"unhealthy")
+                    self.wfile.write(f"unhealthy: {why}".encode() if why else b"unhealthy")
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -398,9 +401,12 @@ def _health_handler(is_healthy: Callable[[], bool]) -> type[BaseHTTPRequestHandl
     return HealthCheckHandler
 
 
-def start_health_server(port: int, is_healthy: Callable[[], bool]) -> HTTPServer:
-    """Serve ``GET /is_healthy`` on ``port`` from a daemon thread."""
-    server = HTTPServer(("0.0.0.0", port), _health_handler(is_healthy))  # noqa: S104 - a container's own port  # nosec B104
+def start_health_server(
+    port: int, is_healthy: Callable[[], bool], *, reason: Callable[[], str] | None = None
+) -> HTTPServer:
+    """Serve ``GET /is_healthy`` on ``port`` from a daemon thread; a 503
+    names ``reason()`` when given."""
+    server = HTTPServer(("0.0.0.0", port), _health_handler(is_healthy, reason))  # noqa: S104 - a container's own port  # nosec B104
     threading.Thread(target=server.serve_forever, daemon=True, name="colca-health").start()
     return server
 
@@ -409,14 +415,16 @@ def run(build: Callable[[], ConnectorService], *, health_port: int | None = 8888
     """Build a connector inside a running event loop and serve it until
     stopped, with ``/is_healthy`` on ``health_port`` (None: no endpoint).
     It takes a factory because some protocol clients, such as pymodbus's
-    ``AsyncModbusTcpClient``, need the running loop at construction."""
+    ``AsyncModbusTcpClient``, need the running loop at construction.
+
+    The endpoint answers from the start, before the node is reached: 503
+    with the reason (:meth:`ConnectorService.health_problem`) until the
+    connector is started and its broker link is up."""
 
     async def main() -> None:
         svc = build()
         if health_port is not None:
-            # Unhealthy while buffering through a broker outage, and while
-            # another process runs as this connector (see Service.identity_conflict).
-            start_health_server(health_port, lambda: svc.is_broker_connected() and not svc.identity_conflict)
+            start_health_server(health_port, lambda: not svc.health_problem(), reason=svc.health_problem)
         await svc.serve()
 
     asyncio.run(main())
@@ -691,22 +699,40 @@ class ConnectorService(Service):
         """Serve until stopped: :func:`run` with this service."""
         run(lambda: self, health_port=health_port)
 
+    def health_problem(self) -> str:
+        """Why the connector is not healthy, ``""`` while it is: not started
+        yet (Colca not reached, see :attr:`readiness`), another process
+        running as this connector (:attr:`identity_conflict`), or the broker
+        link down while samples are journaled."""
+        readiness = self.readiness
+        if not readiness.ready:
+            return f"not ready: {readiness.reason}"
+        if self.identity_conflict:
+            return self.identity_conflict
+        if not self.is_broker_connected():
+            return "the MQTT link to Colca is down; samples are journaled until it returns"
+        return ""
+
     async def stop(self) -> None:
         self._stopping.set()
         self.clock.changes.notify()
 
     async def serve(self) -> None:
-        """Register, discover, poll. Returns when :meth:`stop` is called;
-        raises if the node cannot be reached at all (a connector without a
-        node has nothing to do — the container restarts it)."""
+        """Register, discover, poll. Returns when :meth:`stop` is called.
+
+        A node that cannot be reached yet does not end it: the connector
+        retries with backoff (:meth:`~chaski.Service.start_when_reachable`)
+        and reports itself not ready meanwhile; the source is not touched
+        before the node answers. A configuration error raises."""
         self._log.info("[STARTUP] Connector starting: protocol=%s, interval=%.1fs", self.driver.protocol, self.interval)
-        self.start()
-        # Service configures Paho's queue before connecting. Its limit is
-        # the same as our pending buffer; Paho refuses changing it afterwards.
-        self.telemetry.broker_healthy(True)
         writes: asyncio.Task | None = None
         heartbeat: asyncio.Task | None = None
         try:
+            if not await self.start_when_reachable_async(self._stopping):
+                return
+            # Service configures Paho's queue before connecting. Its limit is
+            # the same as our pending buffer; Paho refuses changing it afterwards.
+            self.telemetry.broker_healthy(True)
             await self._startup_discovery()
             writes = asyncio.ensure_future(self._serve_writes())
             heartbeat = asyncio.ensure_future(self._heartbeat_forever())

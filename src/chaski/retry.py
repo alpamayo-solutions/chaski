@@ -1,6 +1,7 @@
 """Backoff for failed transport operations; never an idle refresh cadence."""
 
 import math
+import urllib.error
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from random import SystemRandom
@@ -28,9 +29,14 @@ def retry_after(error) -> float | None:
     ):
         return float(explicit)
     response = getattr(error, "response", None)
-    if response is None or response.status_code != 429:
+    if response is not None and response.status_code == 429:
+        headers = response.headers
+    elif isinstance(error, urllib.error.HTTPError) and error.code == 429:
+        # urllib's HTTPError is its own response (resolve_local_identity's /self).
+        headers = error.headers
+    else:
         return None
-    value = response.headers.get("Retry-After", "")
+    value = (headers.get("Retry-After") if headers is not None else None) or ""
     try:
         delay = float(value)
     except ValueError:

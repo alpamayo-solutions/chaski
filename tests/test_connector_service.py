@@ -997,9 +997,11 @@ def test_a_reconnect_re_resolves_placement_and_republishes_at_the_new_position(n
 
 
 def test_the_local_door_is_opened_with_the_log_publisher_attached(node, driver, monkeypatch):
-    """The connector publishes its log through connect_local_mqtt, like every
-    local service."""
+    """The connector publishes its log on the local door, like every local
+    service, attached once the broker answered: an attempt that fails while
+    Colca is down leaves no handler behind."""
     calls: dict = {}
+    attached: list = []
 
     def connect(name, **kwargs):
         calls.update(kwargs, name=name)
@@ -1011,8 +1013,10 @@ def test_the_local_door_is_opened_with_the_log_publisher_attached(node, driver, 
     monkeypatch.setattr("chaski.service.resolve_local_identity", lambda *a, **k: identity)
     monkeypatch.setattr("chaski.service.connect_local_mqtt", connect)
     monkeypatch.setattr("chaski.service.Door", node.door)
+    monkeypatch.setattr("chaski.service.attach_log_publisher", lambda client, context: attached.append(client))
     ConnectorService(NAME, driver=driver).start()
-    assert calls["name"] == NAME and calls["publish_logs"] is True and calls["will"] is not None
+    assert calls["name"] == NAME and calls["publish_logs"] is False and calls["will"] is not None
+    assert attached == [node]
 
 
 # ── the whole loop, end to end ──────────────────────────────────────────
