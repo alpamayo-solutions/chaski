@@ -60,7 +60,22 @@ class HealthState:
 
     ``backfill`` reports a running backfill (:mod:`chaski.dataops.backfill`):
     the job, its range, position and share done. A backfill in progress is
-    healthy; one that fails is counted in ``handlers`` like any task.
+    healthy: it reads history through the buffer and the historian, not a
+    cursor, so it adds nothing to ``cursor_lag``, which stays the lag of live
+    intake. One that fails is counted in ``handlers`` like any task.
+
+    ``status`` sums the answer up in one word:
+
+    * ``starting``: startup is not done (503);
+    * ``unhealthy``: any of the failures above (503);
+    * ``degraded``: a handler is being retried, or a running backfill finished
+      no window for its ``stall_after`` bound; ``degraded`` lists why (200,
+      since live intake goes on);
+    * ``backfilling``: a first backfill holds the producer's live triggers on
+      purpose until it reaches the live edge (200; the ingest goes on
+      buffering, so its cursor does not lag);
+    * ``ok`` otherwise, an independent backfill running beside live dispatch
+      included (200; ``backfill`` shows its progress).
     """
 
     started_at: float = field(default_factory=time.time)
@@ -134,6 +149,17 @@ class HealthState:
             and self._handlers() != UNHEALTHY
         )
 
+    def _degraded(self, backfill: dict) -> list[str]:
+        reasons: list[str] = []
+        if self.handlers is not None:
+            reasons.extend(
+                f"{name} failed {f.failures}x, retried" for name, f in sorted(self.handlers.failing().items())
+            )
+        stalled = (backfill.get("running") or {}).get("stalled")
+        if stalled:
+            reasons.append(stalled)
+        return reasons
+
     def snapshot(self) -> dict:
         ingest = self._ingest()
         broker = self._broker()
@@ -160,6 +186,18 @@ class HealthState:
         backfill = self.backfill() if self.backfill is not None else {}
         if backfill:
             body["backfill"] = backfill
+        degraded = self._degraded(backfill) if body["ok"] else []
+        if not self.ready:
+            body["status"] = "starting"
+        elif not body["ok"]:
+            body["status"] = "unhealthy"
+        elif degraded:
+            body["status"] = "degraded"
+            body["degraded"] = degraded
+        elif (backfill.get("running") or {}).get("holds_live"):
+            body["status"] = "backfilling"
+        else:
+            body["status"] = "ok"
         if lag:
             body["cursor_lag"] = lag
         if conflict:

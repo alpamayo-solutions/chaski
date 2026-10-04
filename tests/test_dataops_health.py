@@ -179,3 +179,108 @@ async def test_an_identity_conflict_turns_the_probe_503():
     finally:
         server.close()
         await server.wait_closed()
+
+
+# ─── health per backfill mode ──────────────────────────────────────────────
+
+
+def _running(*, holds_live: bool, stalled: str = "") -> dict:
+    running = {"producer": "cycles", "job": "initial", "progress": 0.03, "holds_live": holds_live}
+    if stalled:
+        running["stalled"] = stalled
+    return {"running": running, "pending": 0}
+
+
+def _state(backfill: dict, lag: str = "") -> HealthState:
+    state = HealthState(backfill=lambda: backfill, cursor_lag=lambda: lag)
+    state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
+    return state
+
+
+@run_async
+async def test_without_a_backfill_a_running_ingest_reports_ok():
+    state = _state({})
+    try:
+        body = state.snapshot()
+        assert state.healthy() and body["status"] == "ok"
+        assert "backfill" not in body and "degraded" not in body
+    finally:
+        state.ingest_task.cancel()
+
+
+@run_async
+async def test_an_independent_backfill_is_progress_and_the_service_reports_ok():
+    """Live dispatch runs beside the history: the door answers 200 with the
+    job's progress, and only live lag fails it."""
+    state = _state(_running(holds_live=False))
+    try:
+        body = state.snapshot()
+        assert state.healthy() and body["ok"] and body["status"] == "ok"
+        assert body["backfill"]["running"]["holds_live"] is False
+        assert "cursor_lag" not in body
+    finally:
+        state.ingest_task.cancel()
+
+
+@run_async
+async def test_a_backfill_that_holds_live_reports_backfilling_and_stays_200():
+    """Live triggers are held on purpose; the ingest goes on buffering, so the
+    service is neither not-ready nor degraded."""
+    state = _state(_running(holds_live=True))
+    try:
+        body = state.snapshot()
+        assert state.healthy() and body["ok"]
+        assert body["status"] == "backfilling"
+        assert "not_ready" not in body and "degraded" not in body
+    finally:
+        state.ingest_task.cancel()
+
+
+@run_async
+async def test_live_lag_during_a_backfill_still_fails_the_probe_in_either_mode():
+    lag = "dataops has records on metrics waiting 75 s that it has not read"
+    for holds_live in (False, True):
+        state = _state(_running(holds_live=holds_live), lag=lag)
+        try:
+            body = state.snapshot()
+            assert not state.healthy() and not body["ok"]
+            assert body["status"] == "unhealthy" and body["cursor_lag"] == lag
+            assert body["backfill"]["running"]["holds_live"] is holds_live
+        finally:
+            state.ingest_task.cancel()
+
+
+@run_async
+async def test_a_stalled_backfill_is_degraded_with_its_reason_and_stays_200():
+    reason = "no backfill window finished in 900 s; it waits for its inputs to be commissioned"
+    for holds_live in (False, True):
+        state = _state(_running(holds_live=holds_live, stalled=reason))
+        try:
+            body = state.snapshot()
+            assert state.healthy() and body["ok"]
+            assert body["status"] == "degraded"
+            assert body["degraded"] == [reason]
+        finally:
+            state.ingest_task.cancel()
+
+
+@run_async
+async def test_a_retried_handler_is_degraded_and_names_it():
+    from chaski.failures import HandlerHealth
+
+    handlers = HandlerHealth()
+    handlers.failed("cycles.on_state", RuntimeError("boom"))
+    state = _state({})
+    state.handlers = handlers
+    try:
+        body = state.snapshot()
+        assert state.healthy() and body["status"] == "degraded"
+        assert body["degraded"] == ["cycles.on_state failed 1x, retried"]
+    finally:
+        state.ingest_task.cancel()
+
+
+def test_before_startup_is_done_the_status_is_starting():
+    state = HealthState(ready=False, backfill=lambda: _running(holds_live=True))
+    body = state.snapshot()
+    assert not state.healthy() and body["status"] == "starting"

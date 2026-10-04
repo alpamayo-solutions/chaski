@@ -145,7 +145,12 @@ stay silent also drains every `chaski.doorbell.IDLE_DRAIN_S` (5 minutes), so
 its cursor moves past the records it skips instead of holding the node's
 retention (`follow(bell, idle_drain_s=...)`). A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
-`svc.cursor_lag` follows and a `DataOpsService` health door fails on.
+`svc.cursor_lag` follows and a `DataOpsService` health door fails on. A
+`DataOpsService` reads `metrics` on one cursor per buffer generation; a new
+buffer (a fresh state volume) starts a new one, and the service retires the
+cursors of earlier generations at start (through the local door's
+`/backlog`). Where the node does not list them, the health door does not count
+lag that the finding names only on those cursors.
 
 For current state, `svc.retained_view` keeps a snapshot of some contracts and
 follows their changes on the durable streams. Every view names the paths it
@@ -602,6 +607,14 @@ DataOpsService("dataops", historian=my_historian, backfill_rate=1.0, backfill_bu
   share done, whether live is held). A retained `backfill` `_Finding` stands
   while a job runs and is retired when none is left. A failure is retried with
   backoff and reported in `handler_health` as `task backfill`.
+- **Health.** A running backfill is progress, not lag: it reads history through
+  the buffer and the historian, not a cursor, so the door's `cursor_lag` stays
+  the lag of live intake and a stalled live ingest still answers 503. The
+  door's `status` is `backfilling` (200) while a first job holds live dispatch,
+  and `ok` while an independent one runs beside it. A job that finished no
+  window for `backfill_stall_after` seconds (default 600; the throttle's pause
+  not counted) shows `stalled` with the reason, and `status` is `degraded`
+  (200) with the reason under `degraded`.
 - **Repair.** `svc.request_backfill("cycles", start, end, window="1h")` runs
   the producer again over `[start, end)` on a separate instance, throttled the
   same way and resumable. `window` sets the job's step size; without it the job

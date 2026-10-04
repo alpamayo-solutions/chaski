@@ -621,6 +621,7 @@ class Service:
         # summary while it stands (see cursor_lag).
         self._lag_topic: str | None = None
         self._cursor_lag = ""
+        self._cursor_lag_cursors: tuple[str, ...] = ()
         # When the broker last handed this identity's session to another
         # connection (monotonic), and the timer that retires the conflict.
         self._taken_over_at: float | None = None
@@ -1170,6 +1171,12 @@ class Service:
         """
         return self._cursor_lag
 
+    @property
+    def cursor_lag_cursors(self) -> tuple[str, ...]:
+        """The cursors the standing ``cursor_lag`` finding names (its
+        ``detail.cursors``), ``()`` while none stands or the node names none."""
+        return self._cursor_lag_cursors
+
     def _lag_topic_now(self) -> str:
         return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/cursor_lag"
 
@@ -1182,6 +1189,7 @@ class Service:
         if self._lag_topic is not None:
             client.unsubscribe(self._lag_topic)
             self._cursor_lag = ""
+            self._cursor_lag_cursors = ()
         self._lag_topic = topic
         client.subscribe(topic, qos=1, callback=self._on_cursor_lag)
 
@@ -1192,16 +1200,22 @@ class Service:
                 payload = json.loads(payload) if payload else None
             except ValueError:
                 payload = {}
+        cursors: tuple[str, ...] = ()
         if payload is None:
             summary = ""
         else:
             raw = payload.get("summary") if isinstance(payload, dict) else getattr(payload, "summary", None)
             summary = raw if isinstance(raw, str) and raw else "records wait unread on this service's cursor"
+            detail = payload.get("detail") if isinstance(payload, dict) else getattr(payload, "detail", None)
+            named = detail.get("cursors") if isinstance(detail, dict) else None
+            if isinstance(named, list):
+                cursors = tuple(c["cursor"] for c in named if isinstance(c, dict) and isinstance(c.get("cursor"), str))
         if summary != self._cursor_lag:
             if summary:
                 logger.warning("chaski.Service: %s: the node reports %s", self.name, summary)
             else:
                 logger.info("chaski.Service: %s: the node reports its cursors caught up", self.name)
+        self._cursor_lag_cursors = cursors
         self._cursor_lag = summary
 
     def _subscribe_clock(self) -> None:

@@ -5,7 +5,8 @@ service's cursor namespace) walks the stream forward, appends every record to
 the local :class:`~chaski.dataops.Buffer`, and runs the ``@on_metric`` handlers
 bound to its ``signal_id``, in stream order, live and on replay alike. A new
 buffer generation starts a new cursor at offset 1, so cold start, recovery and
-replay are one code path.
+replay are one code path. The service retires the cursors of earlier
+generations at start (:meth:`chaski.dataops.DataOpsService.serve`).
 
 The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
@@ -129,7 +130,6 @@ class Ingest:
         *,
         dispatch: dict[str, list[Handler]] | None = None,
         signal_ids: Iterable[str] | None = None,
-        previous_generation: str | None = None,
         strict: bool = True,
         min_fetch_interval_s: float = MIN_FETCH_INTERVAL_S,
         retry_min_s: float = 1.0,
@@ -152,7 +152,6 @@ class Ingest:
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
         self._cursor_name = cursor_name(buffer.generation)
         self._stream = open_stream(self._cursor_name, self._signal_ids)
-        self._previous_generation = previous_generation
         self._bell = Doorbell()
         #: Held while one page is appended and dispatched. A backfill hands a
         #: producer over to live dispatch under it, between two pages
@@ -205,20 +204,6 @@ class Ingest:
     def last_drain_at(self) -> float:
         """Monotonic time the last drain finished (or the loop was built)."""
         return self._last_drain_at
-
-    # ------------------------------------------------------------------ startup
-
-    def retire_previous_generation(self) -> None:
-        """Delete the previous generation's ingest cursor, if any.
-
-        A rebuilt buffer starts a new cursor, and the old one would otherwise
-        hold back retention. Deleting a missing cursor succeeds.
-        """
-        if not self._previous_generation:
-            return
-        stale = self._open_stream(cursor_name(self._previous_generation), None)
-        log.info("Retiring previous-generation cursor %s (stream=%s)", stale.cursor, stale.name)
-        stale.retire()
 
     # ------------------------------------------------------------------ loop
 
