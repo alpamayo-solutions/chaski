@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.1](https://github.com/alpamayo-solutions/chaski/compare/v0.23.0...v0.23.1) (2026-10-04)
+
+
+### Fixes
+
+* **dataops:** retire earlier-generation ingest cursors and report backfill health ([#137](https://github.com/alpamayo-solutions/chaski/issues/137)) ([8d5b97b](https://github.com/alpamayo-solutions/chaski/commit/8d5b97b31134309f50052c1a1dedc6817bbcd61c))
+
 ## [0.23.0](https://github.com/alpamayo-solutions/chaski/compare/v0.22.0...v0.23.0) (2026-10-04)
 
 
