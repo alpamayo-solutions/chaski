@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS backfill_jobs (
     code_hash   TEXT NOT NULL,
     done        INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL,
+    window_s    REAL,
     PRIMARY KEY (producer, job)
 );
 
@@ -123,9 +124,16 @@ class Buffer:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._upgrade()
         self._conn.commit()
         self._deferred = 0
         self.generation: str = self._load_or_mint_generation()
+
+    def _upgrade(self) -> None:
+        """Add the columns a buffer written by an older release lacks."""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(backfill_jobs)")}
+        if "window_s" not in columns:
+            self._conn.execute("ALTER TABLE backfill_jobs ADD COLUMN window_s REAL")
 
     def checkpoint(self, producer: str):
         """Return a producer's versioned JSON state and handled input offsets."""
@@ -470,15 +478,17 @@ class Buffer:
 
     def backfill_jobs(self, *, pending_only: bool = False) -> list[dict[str, Any]]:
         """Every backfill job, oldest first: ``producer``, ``job``, ``start``,
-        ``end`` (``None`` for a producer's first backfill, which ends at the
-        live edge), ``position``, ``windows``, ``code_hash``, ``done``."""
+        ``end`` (``None`` for a first backfill that holds live dispatch and
+        ends at the live edge; an independent one ends at its recorded
+        boundary), ``position``, ``windows``, ``code_hash``, ``done`` and
+        ``window`` (seconds per step, ``None`` when the job did not set one)."""
         with self._lock:
             rows = self._conn.execute(
-                'SELECT producer, job, start, "end", position, windows, code_hash, done, created_at '
+                'SELECT producer, job, start, "end", position, windows, code_hash, done, created_at, window_s '
                 "FROM backfill_jobs WHERE done = 0 OR ? ORDER BY created_at, producer, job",
                 (0 if pending_only else 1,),
             ).fetchall()
-        keys = ("producer", "job", "start", "end", "position", "windows", "code_hash", "done", "created_at")
+        keys = ("producer", "job", "start", "end", "position", "windows", "code_hash", "done", "created_at", "window")
         return [{**dict(zip(keys, row, strict=True)), "done": bool(row[7])} for row in rows]
 
     def backfill_job(self, producer: str, job: str) -> dict[str, Any] | None:
@@ -486,17 +496,34 @@ class Buffer:
         return next((j for j in self.backfill_jobs() if j["producer"] == producer and j["job"] == job), None)
 
     def add_backfill_job(
-        self, producer: str, job: str, start: float, end: float | None, code_hash: str, *, created_at: float
+        self,
+        producer: str,
+        job: str,
+        start: float,
+        end: float | None,
+        code_hash: str,
+        *,
+        created_at: float,
+        window: float | None = None,
     ) -> bool:
-        """Record a job at its start. A job that exists is left as it is;
-        returns whether this call created it."""
+        """Record a job at its start. A job that exists is left as it is, its
+        end included; returns whether this call created it."""
         with self._lock, self._conn:
             cur = self._conn.execute(
                 'INSERT OR IGNORE INTO backfill_jobs (producer, job, start, "end", position, windows, code_hash, '
-                "done, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)",
-                (producer, job, start, end, start, code_hash, created_at),
+                "done, created_at, window_s) VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, ?)",
+                (producer, job, start, end, start, code_hash, created_at, window),
             )
             return cur.rowcount > 0
+
+    def set_backfill_end(self, producer: str, job: str, end: float) -> None:
+        """Fix the end of a job that had none: a first backfill that no longer
+        holds live dispatch ends where live dispatch began."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                'UPDATE backfill_jobs SET "end" = ? WHERE producer = ? AND job = ? AND "end" IS NULL',
+                (end, producer, job),
+            )
 
     def backfill_progress(self, producer: str, job: str, position: float, windows: int, code_hash: str) -> None:
         """Record the end of the last window a job completed. Committed at

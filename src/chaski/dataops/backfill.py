@@ -36,11 +36,33 @@ have been without a backfill. One instance sees the producer's whole timeline
 in order, so a producer with in-memory state ends the backfill in the state
 live processing continues from.
 
+**Independent mode.** ``Backfill(..., mode="independent")`` does not hold
+the producer's live triggers: live dispatch runs from the first start, as for
+a producer without a backfill. The first job then covers ``[now - horizon,
+live start)``; the live start is recorded with the job at that first start, so
+neither a restart nor a code change moves it. The job runs on a separate
+instance, after ``setup()``, like a repair, beside live dispatch, throttled the
+same way. Where history and live overlap (live processing also covers what the
+stream still holds), deterministic output ids make the overlap idempotent.
+
+Choose ``hold_live`` (the default) when the producer's in-memory state must
+flow continuously from history into live. Choose ``independent`` when its
+output does not depend on state carried across the live start, because its
+state restarts cleanly from the data (a cycle segmenter that opens a cycle at
+the next start condition, a per-sample computation): live output is there at
+once instead of after hours of history, and the union of history and live
+output equals one live pass. Such a producer writes a result once it is final
+(a cycle at its end): the history run stops at the live start with the cycle
+open there unfinished, and a write of it as still open would overwrite what
+live processing wrote at its end. A producer switched from ``hold_live`` to
+``independent`` while its first job runs keeps the job's position; its live
+start is fixed at that restart.
+
 **Durable and resumable.** The job's position is committed after each window,
-in the same commit as the producer's checkpoint (``state_version``). After a
-restart the job resumes at the last committed window, with the checkpoint
-restored; a producer without ``state_version`` resumes with the state its
-``setup()`` gives it. A window that failed is processed again. A changed code
+in the same commit as the producer's checkpoint (``state_version``) when the
+job holds live. After a restart the job resumes at the last committed window,
+with the checkpoint restored; a producer without ``state_version``, and every
+job on a separate instance, resumes with the state its ``setup()`` gives it. A window that failed is processed again. A changed code
 hash restarts the job from its start.
 
 **Throttled.** Between windows the job sleeps long enough that it runs at most
@@ -56,7 +78,8 @@ live processing covered) overwrites rather than duplicates.
 **Repair.** :meth:`DataOpsService.request_backfill` records a job for an
 explicit range. It runs on a separate instance of the producer, after
 ``setup()``, so the live instance's state and its live dispatch are left
-alone. The same throttle applies.
+alone. The same throttle applies. Its ``window`` is the job's own; without
+one it is the declaration's, or ``DEFAULT_WINDOW``.
 
 **Progress.** The health door reports ``backfill`` (the job, its range,
 position and share done), and the service keeps a retained ``backfill``
@@ -98,8 +121,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("chaski.dataops.backfill")
 
-#: The job a producer's ``backfill`` declaration starts: from its horizon to the live edge.
+#: The job a producer's ``backfill`` declaration starts: from its horizon to
+#: the live edge (``hold_live``) or to where live dispatch began (``independent``).
 INITIAL = "initial"
+#: The first backfill holds live dispatch until it reaches the live edge.
+HOLD_LIVE = "hold_live"
+#: Live dispatch starts at once; the first backfill covers what lies before.
+INDEPENDENT = "independent"
+MODES = (HOLD_LIVE, INDEPENDENT)
 DEFAULT_WINDOW = "1h"
 #: At most this many windows per second.
 DEFAULT_RATE = 1.0
@@ -113,17 +142,32 @@ FINDING_INTERVAL_S = 60.0
 
 class Backfill:
     """A producer's declaration that it processes history older than live
-    intake: ``horizon`` (how far back, ``"400d"`` or seconds) and ``window``
-    (how much history one step processes)."""
+    intake: ``horizon`` (how far back, ``"400d"`` or seconds), ``window``
+    (how much history one step processes) and ``mode``, how the first
+    backfill relates to live dispatch:
 
-    __slots__ = ("horizon_s", "window_s")
+    * ``"hold_live"`` (the default): live triggers wait until the history is
+      processed, and one instance carries its state from history into live.
+    * ``"independent"``: live dispatch starts at once, and the history before
+      that start runs beside it on a separate instance.
 
-    def __init__(self, horizon: str | float, window: str | float = DEFAULT_WINDOW) -> None:
+    See the module docstring for when to choose which."""
+
+    __slots__ = ("horizon_s", "mode", "window_s")
+
+    def __init__(self, horizon: str | float, window: str | float = DEFAULT_WINDOW, *, mode: str = HOLD_LIVE) -> None:
+        if mode not in MODES:
+            raise ValueError(f"Backfill mode must be one of {', '.join(MODES)}, got {mode!r}")
         self.horizon_s = parse_duration(horizon)
         self.window_s = parse_duration(window)
+        self.mode = mode
+
+    @property
+    def holds_live(self) -> bool:
+        return self.mode == HOLD_LIVE
 
     def __repr__(self) -> str:
-        return f"Backfill(horizon={self.horizon_s:g}, window={self.window_s:g})"
+        return f"Backfill(horizon={self.horizon_s:g}, window={self.window_s:g}, mode={self.mode!r})"
 
 
 def tick_instants(spec: CronSpec | IntervalSpec, start: float, end: float) -> list[float]:
@@ -232,8 +276,14 @@ class BackfillRunner:
 
     def plan(self) -> None:
         """Record the first job of every producer that declares a backfill and
-        has none yet, and hold the live triggers of each whose first job is
-        not done."""
+        has none yet, and hold the live triggers of each whose first job holds
+        live dispatch and is not done.
+
+        An independent first job ends where live dispatch begins: now, at the
+        first start. The end is recorded with the job, so a restart keeps it.
+        A first job recorded as holding live and not yet done, whose producer
+        now declares ``independent``, gets its end here and goes on beside
+        live dispatch."""
         now = runtime_now(self._service)
         for name, instance in self._instances.items():
             spec = type(instance).backfill
@@ -243,12 +293,17 @@ class BackfillRunner:
                 name,
                 INITIAL,
                 now - spec.horizon_s,
-                None,
+                None if spec.holds_live else now,
                 codehash.compute_code_hash(type(instance)),
                 created_at=time.time(),
             )
             job = self._buffer.backfill_job(name, INITIAL)
-            if job is not None and not job["done"]:
+            if job is None or job["done"]:
+                continue
+            if job["end"] is None and not spec.holds_live:
+                self._buffer.set_backfill_end(name, INITIAL, now)
+                job = {**job, "end": now}
+            if job["end"] is None:
                 with self._lock:
                     self._held.add(name)
                 log.info(
@@ -256,6 +311,14 @@ class BackfillRunner:
                     name,
                     "starting" if created else "resuming",
                     _iso(job["position"]),
+                )
+            else:
+                log.info(
+                    "%s: %s independent backfill from %s to %s; live dispatch runs meanwhile",
+                    name,
+                    "starting" if created else "resuming",
+                    _iso(job["position"]),
+                    _iso(job["end"]),
                 )
 
     def holds(self, producer: str) -> bool:
@@ -265,9 +328,13 @@ class BackfillRunner:
 
     # -- repair ------------------------------------------------------------
 
-    def request(self, producer: str, start: float, end: float) -> str:
+    def request(self, producer: str, start: float, end: float, *, window: Any = None) -> str:
         """Record a job over ``[start, end)`` and wake the runner. Returns its id."""
-        job = request(self._buffer, self._instances[producer], start, end) if producer in self._instances else None
+        job = (
+            request(self._buffer, self._instances[producer], start, end, window=window)
+            if producer in self._instances
+            else None
+        )
         if job is None:
             raise KeyError(f"no producer {producer!r} runs in this service")
         self.bell.ring()
@@ -298,6 +365,7 @@ class BackfillRunner:
                 "windows": windows,
                 "progress": round(progress, 4),
                 "holds_live": job["producer"] in self._held,
+                "window_s": job["window_s"],
             }
 
     async def _publish_finding(self, *, force: bool = False) -> None:
@@ -360,7 +428,10 @@ class BackfillRunner:
         live = self._instances[name]
         cls = type(live)
         initial = job_id == INITIAL
-        window = cls.backfill.window_s if cls.backfill is not None else parse_duration(DEFAULT_WINDOW)
+        # A first backfill that holds live dispatch runs on the live instance
+        # up to the live edge; every other job on its own instance up to its end.
+        holding = initial and job["end"] is None
+        window = _window_of(cls, job)
         code_hash = await asyncio.to_thread(codehash.compute_code_hash, cls)
         position, windows = job["position"], job["windows"]
         if windows and job["code_hash"] != code_hash:
@@ -370,9 +441,9 @@ class BackfillRunner:
             position, windows = job["start"], 0
             await asyncio.to_thread(self._buffer.backfill_progress, name, job_id, position, windows, code_hash)
         # Computing the hash parses the producer's modules: once per job.
-        job = {**job, "code_hash": code_hash}
+        job = {**job, "code_hash": code_hash, "window_s": window}
 
-        if initial:
+        if holding:
             instance = live
             if windows:
                 restore_checkpoint(instance)
@@ -394,7 +465,7 @@ class BackfillRunner:
                     first = self._first(plan)
                     if first is not None and position < first:
                         position = first
-                if initial:
+                if holding:
                     edge = self._edge(plan)
                     self._report(job, position, windows, edge)
                     if position + window < edge:
@@ -402,7 +473,7 @@ class BackfillRunner:
                             instance, plan, job, position, position + window, windows, stop
                         )
                         continue
-                    if await self._hand_over(instance, plan, job, position, windows, code_hash, stop):
+                    if await self._hand_over(instance, plan, job, position, windows, code_hash, window, stop):
                         return
                     continue
                 end = job["end"]
@@ -415,7 +486,7 @@ class BackfillRunner:
                     instance, plan, job, position, min(position + window, end), windows, stop
                 )
         finally:
-            if not initial:
+            if not holding:
                 try:
                     await instance.teardown()
                 except Exception as exc:
@@ -484,9 +555,8 @@ class BackfillRunner:
         self, instance: Producer, job: dict[str, Any], position: float, windows: int, *, done: bool = False
     ) -> None:
         code_hash = job["code_hash"]
-        initial = job["job"] == INITIAL
         with self._buffer.one_commit():
-            if initial:
+            if _holds_live(job):
                 save_checkpoint(instance)
             self._buffer.backfill_progress(job["producer"], job["job"], position, windows, code_hash)
             if done:
@@ -500,6 +570,7 @@ class BackfillRunner:
         position: float,
         windows: int,
         code_hash: str,
+        window: float,
         stop: asyncio.Event,
     ) -> bool:
         """Process the rest of the buffer and release the producer to live
@@ -512,7 +583,6 @@ class BackfillRunner:
         await _acquire(page_lock)
         try:
             edge = self._edge(plan)
-            window = type(instance).backfill.window_s  # type: ignore[union-attr]
             if position + window < edge:
                 return False
             end = math.nextafter(max(edge, position), math.inf)
@@ -553,7 +623,7 @@ class BackfillRunner:
             events.extend((due, 1, order, method_name, None) for due in tick_instants(spec, start, end))
         events.sort(key=lambda event: event[:3])
 
-        checkpointed = job["job"] == INITIAL and instance.state_version is not None
+        checkpointed = _holds_live(job) and instance.state_version is not None
         previous = state_copy(instance) if checkpointed else None
         try:
             for ts, kind, _order, target, value in events:
@@ -593,20 +663,39 @@ class BackfillRunner:
                 record_rejection(self._service, consumer, subject, rejected)
 
 
-def request(buffer: Any, instance_or_cls: Producer | type[Producer], start: Any, end: Any) -> str:
+def request(
+    buffer: Any, instance_or_cls: Producer | type[Producer], start: Any, end: Any, *, window: Any = None
+) -> str:
     """Record a repair job for a producer over ``[start, end)`` (unix
-    seconds or datetimes) in ``buffer``; returns the job id."""
+    seconds or datetimes) in ``buffer``; returns the job id. ``window``
+    (``"6h"`` or seconds) is how much history one step processes; without
+    it the job steps by the producer's ``backfill`` window, or
+    ``DEFAULT_WINDOW`` when it declares none."""
     from .outputs import _epoch
 
     cls = instance_or_cls if isinstance(instance_or_cls, type) else type(instance_or_cls)
     start_s, end_s = _epoch(start), _epoch(end)
     if not math.isfinite(start_s) or not math.isfinite(end_s) or end_s <= start_s:
         raise ValueError(f"a backfill needs start < end, got {start!r} .. {end!r}")
+    window_s = None if window is None else parse_duration(window)
     job = f"repair-{ulid.new()}"
     # The runner records the code hash with the first window it commits.
-    buffer.add_backfill_job(cls.name, job, start_s, end_s, "", created_at=time.time())
+    buffer.add_backfill_job(cls.name, job, start_s, end_s, "", created_at=time.time(), window=window_s)
     log.info("%s: backfill %s requested over %s .. %s", cls.name, job, _iso(start_s), _iso(end_s))
     return job
+
+
+def _holds_live(job: dict[str, Any]) -> bool:
+    """Whether ``job`` is a first backfill that holds live dispatch."""
+    return job["job"] == INITIAL and job["end"] is None
+
+
+def _window_of(cls: type[Producer], job: dict[str, Any]) -> float:
+    """How much history one step of ``job`` processes: a first backfill's
+    from the declaration, a repair's from the job and else the declaration."""
+    if job["job"] != INITIAL and job.get("window") is not None:
+        return float(job["window"])
+    return cls.backfill.window_s if cls.backfill is not None else parse_duration(DEFAULT_WINDOW)
 
 
 async def _acquire(lock: threading.Lock) -> None:
@@ -632,4 +721,14 @@ async def _until(awaitable: Any, stop: asyncio.Event) -> None:
                 pending.cancel()
 
 
-__all__ = ["DEFAULT_BUSY", "DEFAULT_RATE", "INITIAL", "Backfill", "BackfillRunner", "request", "tick_instants"]
+__all__ = [
+    "DEFAULT_BUSY",
+    "DEFAULT_RATE",
+    "HOLD_LIVE",
+    "INDEPENDENT",
+    "INITIAL",
+    "Backfill",
+    "BackfillRunner",
+    "request",
+    "tick_instants",
+]

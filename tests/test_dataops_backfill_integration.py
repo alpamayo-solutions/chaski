@@ -339,3 +339,78 @@ def test_a_backfill_reads_history_through_the_node_api_page_by_page(tmp_path, mo
     assert api.tokens_issued == 1
     assert any("cursor" in request for request in api.metric_requests)
     assert all(request["limit"] == 5 for request in api.metric_requests)
+
+
+def test_an_independent_backfill_lets_live_output_flow_and_its_union_with_live_is_one_live_pass(tmp_path):
+    """The cycle segmenter emits each cycle at its end and opens one only at a
+    start, so its output does not depend on state carried across the live
+    start: with ``mode="independent"`` live cycles come at once while the
+    history runs, and history and live together are one live pass."""
+    now = time.time()
+    history = _history(now - 4 * DAY, 4 * 144)
+    archive = [row for row in history if row[0] < now - DAY]
+    recent = [row for row in history if row[0] >= now - DAY]
+    later = _history(now + 60.0, 12)
+    expected = _expected([*history, *later])
+    live_cycles = {ts for ts in _expected([*recent, *later]) if ts >= later[0][0]}
+    assert live_cycles
+
+    with (
+        chaski.Node("backfill-independent", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="Line/M1") as machine,
+        node.service("reader") as reader,
+    ):
+        historian = _seed(node, machine, reader, archive, recent)
+        producer = cycles(Backfill(horizon="5d", window="1h", mode="independent"))
+        with _serving(node, tmp_path / "data", producer, historian=historian, backfill_rate=4.0) as svc:
+            assert not svc.backfill_holds("cycles")
+            job = svc.buffer.backfill_job("cycles", INITIAL)
+            assert job is not None and job["end"] is not None and job["end"] >= now
+
+            # Live cycles reach the node while the history is far from done.
+            _publish(machine, later)
+            _wait(lambda: live_cycles <= {ts for ts, _ in _outputs(reader)})
+            running = svc.buffer.backfill_job("cycles", INITIAL)
+            assert not running["done"], "the history finished before live output was checked"
+            assert running["position"] < job["end"] - DAY
+            assert (svc._backfill.status().get("running") or {}).get("holds_live") is False
+
+            _wait(lambda: svc.buffer.backfill_job("cycles", INITIAL)["done"], timeout=120.0)
+            outputs = _until_outputs(reader, len(expected))
+            finished = svc.buffer.backfill_job("cycles", INITIAL)
+
+    assert finished["end"] == job["end"] and finished["position"] == job["end"]
+    # By key, each cycle once and as one live pass emits it; the overlap of
+    # history and live writes the same samples again.
+    assert dict(outputs) == pytest.approx(expected)
+    assert {ts for ts, _ in outputs} == set(expected)
+
+
+def test_a_restart_mid_independent_backfill_keeps_its_live_start(tmp_path):
+    now = time.time()
+    history = _history(now - 4 * DAY, 4 * 144)
+    archive = [row for row in history if row[0] < now - DAY]
+    recent = [row for row in history if row[0] >= now - DAY]
+    expected = _expected(history)
+    producer = cycles(Backfill(horizon="5d", window="2h", mode="independent"))
+
+    with (
+        chaski.Node("backfill-independent-restart", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="Line/M1") as machine,
+        node.service("reader") as reader,
+    ):
+        historian = _seed(node, machine, reader, archive, recent)
+        with _serving(node, tmp_path / "data", producer, historian=historian, backfill_rate=8.0) as svc:
+            boundary = svc.buffer.backfill_job("cycles", INITIAL)["end"]
+            _wait(lambda: (svc.buffer.backfill_job("cycles", INITIAL) or {}).get("windows", 0) >= 8)
+        # Stopped mid-backfill, started again later.
+        with _serving(node, tmp_path / "data", producer, historian=historian, backfill_rate=1000.0) as svc:
+            job = svc.buffer.backfill_job("cycles", INITIAL)
+            assert job["end"] == boundary, "the restart moved the live start"
+            assert job["windows"] >= 8 and not job["done"]
+            assert not svc.backfill_holds("cycles")
+            _wait(lambda: svc.buffer.backfill_job("cycles", INITIAL)["done"])
+            assert svc.buffer.backfill_job("cycles", INITIAL)["position"] == boundary
+            outputs = _until_outputs(reader, len(expected))
+
+    assert dict(outputs) == pytest.approx(expected)

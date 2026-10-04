@@ -16,6 +16,7 @@ import asyncio
 import json
 import threading
 import time
+from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
@@ -560,4 +561,266 @@ async def test_progress_is_reported_and_the_finding_retired_when_done(tmp_path):
     findings = [(t, p) for t, p in service.door.published if t.endswith("/_Finding/n-1/dataops/backfill")]
     assert findings[0][1] and json.loads(findings[0][1])["reason"] == "backfill"
     assert findings[-1][1] == ""  # retracted
+    buffer.close()
+
+
+# ─── independent mode ──────────────────────────────────────────────────────
+
+
+def closer(mode="independent", horizon="10d", window="6h"):
+    """A cycle segmenter whose output does not depend on state carried across
+    a boundary: it writes a cycle once, at its end, and opens one only at a
+    start condition, so an instance that starts mid-cycle skips that cycle."""
+
+    class Closer(Producer):
+        name = "closer"
+        system_element_name = "press"
+        state_version = 1
+        backfill = Backfill(horizon=horizon, window=window, mode=mode)
+
+        state = SignalRangeInput("state", window="1h")
+        cycle = AnnotationOutput("cycle")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.open: float | None = None
+            self.handled: list[float] = []
+
+        def snapshot_state(self):
+            return {"open": self.open}
+
+        def restore_state(self, state) -> None:
+            self.open = state["open"]
+
+        @on_metric("state")
+        async def on_state(self, metric) -> None:
+            self.handled.append(metric.timestamp)
+            previous = self.state.latest_value_before(metric.timestamp - 1e-6)
+            if metric.value and not previous:
+                self.open = metric.timestamp
+            elif not metric.value and previous and self.open is not None:
+                self.cycle.write_interval(self.open, metric.timestamp, "done")
+                self.open = None
+
+    return Closer
+
+
+async def _reference_of(cls, history, tmp_path) -> dict[str, dict]:
+    """What a single live pass of ``cls`` over the whole history emits."""
+    buffer = Buffer(tmp_path / "reference-closer.sqlite3")
+    try:
+        door = _door()
+        instance = _attach(cls, FakeService(door, buffer, None))
+        handler = make_handler(instance.on_state)
+        for offset, (ts, value) in enumerate(history, start=1):
+            buffer.append(SIGNAL, ts, value)
+            await handler(Record(**{**synthetic_record(SIGNAL, ts, value).__dict__, "offset": offset}))
+        return _annotations(door)
+    finally:
+        buffer.close()
+
+
+def _live_record(offset, ts, value):
+    return Record(**{**synthetic_record(SIGNAL, ts, value).__dict__, "offset": offset})
+
+
+def test_backfill_mode_is_validated_and_hold_live_is_the_default():
+    assert Backfill("1d").mode == "hold_live"
+    assert Backfill("1d").holds_live
+    assert not Backfill("1d", mode="independent").holds_live
+    with pytest.raises(ValueError, match="mode"):
+        Backfill("1d", mode="later")
+
+
+@run_async
+async def test_an_independent_backfill_leaves_live_dispatch_running_and_ends_at_the_live_start(tmp_path):
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    later = _history(now + 60.0, 30)
+    cls = closer(window="1h")
+    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:300], buffered=history[300:], rate=40.0)
+    began = time.time()
+
+    # Not held: the start replays the buffer on the live instance at once.
+    assert not runner.holds("closer")
+    job = buffer.backfill_job("closer", INITIAL)
+    assert job is not None and not job["done"]
+    assert now <= job["end"] <= began
+    assert job["start"] == pytest.approx(job["end"] - 10 * DAY)
+    await replay_changed_producers(service, [instance])
+    assert instance.handled == [ts for ts, _ in history[300:]]
+
+    # Live records are dispatched while the history runs.
+    live = make_handler(instance.on_state)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while not (runner.status().get("running") or {}).get("windows", 0) >= 3:
+        await asyncio.sleep(0.005)
+    for offset, (ts, value) in enumerate(later, start=1000):
+        buffer.append(SIGNAL, ts, value)
+        await live(_live_record(offset, ts, value))
+    assert instance.handled[-len(later) :] == [ts for ts, _ in later]
+    running = runner.status()["running"]
+    assert running["holds_live"] is False
+    assert running["to"] == datetime.fromtimestamp(job["end"], UTC).isoformat()
+    assert 0 < running["progress"] < 1
+    assert not buffer.backfill_job("closer", INITIAL)["done"]
+    while buffer.backfill_jobs(pending_only=True) or runner.status():
+        assert not task.done(), task
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+
+    # History and live together emit what one live pass over all of it does.
+    assert _annotations(service.door) == await _reference_of(closer(), [*history, *later], tmp_path)
+    finished = buffer.backfill_job("closer", INITIAL)
+    assert finished["done"] and finished["position"] == finished["end"] == job["end"]
+    # The history ran on its own instance: the live one saw only live traffic.
+    assert instance.handled == [ts for ts, _ in [*history[300:], *later]]
+    # And did not overwrite the live instance's checkpoint.
+    assert buffer.checkpoint("closer")[2] == {"open": instance.open}
+    buffer.close()
+
+
+@run_async
+async def test_a_restart_mid_independent_backfill_keeps_its_live_start(tmp_path):
+    now = time.time()
+    history = _history(now - 4 * DAY, 4 * 144)
+    cls = closer(window="2h")
+    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:500], buffered=history[500:], rate=50.0)
+    await replay_changed_producers(service, [instance])
+    boundary = buffer.backfill_job("closer", INITIAL)["end"]
+
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while (buffer.backfill_job("closer", INITIAL) or {}).get("windows", 0) < 5:
+        await asyncio.sleep(0.005)
+    stop.set()
+    await task
+    stopped = buffer.backfill_job("closer", INITIAL)
+    assert not stopped["done"]
+    buffer.close()
+
+    # A new process, later: the live start stays where the first start put it.
+    time.sleep(0.05)
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    service2 = FakeService(service.door, buffer, service.historian)
+    service2._ingest = _Ingest()
+    resumed = _attach(closer(window="2h"), service2)
+    runner2 = BackfillRunner(service2, [resumed], rate=1000.0, busy=1.0)
+    service2.runner = runner2
+    runner2.plan()
+    job = buffer.backfill_job("closer", INITIAL)
+    assert job["end"] == boundary
+    assert job["position"] == stopped["position"]
+    assert not runner2.holds("closer")
+    await _run_until_done(runner2, "closer")
+
+    finished = buffer.backfill_job("closer", INITIAL)
+    assert finished["done"] and finished["position"] == boundary
+    assert _annotations(service.door) == await _reference_of(closer(), history, tmp_path)
+    buffer.close()
+
+
+@run_async
+async def test_a_held_first_backfill_switched_to_independent_releases_live_at_its_position(tmp_path):
+    now = time.time()
+    history = _history(now - 2 * DAY, 2 * 144)
+    service, _instance, runner, buffer = _setup(
+        closer(mode="hold_live"), tmp_path, archive=history[:200], buffered=history[200:], rate=50.0
+    )
+    assert runner.holds("closer")
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while (buffer.backfill_job("closer", INITIAL) or {}).get("windows", 0) < 2:
+        await asyncio.sleep(0.005)
+    stop.set()
+    await task
+    held = buffer.backfill_job("closer", INITIAL)
+    assert held["end"] is None and not held["done"]
+
+    switched = _attach(closer(), service)
+    runner2 = BackfillRunner(service, [switched], rate=1000.0, busy=1.0)
+    service.runner = runner2
+    before = time.time()
+    runner2.plan()
+    job = buffer.backfill_job("closer", INITIAL)
+    assert not runner2.holds("closer")
+    assert job["end"] >= before and job["position"] == held["position"]
+    await _run_until_done(runner2, "closer")
+    assert buffer.backfill_job("closer", INITIAL)["done"]
+    buffer.close()
+
+
+@run_async
+async def test_a_repair_steps_by_its_own_window(tmp_path):
+    now = time.time()
+    history = _history(now - DAY, 144)
+    service, _instance, runner, buffer = _setup(segmenter(window="6h"), tmp_path, archive=history, buffered=[])
+    await _run_until_done(runner)
+    historian = service.historian
+
+    historian.windows.clear()
+    runner.request("segmenter", now - 6 * 3600, now, window="30m")
+    await _run_until_done(runner)
+    assert {round(end - start) for start, end in historian.windows} == {1800}
+
+    historian.windows.clear()
+    runner.request("segmenter", now - 12 * 3600, now)
+    await _run_until_done(runner)
+    assert {round(end - start) for start, end in historian.windows} == {6 * 3600}
+
+    with pytest.raises(ValueError, match="positive"):
+        runner.request("segmenter", now - 3600, now, window=0)
+    buffer.close()
+
+
+@run_async
+async def test_a_producer_without_a_backfill_declaration_repairs_with_the_window_it_asks_for(tmp_path):
+    now = time.time()
+    history = _history(now - DAY, 144)
+
+    class Plain(Producer):
+        name = "plain"
+        system_element_name = "press"
+        state = SignalRangeInput("state", window="1h")
+
+        @on_metric("state")
+        async def on_state(self, metric) -> None:
+            pass
+
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    historian = FakeHistorian({SIGNAL: history})
+    service = FakeService(_door(), buffer, historian)
+    service._ingest = _Ingest()
+    instance = Plain().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+    assert buffer.backfill_jobs() == []
+
+    job = runner.request("plain", now - 12 * 3600, now, window="4h")
+    assert buffer.backfill_job("plain", job)["window"] == 4 * 3600
+    await _run_until_done(runner, "plain")
+    assert [round(end - start) for start, end in historian.windows] == [4 * 3600] * 3
+    buffer.close()
+
+
+def test_a_buffer_from_an_older_release_gains_the_job_window_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE backfill_jobs (producer TEXT NOT NULL, job TEXT NOT NULL, start REAL NOT NULL, "
+        '"end" REAL, position REAL NOT NULL, windows INTEGER NOT NULL DEFAULT 0, code_hash TEXT NOT NULL, '
+        "done INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, PRIMARY KEY (producer, job))"
+    )
+    conn.execute("INSERT INTO backfill_jobs VALUES ('p', 'initial', 1.0, NULL, 5.0, 2, 'h', 0, 0.0)")
+    conn.commit()
+    conn.close()
+
+    buffer = Buffer(path)
+    job = buffer.backfill_job("p", INITIAL)
+    assert job is not None and job["position"] == 5.0 and job["window"] is None
     buffer.close()
