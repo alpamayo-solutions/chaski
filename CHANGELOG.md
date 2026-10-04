@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/alpamayo-solutions/chaski/compare/v0.21.0...v0.22.0) (2026-10-04)
+
+
+### Features
+
+* **dataops:** read node history through the node API with NodeHistorian ([#133](https://github.com/alpamayo-solutions/chaski/issues/133)) ([f2ae554](https://github.com/alpamayo-solutions/chaski/commit/f2ae5548e7b94698c214c20588e91ab1dde041c7))
+
 ## [0.21.0](https://github.com/alpamayo-solutions/chaski/compare/v0.20.7...v0.21.0) (2026-10-03)
 
 
