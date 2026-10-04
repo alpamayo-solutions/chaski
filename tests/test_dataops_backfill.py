@@ -20,9 +20,10 @@ import time
 import pandas as pd
 import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry, run_async, signal_entry
+from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 
 from chaski.clock import Clock
-from chaski.dataops import AnnotationOutput, Backfill, Producer, SignalRangeInput, every, on_metric
+from chaski.dataops import AnnotationOutput, Backfill, NodeHistorian, Producer, SignalRangeInput, every, on_metric
 from chaski.dataops.backfill import INITIAL, BackfillRunner, tick_instants
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.outputs import bind_annotation_outputs
@@ -178,13 +179,15 @@ class _Ingest:
         self.caught_up.ring()
 
 
-def _setup(cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0):
+def _setup(cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0, historian=None):
     """A service whose historian holds ``archive`` + ``buffered`` and whose
     buffer holds ``buffered``, as after the ingest drained the stream."""
     buffer = Buffer(tmp_path / name)
     for ts, value in buffered:
         buffer.append(SIGNAL, ts, value)
-    service = FakeService(_door(), buffer, FakeHistorian({SIGNAL: [*archive, *buffered]}))
+    if historian is None:
+        historian = FakeHistorian({SIGNAL: [*archive, *buffered]})
+    service = FakeService(_door(), buffer, historian)
     service._ingest = _Ingest()
     instance = _attach(cls, service)
     runner = BackfillRunner(service, [instance], rate=rate, busy=busy)
@@ -228,6 +231,37 @@ async def test_backfill_emits_what_one_live_pass_over_the_same_history_emits(tmp
     assert job is not None and job["done"]
     # Handed over like a replay: the next start does not replay the buffer again.
     assert buffer.watermark("segmenter") == history[-1][0]
+    buffer.close()
+
+
+@run_async
+async def test_a_backfill_through_the_node_api_reads_windows_larger_than_a_page(tmp_path):
+    """The same backfill with ``NodeHistorian`` as the historian: each 6 h
+    window holds 36 samples and the API answers 5 per page, so every window
+    is read over several pages, and the result is that of one live pass."""
+    now = time.time()
+    # Microsecond timestamps, what the historian stores and the API returns.
+    history = [(round(ts, 6), value) for ts, value in _history(now - 3 * DAY, 3 * 144)]
+    archive, buffered = history[:300], history[300:]
+    api = FakeNodeApi()
+    api.add(SIGNAL, [*archive, *buffered])
+    historian = NodeHistorian(
+        "http://node.test", CLIENT_ID, CLIENT_SECRET, page_size=5, transport=api.transport(), sleep=lambda _s: None
+    )
+    cls = segmenter()
+    service, instance, runner, buffer = _setup(cls, tmp_path, archive=archive, buffered=buffered, historian=historian)
+
+    await _run_until_done(runner)
+
+    expected = await _reference(segmenter(), history, tmp_path)
+    assert _annotations(service.door) == expected
+    assert instance.handled == [ts for ts, _ in history]
+    windows = {(request["from"], request["to"]) for request in api.metric_requests}
+    paged = [request for request in api.metric_requests if "cursor" in request]
+    assert len(paged) >= len(windows), "every full window took more than one page"
+    assert all(request["limit"] == 5 for request in api.metric_requests)
+    assert api.tokens_issued == 1
+    historian.close()
     buffer.close()
 
 

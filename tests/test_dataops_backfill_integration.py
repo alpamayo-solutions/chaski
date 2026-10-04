@@ -22,9 +22,10 @@ import uuid
 
 import pandas as pd
 import pytest
+from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 
 import chaski
-from chaski.dataops import Backfill, Producer, SignalOutput, SignalRangeInput, on_metric
+from chaski.dataops import Backfill, NodeHistorian, Producer, SignalOutput, SignalRangeInput, on_metric
 from chaski.dataops.backfill import INITIAL
 from chaski.service import LocalDoor
 
@@ -300,3 +301,41 @@ def test_a_restarted_service_resumes_its_backfill(tmp_path):
     # A window cut short by the stop may be emitted twice: by key, the result
     # is that of one uninterrupted pass.
     assert dict(outputs) == pytest.approx(expected)
+
+
+def test_a_backfill_reads_history_through_the_node_api_page_by_page(tmp_path, monkeypatch):
+    """The historian is the node's API, over HTTP: the service finds it in its
+    service account's environment, as in a PREKIT deployment, and pages every
+    6 h window (36 samples) five rows at a time. The outcome is that of live
+    processing over the whole history."""
+    now = time.time()
+    # Microsecond timestamps, what the historian stores and the API returns.
+    history = [(round(ts, 6), value) for ts, value in _history(now - 3 * DAY, 3 * 144)]
+    archive = [row for row in history if row[0] < now - DAY]
+    recent = [row for row in history if row[0] >= now - DAY]
+    expected = _expected(history)
+    api = FakeNodeApi()
+
+    with (
+        chaski.Node("backfill-node-api", data_dir=tmp_path / "node") as node,
+        node.service("machine", mount="Line/M1") as machine,
+        node.service("reader") as reader,
+        api.serve() as origin,
+    ):
+        seeded = _seed(node, machine, reader, archive, recent)
+        for signal_id, rows in seeded.points.items():
+            api.add(signal_id, rows)
+        monkeypatch.setenv("PREKIT_URL", origin)
+        monkeypatch.setenv("PREKIT_CLIENT_ID", CLIENT_ID)
+        monkeypatch.setenv("PREKIT_CLIENT_SECRET", CLIENT_SECRET)
+        monkeypatch.setenv("DATAOPS_HISTORIAN_PAGE_SIZE", "5")
+        with _serving(node, tmp_path / "data", cycles(Backfill(horizon="4d", window="6h")), backfill_rate=100.0) as svc:
+            assert isinstance(svc.historian, NodeHistorian)
+            _wait(lambda: not svc.backfill_holds("cycles"))
+            outputs = _until_outputs(reader, len(expected))
+
+    assert dict(outputs) == pytest.approx(expected)
+    assert len(outputs) == len({ts for ts, _ in outputs})
+    assert api.tokens_issued == 1
+    assert any("cursor" in request for request in api.metric_requests)
+    assert all(request["limit"] == 5 for request in api.metric_requests)

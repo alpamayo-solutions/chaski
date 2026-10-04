@@ -7,7 +7,8 @@ The evaluator runtime as a library, so any process can run producers:
 Installs with the ``dataops`` extra (``pip install "chaski[dataops]"``) —
 APScheduler, pandas and python-decouple are what this package needs beyond
 the base SDK; it needs no database driver (the historian is a port, see
-:class:`Historian`). ``DataOpsService`` is a :class:`chaski.Service`: the
+:class:`Historian`; :class:`NodeHistorian` implements it over a PREKIT
+node's API). ``DataOpsService`` is a :class:`chaski.Service`: the
 node sees one more local service, not a kind of its own.
 """
 
@@ -19,6 +20,7 @@ from .buffer import Buffer
 from .commands import Command, CommandRejected, CommandResult
 from .ingest import Ingest
 from .inputs import Historian, SignalRangeInput, WindowExceedsRetentionError, validate_windows
+from .node_historian import NodeHistorian, NodeHistorianError
 from .outputs import AnnotationOutput, SignalOutput, bind_annotation_outputs, build_catalogue
 from .service import DataOpsService, build_dispatch, import_directory, import_package
 from .triggers import cron, every, on_command, on_constant, on_metric, on_signal, parse_duration
@@ -33,6 +35,8 @@ __all__ = [
     "DataOpsService",
     "Historian",
     "Ingest",
+    "NodeHistorian",
+    "NodeHistorianError",
     "Producer",
     "Reject",
     "Runtime",

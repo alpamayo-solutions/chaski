@@ -558,8 +558,8 @@ DataOpsService("dataops", historian=my_historian, backfill_rate=1.0, backfill_bu
 
 - **Range.** From `now - horizon` to the live edge, the newest point the
   ingest has buffered for the producer's inputs. Older points come from the
-  `historian` (the `Historian` port; chaski ships no implementation). Without
-  a historian the backfill covers what the buffer holds.
+  `historian` (the `Historian` port, below). Without a historian the backfill
+  covers what the buffer holds.
 - **Same code path.** Each window's records go, in timestamp order, through the
   producer's `@on_metric` handlers, and its `@every`/`@cron` ticks fire at
   their instants (interval ticks on multiples of the interval, cron in UTC).
@@ -596,6 +596,47 @@ async def repair(self, command) -> str:
 A backfill runs on the node's own clock: a service on a factory clock or in
 coordinated steps refuses a producer that declares one. Handlers must not read
 past their record's timestamp; live, that data does not exist yet.
+
+### Read history through the node's API
+
+`NodeHistorian` implements the `Historian` port over a PREKIT node's API, so
+a DataOps service reads the node's history (the edge historian) without a
+database password and only as far as its identity may read:
+
+```python
+from chaski.dataops import DataOpsService, NodeHistorian
+
+historian = NodeHistorian("https://reverse-proxy", client_id, client_secret, verify="/etc/certs/prekit-ca.crt")
+DataOpsService("dataops", historian=historian).add(Cycles).run()
+```
+
+Inside a PREKIT deployment nothing has to be written: declare the service
+with `service_account:` in the node manifest, and `prekit generate` hands it
+`PREKIT_URL`, `PREKIT_CLIENT_ID`, `PREKIT_CLIENT_SECRET` and
+`PREKIT_CA_CERT`. A `DataOpsService` given no `historian=` builds a
+`NodeHistorian` from those (`NodeHistorian.from_env()`); a `historian=` you
+pass wins.
+
+- **Credentials.** A Keycloak `client_credentials` token for
+  `PREKIT_CLIENT_ID`, from `PREKIT_TOKEN_URL` or, by default,
+  `<PREKIT_URL>/auth/realms/<PREKIT_REALM or prekit>/...`. Cached until
+  shortly before it expires; a `401` renews it once.
+- **Paged, bounded.** `window()` pages the raw metric read
+  (`POST /api/v1/workbench/grafana/metrics/`, `raw`, `limit`, `cursor`),
+  `DATAOPS_HISTORIAN_PAGE_SIZE` rows per request (default 10,000). Rows come
+  in (timestamp, row) order, so pages neither repeat nor skip a row. Memory is
+  bounded by the backfill `window`, not the horizon.
+  `latest_before()` uses `POST /api/v1/workbench/grafana/metrics/latest-before/`.
+- **Retries.** `429` and `503` wait for `Retry-After` (capped at 60 s), other
+  server and transport errors back off with jitter; after six attempts, or on
+  any other refusal, `NodeHistorianError` fails the read. In a backfill that
+  fails the window, which is retried and reported in `handler_health`.
+- **Never an empty answer for a failure.** A signal the API leaves out (not
+  readable by this identity, unknown, or the node does not expose its
+  historian) raises `NodeHistorianError` rather than reading as no history.
+
+It needs a PREKIT node whose API pages raw metric reads (`next_cursor`) and
+serves the latest-before read; against an older node `window()` raises.
 
 ## Run a node
 
