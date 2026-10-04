@@ -26,7 +26,8 @@ producer runtime.
   :func:`~chaski.dataops.codehash.compute_code_hash`.
 * **History older than the stream is backfilled**: a producer that declares
   ``backfill`` is run once over its horizon from the historian, in windows,
-  before its live dispatch starts (:mod:`chaski.dataops.backfill`);
+  before its live dispatch starts, or beside it in ``independent`` mode
+  (:mod:`chaski.dataops.backfill`);
   :meth:`DataOpsService.request_backfill` repairs a range.
 * **``_Constant``/``_Signal`` are watched, not ingested**:
   :mod:`chaski.dataops.watch` subscribes ``@on_constant``/``@on_signal``
@@ -46,7 +47,8 @@ Startup order inside :meth:`DataOpsService.serve`:
     has fired yet, so this is where startup compute belongs
  5. check every input window against the broker's metrics retention
  6. record the first backfill of every producer that declares one and hold
-    its live triggers (:mod:`chaski.dataops.backfill`), then build the
+    its live triggers unless it is ``independent``
+    (:mod:`chaski.dataops.backfill`), then build the
     ``signal_id -> [handler]`` dispatch table and the set of input signal ids
  7. replay every producer whose code hash changed, a new one included: reset
     its watermark to the earliest buffered point of its inputs and feed the
@@ -991,11 +993,13 @@ class DataOpsService(Service):
         runner = self._backfill
         return runner is not None and runner.holds(producer)
 
-    def request_backfill(self, producer: str, start: Any, end: Any) -> str:
+    def request_backfill(self, producer: str, start: Any, end: Any, *, window: Any = None) -> str:
         """Run ``producer`` again over ``[start, end)`` (unix seconds or
         datetimes), to repair what it emitted there. The job is recorded in the
         buffer and runs on a separate instance, throttled like every backfill,
-        also after a restart. Returns the job id. Requires :meth:`start`; a
+        also after a restart. ``window`` (``"6h"`` or seconds) is how much
+        history one step processes; without it, the producer's ``backfill``
+        window, or one hour. Returns the job id. Requires :meth:`start`; a
         producer exposes it to the node with its own ``@on_command`` handler
         calling ``self.runtime.request_backfill(self.name, start, end)``."""
         producer_cls = self._producers.get(producer)
@@ -1003,8 +1007,8 @@ class DataOpsService(Service):
             raise KeyError(f"no producer {producer!r} runs in this service")
         runner = self._backfill
         if runner is not None:
-            return runner.request(producer, _epoch_of(start), _epoch_of(end))
-        return record_backfill_request(self.buffer, producer_cls, start, end)
+            return runner.request(producer, _epoch_of(start), _epoch_of(end), window=window)
+        return record_backfill_request(self.buffer, producer_cls, start, end, window=window)
 
     def _backfill_finding_topic(self) -> str:
         from colca_data_contracts import topic_prefix

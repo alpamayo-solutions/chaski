@@ -570,18 +570,43 @@ DataOpsService("dataops", historian=my_historian, backfill_rate=1.0, backfill_bu
   edge the backfill takes the ingest's page lock, processes the rest of the
   buffer and releases the producer. Each record is handled once, by one
   instance, in order: no gap and no double emission.
+- **Independent mode.** `Backfill(horizon="400d", window="6h", mode="independent")`
+  does not hold live dispatch: live triggers run from the first start, as
+  without a backfill, and the history `[now - horizon, live start)` runs beside
+  them on a separate instance (after `setup()`), throttled and resumable like
+  any job. The live start is recorded with the job at the first start, so a
+  restart or a code change does not move it. Where the history and live
+  processing overlap (live processing also covers what the stream still holds),
+  the deterministic output identities make the overlap idempotent.
+- **Which mode.** Keep `hold_live` (the default) when the producer's in-memory
+  state must flow continuously from history into live: a running total, a
+  state machine whose state at the live start depends on all that came before.
+  Choose `independent` when the producer's output does not depend on state
+  carried across the live start, because its state restarts cleanly from the
+  data (a cycle segmenter that opens a cycle at the next start condition, a
+  per-sample or per-window computation). Then live output is there at once
+  instead of after hours of history, and the union of history and live output
+  equals one live pass over the whole range. Such a producer writes a result
+  once it is final (a cycle at its end): the history run stops at the live
+  start with the cycle open there unfinished, and a write of it as still open
+  would overwrite what live processing wrote at its end. A producer that switches from
+  `hold_live` to `independent` while its first backfill runs keeps its
+  position; the live start is fixed at that restart.
 - **Resumable.** Progress is committed per window, with the producer's
-  checkpoint when it sets `state_version`. A restart resumes at the last
-  committed window. A code change restarts the job from its start.
+  checkpoint when it sets `state_version` and holds live. A restart resumes at
+  the last committed window (an independent job on a fresh instance). A code
+  change restarts the job from its start.
 - **Throttled.** At most `backfill_rate` windows per second, and busy at most
   `backfill_busy` of the wall time.
 - **Progress.** The health door reports `backfill` (job, range, position,
   share done, whether live is held). A retained `backfill` `_Finding` stands
   while a job runs and is retired when none is left. A failure is retried with
   backoff and reported in `handler_health` as `task backfill`.
-- **Repair.** `svc.request_backfill("cycles", start, end)` runs the producer
-  again over `[start, end)` on a separate instance, throttled the same way and
-  resumable. Output identities are deterministic (annotation ids from the
+- **Repair.** `svc.request_backfill("cycles", start, end, window="1h")` runs
+  the producer again over `[start, end)` on a separate instance, throttled the
+  same way and resumable. `window` sets the job's step size; without it the job
+  steps by the declared `backfill` window, or one hour for a producer that
+  declares none. Output identities are deterministic (annotation ids from the
   interval, samples by signal and timestamp), so a range live processing
   already covered is overwritten, not duplicated. To trigger it from the node,
   a producer can expose a command:
