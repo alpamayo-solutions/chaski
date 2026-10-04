@@ -804,3 +804,105 @@ def test_buffer_trim_preserves_a_slow_factory_timer_and_uses_real_health_time(ru
     trim_buffer(runtime.buffer, [instance], 10, clock)
     assert runtime.buffer.earliest("sig-tick") == 1040
     assert runtime.buffer.earliest("sig-event") == 9980
+
+
+# ─── ingest cursors of earlier buffer generations ──────────────────────────
+
+
+class _BacklogDoor:
+    """The door's cursor listing and deletion, as the node's local door has them."""
+
+    def __init__(self, rows=None, error: Exception | None = None) -> None:
+        self.rows = rows or []
+        self.error = error
+        self.deleted: list[tuple[str, str]] = []
+        self.asked: list[list[str]] = []
+
+    def backlog(self, prefixes):
+        self.asked.append(list(prefixes))
+        if self.error is not None:
+            raise self.error
+        return self.rows
+
+    def delete_cursor(self, stream, cursor) -> None:
+        self.deleted.append((stream, cursor))
+
+
+def _dataops(tmp_path, door):
+    from chaski.dataops.service import DataOpsService
+
+    svc = DataOpsService("dataops", state_dir=tmp_path / "state", data_dir=tmp_path / "data", health_port=0)
+    svc._local_buffer = Buffer(tmp_path / "buffer.sqlite3")
+    svc._http = door
+    return svc
+
+
+def _row(cursor, stream="metrics"):
+    return {"cursor": cursor, "stream": stream, "position": 1, "head": 9, "lag_records": 8}
+
+
+def test_the_ingest_cursors_of_earlier_generations_are_retired_and_the_current_one_kept(tmp_path):
+    door = _BacklogDoor()
+    svc = _dataops(tmp_path, door)
+    try:
+        current = f"c/dataops/ingest-{svc.buffer.generation}"
+        door.rows = [
+            _row("c/dataops/ingest-01OLDGENERATION0000000000"),
+            _row("c/dataops/ingest-01OLDERGENERATION000000000"),
+            _row(current),
+            _row("c/dataops/ingest-elsewhere", stream="annotations"),
+        ]
+        svc._retire_abandoned_ingest_cursors()
+        assert door.asked == [["c/dataops/ingest-"]]
+        assert door.deleted == [
+            ("metrics", "c/dataops/ingest-01OLDGENERATION0000000000"),
+            ("metrics", "c/dataops/ingest-01OLDERGENERATION000000000"),
+        ]
+    finally:
+        svc._local_buffer.close()
+
+
+def test_a_node_that_cannot_list_cursors_leaves_them_and_startup_goes_on(tmp_path, caplog):
+    request = httpx.Request("GET", "http://node/backlog")
+    door = _BacklogDoor(error=httpx.HTTPStatusError("404", request=request, response=httpx.Response(404)))
+    svc = _dataops(tmp_path, door)
+    try:
+        with caplog.at_level(logging.WARNING, logger="chaski.dataops"):
+            svc._retire_abandoned_ingest_cursors()
+        assert door.deleted == []
+        assert "Could not list earlier ingest cursors" in caplog.text
+    finally:
+        svc._local_buffer.close()
+
+
+def test_health_counts_lag_on_live_cursors_only(tmp_path):
+    """A cursor_lag finding that names only ingest cursors of other
+    generations is not this service's lag; one that names a cursor it reads
+    is, and one without cursor detail counts as before."""
+    svc = _dataops(tmp_path, _BacklogDoor())
+    try:
+        summary = "dataops has records on metrics waiting 119 s that it has not read"
+        current = f"c/dataops/ingest-{svc.buffer.generation}"
+
+        def finding(*cursors):
+            detail = {"cursors": [{"cursor": c, "stream": "metrics", "waiting_s": 119.0} for c in cursors]}
+            svc._on_cursor_lag(SimpleNamespace(payload={"summary": summary, "detail": detail}))
+
+        finding("c/dataops/ingest-01OLDGENERATION0000000000")
+        assert svc.cursor_lag == summary
+        assert svc._live_cursor_lag() == ""
+
+        finding("c/dataops/ingest-01OLDGENERATION0000000000", current)
+        assert svc._live_cursor_lag() == summary
+
+        finding("c/dataops/dataops-definitions")
+        assert svc._live_cursor_lag() == summary
+
+        svc._on_cursor_lag(SimpleNamespace(payload={"summary": summary}))
+        assert svc.cursor_lag_cursors == ()
+        assert svc._live_cursor_lag() == summary
+
+        svc._on_cursor_lag(SimpleNamespace(payload=b""))
+        assert svc.cursor_lag == "" and svc._live_cursor_lag() == ""
+    finally:
+        svc._local_buffer.close()

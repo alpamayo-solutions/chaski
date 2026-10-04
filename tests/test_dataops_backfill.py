@@ -180,7 +180,9 @@ class _Ingest:
         self.caught_up.ring()
 
 
-def _setup(cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0, historian=None):
+def _setup(
+    cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0, historian=None, stall_after=600.0
+):
     """A service whose historian holds ``archive`` + ``buffered`` and whose
     buffer holds ``buffered``, as after the ingest drained the stream."""
     buffer = Buffer(tmp_path / name)
@@ -191,7 +193,7 @@ def _setup(cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000
     service = FakeService(_door(), buffer, historian)
     service._ingest = _Ingest()
     instance = _attach(cls, service)
-    runner = BackfillRunner(service, [instance], rate=rate, busy=busy)
+    runner = BackfillRunner(service, [instance], rate=rate, busy=busy, stall_after=stall_after)
     service.runner = runner
     runner.plan()
     return service, instance, runner, buffer
@@ -824,3 +826,113 @@ def test_a_buffer_from_an_older_release_gains_the_job_window_column(tmp_path):
     job = buffer.backfill_job("p", INITIAL)
     assert job is not None and job["position"] == 5.0 and job["window"] is None
     buffer.close()
+
+
+# ─── stall ─────────────────────────────────────────────────────────────────
+
+
+class GatedHistorian(FakeHistorian):
+    """A historian whose reads block while ``gate`` is closed: a window that
+    does not finish."""
+
+    def __init__(self, points) -> None:
+        super().__init__(points)
+        self.gate = threading.Event()
+        self.gate.set()
+
+    def window(self, signal_id, start, end):
+        assert self.gate.wait(20), "the gate stayed closed"
+        return super().window(signal_id, start, end)
+
+
+@run_async
+@pytest.mark.parametrize("mode", ["independent", "hold_live"])
+async def test_a_backfill_that_finishes_no_window_for_its_bound_reports_stalled_until_it_moves(tmp_path, mode):
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    historian = GatedHistorian({SIGNAL: history})
+    cls = closer(mode=mode, window="1h")
+    _service, _instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history, buffered=history[-10:], historian=historian, rate=1000.0, stall_after=0.3
+    )
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    try:
+        while (runner.status().get("running") or {}).get("windows", 0) < 2:
+            assert not task.done(), task
+            await asyncio.sleep(0.005)
+        assert "stalled" not in runner.status()["running"]
+
+        historian.gate.clear()
+        deadline = time.monotonic() + 10
+        while "stalled" not in (running := runner.status()["running"]):
+            assert time.monotonic() < deadline, "the stall was not reported"
+            await asyncio.sleep(0.02)
+        assert running["stalled"].startswith("no backfill window finished in ")
+        assert running["holds_live"] is (mode == "hold_live")
+
+        historian.gate.set()
+        windows = running["windows"]
+        while (runner.status().get("running") or {}).get("windows", 0) <= windows:
+            await asyncio.sleep(0.005)
+        assert "stalled" not in runner.status()["running"]
+    finally:
+        historian.gate.set()
+        stop.set()
+        await task
+        buffer.close()
+
+
+@run_async
+async def test_the_throttles_pause_is_not_a_stall(tmp_path):
+    """At half a window per second the job pauses about two seconds after
+    each window; a bound shorter than that pause reports no stall."""
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    cls = closer(window="1h")
+    _service, _instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history, buffered=history[-10:], rate=0.5, stall_after=0.5
+    )
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    try:
+        seen = []
+        deadline = time.monotonic() + 4.5
+        while time.monotonic() < deadline:
+            assert not task.done(), task
+            seen.append(runner.status().get("running") or {})
+            await asyncio.sleep(0.05)
+        assert max(r.get("windows", 0) for r in seen) >= 2
+        assert not [r for r in seen if "stalled" in r]
+    finally:
+        stop.set()
+        await task
+        buffer.close()
+
+
+@run_async
+async def test_a_backfill_waiting_for_the_ingest_names_what_it_waits_for_when_stalled(tmp_path):
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    cls = closer(mode="hold_live", window="1h")
+    service, _instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history, buffered=history[-10:], rate=1000.0, stall_after=0.2
+    )
+    # The live ingest never reaches the stream head; without a historian the
+    # backfill waits for it.
+    service.historian = None
+    service._ingest.caught_up = Doorbell()
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    try:
+        deadline = time.monotonic() + 10
+        while "stalled" not in (running := (runner.status().get("running") or {})):
+            assert time.monotonic() < deadline, "the stall was not reported"
+            assert not task.done(), task
+            await asyncio.sleep(0.02)
+        assert running["stalled"].endswith("it waits for the live ingest to reach the stream head")
+        assert running["windows"] == 0 and running["holds_live"] is True
+    finally:
+        stop.set()
+        await task
+        buffer.close()

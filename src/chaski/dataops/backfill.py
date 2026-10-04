@@ -83,7 +83,14 @@ one it is the declaration's, or ``DEFAULT_WINDOW``.
 
 **Progress.** The health door reports ``backfill`` (the job, its range,
 position and share done), and the service keeps a retained ``backfill``
-``_Finding`` while a job runs, retired when none is left.
+``_Finding`` while a job runs, retired when none is left. A running backfill
+is progress, not lag: the job reads history through the buffer and the
+historian, never through a cursor, so it adds nothing to the node's
+``cursor_lag``. While a first job holds live dispatch the door's ``status``
+is ``backfilling``. A job with no window finished for ``stall_after`` seconds
+(the throttle's own pause not counted) is reported as ``stalled`` with the
+reason, and the door's ``status`` is ``degraded``; it stays 200, since live
+intake is not affected.
 
 Nothing here reads Colca to find new data: live intake stays push-driven, and
 the runner waits on its own doorbell (a new request) and on the ingest's.
@@ -138,6 +145,8 @@ DEFAULT_BUSY = 0.5
 FINDING = "backfill"
 #: A running job republishes its finding at most this often.
 FINDING_INTERVAL_S = 60.0
+#: A job with no window finished for this long is reported as stalled.
+DEFAULT_STALL_AFTER_S = 600.0
 
 
 class Backfill:
@@ -250,7 +259,10 @@ class BackfillRunner:
         *,
         rate: float = DEFAULT_RATE,
         busy: float = DEFAULT_BUSY,
+        stall_after: float = DEFAULT_STALL_AFTER_S,
     ) -> None:
+        if stall_after <= 0:
+            raise ValueError("backfill_stall_after must be positive")
         if rate <= 0:
             raise ValueError("backfill_rate must be positive")
         if not 0 < busy <= 1:
@@ -259,12 +271,18 @@ class BackfillRunner:
         self._instances = {instance.name: instance for instance in instances}
         self._rate = rate
         self._busy = busy
+        self._stall_after = stall_after
         #: Rung by :meth:`request`: a new job may be waiting.
         self.bell = Doorbell()
         self._lock = threading.Lock()
         self._held: set[str] = set()
         self._current: dict[str, Any] | None = None
         self._pending = 0
+        #: Monotonic time the running job last moved: started, finished a
+        #: window, or ended the throttle's pause. ``None`` while none runs.
+        self._moved_at: float | None = None
+        #: What the running job waits for, ``""`` while it is not waiting.
+        self._waiting = ""
         self._finding_up: bool | None = None
         self._finding_at = 0.0
 
@@ -347,9 +365,27 @@ class BackfillRunner:
         with self._lock:
             current = dict(self._current) if self._current is not None else None
             pending = self._pending
+            moved_at, waiting = self._moved_at, self._waiting
         if current is None and not pending:
             return {}
+        if current is not None and moved_at is not None:
+            still = time.monotonic() - moved_at
+            if still > self._stall_after:
+                current["stalled"] = f"no backfill window finished in {still:.0f} s" + (
+                    f"; it waits for {waiting}" if waiting else ""
+                )
         return {"running": current, "pending": pending}
+
+    def _moved(self, *, pause: float = 0.0) -> None:
+        """The running job moved now; a throttle ``pause`` that follows does
+        not count towards a stall."""
+        with self._lock:
+            self._moved_at = time.monotonic() + pause
+            self._waiting = ""
+
+    def _wait_for(self, waiting: str) -> None:
+        with self._lock:
+            self._waiting = waiting
 
     def _report(self, job: dict[str, Any], position: float, windows: int, end: float | None) -> None:
         start = job["start"]
@@ -412,6 +448,8 @@ class BackfillRunner:
             if not jobs:
                 with self._lock:
                     self._current = None
+                    self._moved_at = None
+                    self._waiting = ""
                 await self._publish_finding(force=True)
                 await _until(self.bell.after(seen), stop)
                 continue
@@ -452,6 +490,11 @@ class BackfillRunner:
             await instance.setup()
             _bind_like(instance, live)
         log.info("%s: backfill %s at %s (%d window(s) done)", name, job_id, _iso(position), windows)
+        # Reported from the start, so a job that waits before its first
+        # window shows, and a stall there too. Holding live, the edge is
+        # about now until the plan says where the buffer ends.
+        self._report(job, position, windows, job["end"] if job["end"] is not None else runtime_now(self._service))
+        self._moved()
         try:
             while not stop.is_set():
                 plan = await self._resolved(instance, stop)
@@ -503,8 +546,10 @@ class BackfillRunner:
             if not plan.declared or plan.signal_ids or cache is None:
                 if plan.unresolved:
                     log.warning("%s: %d input(s) unresolved; backfilling the others", instance.name, plan.unresolved)
+                self._wait_for("")
                 return plan
             log.info("%s: backfill waits for its inputs to be commissioned", instance.name)
+            self._wait_for("its inputs to be commissioned")
             await cache.changes.wait_async(version, stop=stop)
         return None
 
@@ -515,7 +560,9 @@ class BackfillRunner:
         ingest = self._service._ingest
         if not plan.signal_ids or ingest is None or ingest.caught_up.generation:
             return True
+        self._wait_for("the live ingest to reach the stream head")
         await _until(ingest.caught_up.after(0), stop)
+        self._wait_for("")
         return False
 
     def _first(self, plan: _Plan) -> float | None:
@@ -544,9 +591,10 @@ class BackfillRunner:
         await self._window(instance, plan, job, start, end)
         windows += 1
         await asyncio.to_thread(self._commit, instance, job, end, windows)
-        await self._publish_finding()
         elapsed = time.monotonic() - began
-        pause = max(1.0 / self._rate - elapsed, elapsed * (1.0 / self._busy - 1.0))
+        pause = max(1.0 / self._rate - elapsed, elapsed * (1.0 / self._busy - 1.0), 0.0)
+        self._moved(pause=pause)
+        await self._publish_finding()
         if pause > 0:
             await _until(asyncio.sleep(pause), stop)
         return end, windows
@@ -592,6 +640,8 @@ class BackfillRunner:
             with self._lock:
                 self._held.discard(instance.name)
                 self._current = None
+                self._moved_at = None
+                self._waiting = ""
         finally:
             page_lock.release()
         log.info(

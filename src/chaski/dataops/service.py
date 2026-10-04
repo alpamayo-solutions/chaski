@@ -54,7 +54,8 @@ Startup order inside :meth:`DataOpsService.serve`:
     its watermark to the earliest buffered point of its inputs and feed the
     buffered records through the live handlers. Unchanged producers are left
     alone. A failed replay is retried under :func:`supervise`
- 8. retire the previous generation's ingest cursor, if one is known
+ 8. retire the ingest cursors of earlier buffer generations (a lost or
+    deleted buffer starts a new generation; nothing reads its old cursor)
  9. start the ingest task, and resolve again whenever the live index changes
     (:func:`follow_index`); without one, whenever a ``_Signal`` record under
     the service changes, and after every reconnect; start the backfill runner
@@ -95,16 +96,16 @@ from colca_data_contracts import Metric
 
 from chaski.door import Door, Record, Stream
 from chaski.failures import HandlerHealth, Reject
-from chaski.outage import Outage, expected_failure
+from chaski.outage import Outage, expected_failure, warn_failure
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
 from . import codehash, commands, health, resolve, watch
-from .backfill import DEFAULT_BUSY, DEFAULT_RATE, BackfillRunner
+from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
 from .backfill import request as record_backfill_request
 from .base import Producer, Runtime, restore_checkpoint, runtime_now, save_checkpoint, state_copy
 from .buffer import Buffer
-from .ingest import Ingest, consumer_name
+from .ingest import Ingest, consumer_name, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import record_rejection, run_due, run_periodic, timer_key
@@ -830,7 +831,9 @@ class DataOpsService(Service):
     ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
     ``health_port`` the health door (``0`` for an ephemeral port);
     ``backfill_rate`` (windows per second) and ``backfill_busy`` (share of
-    wall time) the most a backfill may take (:mod:`chaski.dataops.backfill`).
+    wall time) the most a backfill may take, and ``backfill_stall_after``
+    (seconds without a finished window) when the health door reports a running
+    backfill as stalled (:mod:`chaski.dataops.backfill`).
     Every other keyword is the base class's.
     """
 
@@ -848,12 +851,15 @@ class DataOpsService(Service):
         health_port: int = health.PORT_DEFAULT,
         backfill_rate: float = DEFAULT_RATE,
         backfill_busy: float = DEFAULT_BUSY,
+        backfill_stall_after: float = DEFAULT_STALL_AFTER_S,
         **service_kw: Any,
     ) -> None:
         if backfill_rate <= 0:
             raise ValueError("backfill_rate must be positive")
         if not 0 < backfill_busy <= 1:
             raise ValueError("backfill_busy must be in (0, 1]")
+        if backfill_stall_after <= 0:
+            raise ValueError("backfill_stall_after must be positive")
         super().__init__(name, mount, node=node, **service_kw)
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
@@ -871,6 +877,7 @@ class DataOpsService(Service):
         self._health_port = health_port
         self._backfill_rate = backfill_rate
         self._backfill_busy = backfill_busy
+        self._backfill_stall_after = backfill_stall_after
         self._backfill: BackfillRunner | None = None
         self._producers: dict[str, type[Producer]] = {}
         self._local_buffer: Buffer | None = None
@@ -1076,6 +1083,50 @@ class DataOpsService(Service):
         """The declared outputs decide what is stale (:func:`build_catalogue`);
         a shutdown changes nothing, so the run's catalogue stays the node's."""
 
+    def _retire_abandoned_ingest_cursors(self) -> None:
+        """Delete this service's ingest cursors of other buffer generations.
+
+        A new buffer (a fresh state volume, a lost buffer file) starts a new
+        generation and with it a new cursor. Nothing reads the old one again:
+        it would hold the node's retention, and the node's cursor watchdog
+        would report its unread records as this service's ``cursor_lag``. The
+        node lists the identity's cursors on its local door (``/backlog``); a
+        node that does not (an external service) keeps them, and the health
+        door does not count them (:meth:`_live_cursor_lag`).
+        """
+        prefix = self.cursor_prefix + "ingest-"
+        current = self.cursor_prefix + cursor_name(self.buffer.generation)
+        door = self._require_http("backlog")
+        try:
+            rows = door.backlog([prefix])
+        except Exception as exc:
+            warn_failure(log, exc, "Could not list earlier ingest cursors to retire them")
+            return
+        for row in rows:
+            cursor, stream = row.get("cursor", ""), row.get("stream", "")
+            if stream != "metrics" or not cursor.startswith(prefix) or cursor == current:
+                continue
+            try:
+                door.delete_cursor(stream, cursor)
+            except Exception as exc:
+                warn_failure(log, exc, "Could not retire the earlier ingest cursor %s", cursor)
+                continue
+            log.info("Retired the ingest cursor %s of an earlier buffer generation (stream=%s)", cursor, stream)
+
+    def _live_cursor_lag(self) -> str:
+        """The node's ``cursor_lag`` finding, unless it names only ingest
+        cursors of other buffer generations: nothing reads those any more, so
+        their unread records are not this service's lag."""
+        summary = self.cursor_lag
+        cursors = self.cursor_lag_cursors
+        if not summary or not cursors or self._local_buffer is None:
+            return summary
+        prefix = self.cursor_prefix + "ingest-"
+        current = self.cursor_prefix + cursor_name(self._local_buffer.generation)
+        if all(cursor.startswith(prefix) and cursor != current for cursor in cursors):
+            return ""
+        return summary
+
     def _open_ingest_stream(self, cursor: str, signal_ids: list[str] | None) -> Stream:
         self._wake_on_inputs(signal_ids or [])
         return self.stream("metrics", cursor=cursor, signal_ids=signal_ids)
@@ -1232,7 +1283,7 @@ class DataOpsService(Service):
         health_state = health.HealthState(
             ready=False,
             broker_connected=self.is_broker_connected,
-            cursor_lag=lambda: self.cursor_lag,
+            cursor_lag=self._live_cursor_lag,
             identity_conflict=lambda: self.identity_conflict,
             not_ready=not_ready,
         )
@@ -1308,7 +1359,13 @@ class DataOpsService(Service):
                     "A producer declares a backfill, which runs on the node's own clock; "
                     "this service runs on a factory clock or in coordinated steps"
                 )
-            backfill = BackfillRunner(self, instances, rate=self._backfill_rate, busy=self._backfill_busy)
+            backfill = BackfillRunner(
+                self,
+                instances,
+                rate=self._backfill_rate,
+                busy=self._backfill_busy,
+                stall_after=self._backfill_stall_after,
+            )
             await asyncio.to_thread(backfill.plan)
             self._backfill = backfill
             health_state.backfill = backfill.status
@@ -1321,8 +1378,9 @@ class DataOpsService(Service):
             if stop.is_set():
                 return
 
-            # 8) Retire the previous generation's cursor (if any) and build the
-            #    ingest loop over this service's own consume lane.
+            # 8) Retire the ingest cursors of earlier generations and build
+            #    the ingest loop over this service's own consume lane.
+            await asyncio.to_thread(self._retire_abandoned_ingest_cursors)
             ingest = Ingest(
                 self._open_ingest_stream,
                 self.buffer,
@@ -1331,11 +1389,7 @@ class DataOpsService(Service):
                 retry_min_s=self._retry_min_s,
                 health=self.handler_health,
                 reject=self.reject,
-                # A lost buffer's generation cannot be recovered, so nothing knows
-                # the previous cursor yet and retiring it is a no-op.
-                previous_generation=None,
             )
-            ingest.retire_previous_generation()
             self._ingest = ingest
 
             # 9) Start ingest in the background and keep retrying unresolved inputs.

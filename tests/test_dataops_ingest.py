@@ -512,26 +512,6 @@ async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
     assert len(delays) == 1 and 45 <= delays[0] <= 54
 
 
-# ------------------------------------------------------------------ generational cursor retirement
-
-
-@run_async
-async def test_retire_previous_generation_deletes_only_the_named_prior_cursor(door, buffer):
-    # no previous generation known → nothing to delete
-    ingest_fresh = _ingest(door, buffer, signal_ids=["sig-1"])
-    ingest_fresh.retire_previous_generation()
-    assert door.deleted == []
-
-    # a previous generation IS known → exactly that cursor is deleted, and
-    # never the current one
-    door2 = FakeDoor()
-    ingest = _ingest(door2, buffer, signal_ids=["sig-1"], previous_generation="01OLDGENERATIONULID")
-    ingest.retire_previous_generation()
-
-    assert door2.deleted == [("metrics", CURSOR_PREFIX + cursor_name("01OLDGENERATIONULID"))]
-    assert ingest.cursor not in [c for _, c in door2.deleted]
-
-
 # ------------------------------------------------------------------ crash recovery / reprocessing
 
 
