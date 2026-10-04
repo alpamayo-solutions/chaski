@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/alpamayo-solutions/chaski/compare/v0.22.0...v0.23.0) (2026-10-04)
+
+
+### Features
+
+* **dataops:** run a first backfill beside live dispatch in independent mode ([#135](https://github.com/alpamayo-solutions/chaski/issues/135)) ([f4c8e34](https://github.com/alpamayo-solutions/chaski/commit/f4c8e341d15761f18c96e5eeaad6ffe9892566eb))
+
 ## [0.22.0](https://github.com/alpamayo-solutions/chaski/compare/v0.21.0...v0.22.0) (2026-10-04)
 
 
