@@ -28,8 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
-          # colca v0.28.0: per-signal retention and zstd storage compression.
-          ref: 44e3b9396c37ae029efb354007e91a2c8b64b442
+          # colca v0.29.0: log forwarding by level, collapsed and capped repeats, fetchLogs.
+          ref: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Same broker revision as lint/contracts above.
-          ref: 44e3b9396c37ae029efb354007e91a2c8b64b442
+          ref: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
