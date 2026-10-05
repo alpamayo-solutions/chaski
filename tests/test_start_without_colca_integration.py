@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import os
-import socket
 import ssl
 import threading
 import time
@@ -19,6 +18,7 @@ import urllib.request
 
 import pytest
 import yaml
+from ports import reserved_port
 from test_connector_refusals_integration import TEMPERATURE, _signal_id, _wait_for_values
 from test_connector_service import FakeDriver
 from test_connector_writes_integration import _signal_path
@@ -65,17 +65,11 @@ class Line(Producer):
         return "speed set"
 
 
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 @pytest.fixture
 def fixed_local_doors(monkeypatch):
     """The node's local doors on ports chosen before it starts, so services
     can be pointed at a node that is not up yet: ``(http_port, mqtt_port)``."""
-    http_port, mqtt_port = _free_port(), _free_port()
+    http_port, mqtt_port = reserved_port(), reserved_port()
     original = Node._write_config
 
     def write_config(self):
@@ -147,7 +141,7 @@ def _operator(node: chaski.Node, admin: chaski.Service, tmp_path):
 
 
 @contextlib.contextmanager
-def _running_connector(svc: ConnectorService, health_port: int):
+def _running_connector(svc: ConnectorService):
     """The stock entry point, ``chaski.run_connector``, on its own thread."""
     loops: list[asyncio.AbstractEventLoop] = []
     failure: list[BaseException] = []
@@ -158,7 +152,7 @@ def _running_connector(svc: ConnectorService, health_port: int):
 
     def run() -> None:
         try:
-            run_connector(build, health_port=health_port)
+            run_connector(build, health_port=0)
         except BaseException as exc:  # pragma: no cover - reported below
             failure.append(exc)
 
@@ -195,10 +189,9 @@ def _serving_dataops(svc, stop: asyncio.Event):
     assert not failure, f"the DataOps service ended with {failure[0]!r}"
 
 
-def test_services_started_before_colca_wait_report_not_ready_and_then_run(tmp_path, fixed_local_doors):
+def test_services_started_before_colca_wait_report_not_ready_and_then_run(tmp_path, fixed_local_doors, health_doors):
     http_port, mqtt_port = fixed_local_doors
     door = chaski.LocalDoor(host="127.0.0.1", http_port=http_port, mqtt_port=mqtt_port)
-    connector_health, dataops_health = _free_port(), _free_port()
     connector = ConnectorService(
         "temp-conn",
         "line1",
@@ -213,7 +206,7 @@ def test_services_started_before_colca_wait_report_not_ready_and_then_run(tmp_pa
         node=door,
         state_dir=tmp_path / "dataops-state",
         data_dir=tmp_path / "dataops-data",
-        health_port=dataops_health,
+        health_port=0,
     )
     dataops.add(Line)
     node = chaski.Node("late-colca", data_dir=tmp_path / "node")
@@ -221,8 +214,10 @@ def test_services_started_before_colca_wait_report_not_ready_and_then_run(tmp_pa
     # Unwound in reverse: both services stop while their node still runs.
     with contextlib.ExitStack() as stack:
         stack.callback(node.stop)
-        connector_thread = stack.enter_context(_running_connector(connector, connector_health))
+        connector_thread = stack.enter_context(_running_connector(connector))
         dataops_thread = stack.enter_context(_serving_dataops(dataops, asyncio.Event()))
+        (connector_health,) = _wait(lambda: health_doors.connector, timeout=5, what="the connector's health door")
+        (dataops_health,) = _wait(lambda: health_doors.dataops, timeout=5, what="the DataOps health door")
 
         # Both health doors answer at once: not ready, and why.
         started = time.monotonic()

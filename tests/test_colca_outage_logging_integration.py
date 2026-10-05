@@ -15,7 +15,6 @@ import time
 import pytest
 from test_start_without_colca_integration import (  # noqa: F401  # fixtures
     _contracts_bundle_env,
-    _free_port,
     _get,
     _isolate_registry,
     _no_node_door,
@@ -80,16 +79,20 @@ def _chaski(record: logging.LogRecord) -> bool:
     return record.name.startswith(("chaski", "apscheduler"))
 
 
-def test_a_colca_outage_logs_one_warning_per_loop_and_no_traceback(tmp_path, fixed_local_doors, caplog):  # noqa: F811
+def test_a_colca_outage_logs_one_warning_per_loop_and_no_traceback(
+    tmp_path,
+    fixed_local_doors,  # noqa: F811
+    health_doors,
+    caplog,
+):
     http_port, mqtt_port = fixed_local_doors
     door = chaski.LocalDoor(host="127.0.0.1", http_port=http_port, mqtt_port=mqtt_port)
-    health_port = _free_port()
     dataops = chaski.DataOpsService(
         "dataops",
         node=door,
         state_dir=tmp_path / "dataops-state",
         data_dir=tmp_path / "dataops-data",
-        health_port=health_port,
+        health_port=0,
     )
     dataops.add(Ticker)
     node = chaski.Node("outage", data_dir=tmp_path / "node")
@@ -98,6 +101,7 @@ def test_a_colca_outage_logs_one_warning_per_loop_and_no_traceback(tmp_path, fix
     with contextlib.ExitStack() as stack:
         stack.callback(node.stop)
         stack.enter_context(_serving_dataops(dataops, asyncio.Event()))
+        (health_port,) = _wait(lambda: health_doors.dataops, timeout=10, what="the DataOps health door")
         _wait(lambda: _healthy(health_port), timeout=30, what="DataOps healthy")
         assert TICKED.wait(10), "the timer never ran"
         definitions = dataops._definition_cache

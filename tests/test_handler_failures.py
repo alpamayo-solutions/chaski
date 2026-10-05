@@ -264,14 +264,10 @@ def _get(port: int):
 
 @run_async
 async def test_the_health_door_says_degraded_then_fails_when_unhealthy():
-    import socket
-
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
     health = HandlerHealth(unhealthy_after=2)
     state = HealthState(handlers=health)
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = server.sockets[0].getsockname()[1]
     try:
         health.failed("Panels.on_edge", RuntimeError("boom"))
         status, body = await asyncio.to_thread(_get, port)

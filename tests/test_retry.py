@@ -41,7 +41,12 @@ def test_retry_after_beyond_the_backoff_maximum_is_honoured():
     assert all(45 <= delay <= 54 for delay in delays)
 
 
-@pytest.mark.parametrize("value", ["3600", format_datetime(datetime.now(UTC) + timedelta(days=2), usegmt=True)])
+# Named ids: an id carrying the date would differ between the processes of a parallel run.
+@pytest.mark.parametrize(
+    "value",
+    ["3600", format_datetime(datetime.now(UTC) + timedelta(days=2), usegmt=True)],
+    ids=["seconds", "http-date"],
+)
 def test_absurd_retry_after_is_capped(value):
     delays = [Backoff().delay(_refused(429, value)) for _ in range(50)]
     assert all(RETRY_AFTER_MAX_S <= delay <= RETRY_AFTER_MAX_S * 1.2 for delay in delays)
