@@ -21,8 +21,8 @@ class StreamChange:
 
     ``head`` is the last offset the stream had admitted when the node sent
     the hint (the hint's next offset minus one), ``None`` when the node sent
-    no offset. Hints coalesce, so ``head`` is the newest one, not one per
-    record. ``subscription`` numbers the established subscription that
+    no offset or the watch is narrowed to contracts. Hints coalesce, so
+    ``head`` is the newest one, not one per record. ``subscription`` numbers the established subscription that
     delivered the hint, from 1; it changes on every reconnect.
     """
 
@@ -60,7 +60,10 @@ class StreamChanges:
     ``contracts`` narrows the hints to growth by those contracts. A filtered
     consumer woken only by them leaves its cursor behind the records it skips
     between hints, which holds back the node's pruner; leave it empty unless
-    something else wakes the consumer past them.
+    something else wakes the consumer past them. Such a watch reports no
+    ``head``: colcad up to 0.29.1 read a narrowed hint's offset apart from
+    the growth it announced, so the offset could miss the record that woke
+    it, and no later hint would follow. Its consumers read the tail.
     """
 
     def __init__(
@@ -158,7 +161,7 @@ class StreamChanges:
             for stream in hint.streams:
                 if stream not in self.signals:
                     continue
-                following = offsets.get(stream)
+                following = None if self.contracts else offsets.get(stream)
                 head = None if following is None else max(0, int(following) - 1)
                 change = StreamChange(stream, head, subscription)
                 self._latest[stream] = change

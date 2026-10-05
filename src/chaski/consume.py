@@ -61,7 +61,9 @@ def consume(
 
     Without a ``bell`` each stream-change hint's head bounds the drain, and a
     hint the cursor already passed costs no request
-    (:class:`chaski.stream_changes.StreamChange`).
+    (:class:`chaski.stream_changes.StreamChange`). The idle drain is skipped
+    too while the newest hint shows the cursor at the head: it has already
+    walked past every record up to it.
     """
     stop = stop or threading.Event()
     name = consumer or stream.cursor

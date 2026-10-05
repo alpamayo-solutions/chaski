@@ -538,6 +538,25 @@ class Stream:
         self._advance(offset)
         return moved
 
+    def observe(self, page: Page) -> None:
+        """Learn the cursor's stored position from a page read from it.
+
+        A page read from the cursor starts right after its stored position. One
+        that starts below :attr:`position` means the node lost acknowledged
+        records (its data was reset or restored): the position goes back to the
+        node's, so acks and stream-change hints below the old one count again.
+        """
+        if page.start is not None and page.start - 1 < self._acknowledged:
+            log.warning(
+                "stream=%s cursor=%s: the node holds the cursor at %d, behind %d acknowledged here; following the node",
+                self.name,
+                self.cursor,
+                page.start - 1,
+                self._acknowledged,
+            )
+            self._acknowledged = page.start - 1
+            self._moved.ring()
+
     def _advance(self, offset: int) -> None:
         if offset > self._acknowledged:
             self._acknowledged = offset
@@ -597,8 +616,12 @@ class Stream:
             return
         if head is None:
             head = self.head()
+        first = True
         while stop is None or not stop.is_set():
             page = self.fetch()
+            if first:
+                self.observe(page)
+                first = False
             if page.gap is not None:
                 raise StreamGapError(
                     f"stream={self.name} cursor={self.cursor}: retained offsets "
@@ -643,7 +666,9 @@ class Stream:
 
         Without a ``bell`` it watches the stream's growth, and each hint's
         head bounds the drain: a hint the cursor already passed costs no
-        request, and a drain reads no tail first."""
+        request, and a drain reads no tail first. The idle drain is skipped
+        too while the newest hint shows the cursor at the head: it has
+        already walked past every record up to it."""
         stop = stop or threading.Event()
         if bell is None:
             from .stream_changes import StreamChanges

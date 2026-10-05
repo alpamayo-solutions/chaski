@@ -397,8 +397,12 @@ class CommandExecutor:
             head = change.head
         else:
             head = await asyncio.to_thread(self._stream.head)
+        first = True
         while True:
             page: Page = await asyncio.to_thread(self._stream.fetch)
+            if first:
+                self._stream.observe(page)
+                first = False
             if page.gap is not None:
                 raise StreamGapError(
                     f"commands: offsets {page.gap.from_offset}..{page.gap.to_offset} were pruned; explicit recovery required"

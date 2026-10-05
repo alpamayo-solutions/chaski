@@ -335,10 +335,16 @@ class RetainedView:
                         head = change.head
                     else:
                         head = self.door.fetch(stream, self.cursor, max=1, tail=True).next - 1
+                    first = True
                     while not self.stop.is_set():
                         page = self.door.fetch(
                             stream, self.cursor, max=1000, contracts=sorted(self.contracts), **self._topics
                         )
+                        if first and page.start is not None and page.start - 1 < self.positions.get(stream, 0):
+                            # The node lost acknowledged records (a reset or
+                            # restore): follow its position, not the old one.
+                            self.positions[stream] = page.start - 1
+                        first = False
                         if page.gap is not None:
                             self.initialized = False
                             gap = True

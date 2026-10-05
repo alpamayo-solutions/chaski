@@ -405,3 +405,99 @@ def test_a_causal_read_still_reads_the_tail():
     door.fetches.clear()
     view.synchronize()
     assert door.fetches[0] == "tail"
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_a_contract_narrowed_watch_reports_no_head():
+    door = Door(stream="commands")
+    door.put({"not": "a command"})
+    watch = StreamChanges(door, ["commands"], contracts=["_CmdOperate"]).start()
+    try:
+        _until(lambda: watch.latest("commands") is not None)
+        assert watch.latest("commands") == StreamChange("commands", None, 1)
+    finally:
+        watch.close()
+
+
+def test_the_executor_handles_a_command_whose_narrowed_hint_understates_the_head():
+    """colcad up to 0.29.1 could pair a narrowed hint with the offset read
+    before the append that woke it; no later hint follows. The executor must
+    still handle that command."""
+
+    class StaleDoor(Door):
+        def watch(self, streams, *, stop, contracts=(), interval_ms=None):
+            self.connections += 1
+            yield Hint(streams=list(streams), next={s: len(self.records) + 1 for s in streams})
+            while not stop():
+                try:
+                    hint = self.hints.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+                yield hint
+
+    door = StaleDoor(stream="commands")
+    door.put({"not": "a command"})
+    stream = Stream(door, "commands", "c/worker/commands")
+    executor = CommandExecutor(door, lambda topic, payload: None, stream, {}, "node", contracts=["_CmdOperate"])
+    watch = StreamChanges(door, ["commands"], contracts=executor._contracts).start()
+    executor._watch = watch
+    try:
+        _until(lambda: watch.latest("commands") is not None)
+        assert asyncio.run(executor.drain()) == 1
+        stale_next = len(door.records) + 1
+        door.put({"not": "a command"})
+        door.hints.put(Hint(streams=["commands"], next={"commands": stale_next}))
+        _until(lambda: watch["commands"].version >= 2)
+        assert asyncio.run(executor.drain()) == 1, "the command behind the stale hint was skipped"
+        assert stream.position == 2
+    finally:
+        watch.close()
+
+
+def test_follow_catches_up_after_the_node_lost_acknowledged_records():
+    """colcad's data reset or restored to a shorter stream while the client
+    stays up: the position known here must follow the node's, or hints at or
+    below the old position count as covered and acks are skipped."""
+    door = Door()
+    for value in range(5):
+        door.put(value)
+    records: list = []
+    stop = threading.Event()
+    stream, worker = _follow(door, records, stop, idle_drain_s=None)
+    try:
+        _until(lambda: stream.position == 5)
+        with door.lock:  # restored from a backup holding two records, cursor at 0
+            door.records = door.records[:2]
+            door.cursor = 0
+        door.disconnect()
+        _until(lambda: door.connections == 2)
+        _until(lambda: door.cursor == 2)
+        assert stream.position == 2
+        door.put(5)
+        door.hint()
+        _until(lambda: door.cursor == 3)
+        assert records == [0, 1, 2, 3, 4, 0, 1, 5]
+    finally:
+        stop.set()
+        worker.join(5)
+
+
+def test_the_view_follows_the_node_after_it_lost_acknowledged_records():
+    door = KvDoor()
+    for value in range(3):
+        door.put({"value": value})
+    view = RetainedView(door, ["_Metric"], ["metrics"], "c/worker/view", scope=ViewScope.whole_node())
+    view.synchronize()
+    assert view.position() == 3
+    with door.lock:  # restored with one record, already read
+        door.records = door.records[:1]
+        door.cursor = 1
+    _hint(view, door, subscription=2)
+    view._refresh_changed()
+    assert view.position() == 1
+    door.put({"value": 9})
+    _hint(view, door, subscription=2)
+    view._refresh_changed()
+    assert view.position() == 2

@@ -1895,7 +1895,8 @@ class Service:
         record aside instead (see :meth:`reject`). ``bell`` is a
         :class:`chaski.Doorbell` rung by the stream's MQTT topics and on
         reconnect; without one the stream's growth is watched. After
-        ``idle_drain_s`` without a ring it drains anyway, so a filtered cursor
+        ``idle_drain_s`` without a ring it drains anyway (unless the newest
+        stream-change hint shows the cursor at the head), so a filtered cursor
         keeps moving past the records it skips. Blocks.
 
         ``stream.position`` says how far the handler got;
