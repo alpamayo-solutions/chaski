@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import json
 import os
-import socket
 import threading
 import time
 import urllib.error
@@ -84,12 +83,6 @@ def _wait(predicate, timeout: float = 60.0, interval: float = 0.2):
     return result
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _health(port: int) -> tuple[int, dict]:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as response:
@@ -100,6 +93,7 @@ def _health(port: int) -> tuple[int, dict]:
 
 @contextlib.contextmanager
 def _serving(node, data_dir, **kwargs):
+    kwargs.setdefault("health_port", 0)
     door = LocalDoor(host="127.0.0.1", http_port=node._ports["api_local"], mqtt_port=node._ports["mqtt_local"])
     svc = chaski.DataOpsService(
         "dataops", node=door, state_dir=node.data_dir / "services" / "dataops", data_dir=data_dir, **kwargs
@@ -150,9 +144,8 @@ def _latest_output(reader) -> float | None:
 
 
 def test_a_long_independent_backfill_after_a_fresh_start_keeps_health_ok_and_a_stalled_ingest_fails_it(
-    tmp_path, fast_lag_alarm
+    tmp_path, fast_lag_alarm, health_doors
 ):
-    port = _free_port()
     with (
         chaski.Node("health-backfill", data_dir=tmp_path / "node") as node,
         node.service("machine", mount="Line/M1") as machine,
@@ -169,9 +162,8 @@ def test_a_long_independent_backfill_after_a_fresh_start_keeps_health_ok_and_a_s
 
         # Fresh state: a new buffer generation, so a new ingest cursor, and a
         # long independent first backfill beside live dispatch.
-        with _serving(
-            node, tmp_path / "second", historian=EmptyHistorian(), health_port=port, backfill_rate=0.5
-        ) as svc:
+        with _serving(node, tmp_path / "second", historian=EmptyHistorian(), backfill_rate=0.5) as svc:
+            port = health_doors.dataops[-1]
             assert svc._ingest.cursor != old_cursor
             _wait(lambda: svc._backfill.status().get("running"))
 

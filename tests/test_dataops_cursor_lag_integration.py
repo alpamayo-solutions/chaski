@@ -64,7 +64,11 @@ def _serving(node, tmp_path):
     """A DataOps service on the node's local door, served on its own loop."""
     door = LocalDoor(host="127.0.0.1", http_port=node._ports["api_local"], mqtt_port=node._ports["mqtt_local"])
     svc = chaski.DataOpsService(
-        "dataops", node=door, state_dir=node.data_dir / "services" / "dataops", data_dir=tmp_path / "data"
+        "dataops",
+        node=door,
+        state_dir=node.data_dir / "services" / "dataops",
+        data_dir=tmp_path / "data",
+        health_port=0,
     )
     svc.add(Line)
     loop = asyncio.new_event_loop()

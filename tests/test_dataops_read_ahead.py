@@ -244,26 +244,83 @@ async def test_stopping_waits_for_the_last_ack(tmp_path):
     assert door.position == 6
 
 
+class OverlapDoor(CursorDoor):
+    """A ``CursorDoor`` that notes which fetches and acks were in flight while
+    a record was handled. With read-ahead, each ack waits (briefly) for the
+    handling of a later record, so an ack the loop awaited before going on
+    would show as one that never overlapped processing."""
+
+    def __init__(self, n: int, *, read_ahead: bool) -> None:
+        super().__init__(n, read_ahead=read_ahead)
+        self.in_flight: list[str] = []
+        self.fetches_started = 0
+        self.highest_handled = 0
+        self.acks_overlapped: list[bool] = []
+
+    def fetch(self, stream, cursor, **kwargs):
+        with self._lock:
+            self.fetches_started += 1
+            self.in_flight.append("fetch")
+        try:
+            return super().fetch(stream, cursor, **kwargs)
+        finally:
+            with self._lock:
+                self.in_flight.remove("fetch")
+
+    def ack(self, stream, cursor, offset) -> bool:
+        with self._lock:
+            self.in_flight.append("ack")
+        try:
+            if self.read_ahead and offset < len(self.records):
+                deadline = time.monotonic() + 2.0
+                while self.highest_handled <= offset and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                self.acks_overlapped.append(self.highest_handled > offset)
+            return super().ack(stream, cursor, offset)
+        finally:
+            with self._lock:
+                self.in_flight.remove("ack")
+
+
 @run_async
 async def test_read_ahead_drains_a_backlog_faster_when_fetch_ack_and_processing_take_time(tmp_path):
-    """20 pages; fetch, ack and each page's processing take about 20 ms each.
-    In turn that is about 60 ms a page; with read-ahead about 20-40 ms."""
-
-    async def handler(record):
-        if record.offset % 5 == 0:
-            await asyncio.sleep(0.02)
-
-    elapsed: dict[bool, float] = {}
+    """20 pages of 5. Read-ahead drains a backlog faster because the next fetch
+    and the last ack run while a page is processed, where an older node takes
+    the three in turn. Asserted on that overlap rather than on elapsed time,
+    which a loaded runner stretches unevenly."""
     for read_ahead in (False, True):
-        door = CursorDoor(100, read_ahead=read_ahead, latency_s=0.02)
+        door = OverlapDoor(100, read_ahead=read_ahead)
+        busy_while_handling: list[list[str]] = []
+        next_fetch_in_time: list[bool] = []
+
+        async def handler(record, door=door, busy=busy_while_handling, in_time=next_fetch_in_time):
+            with door._lock:
+                busy.append(list(door.in_flight))
+            door.highest_handled = record.offset
+            page = record.offset // 5
+            if door.read_ahead and record.offset % 5 == 0 and page < 20:
+                # The fetch of the next page has gone out before this page is done.
+                for _ in range(400):
+                    if door.fetches_started > page:
+                        break
+                    await asyncio.sleep(0.005)
+                in_time.append(door.fetches_started > page)
+
         ingest, buffer = _ingest(door, tmp_path / str(read_ahead), None, page=5)
         ingest.rebind({"sig-1": [handler]}, ["sig-1"])
-        started = time.monotonic()
-        await _run_until(ingest, lambda door=door: door.position == 101, timeout=20.0)
-        elapsed[read_ahead] = time.monotonic() - started
+        await _run_until(ingest, lambda door=door: door.position == 101, timeout=30.0)
         buffer.close()
 
-    assert elapsed[True] < 0.75 * elapsed[False], elapsed
+        assert len(busy_while_handling) == 100
+        assert door.acks[-1] == 100
+        assert door.acks == sorted(door.acks)
+        if read_ahead:
+            assert next_fetch_in_time == [True] * 19
+            assert door.acks_overlapped, "no ack went out before the last page"
+            assert all(door.acks_overlapped), "an ack held up processing"
+        else:
+            assert not any(busy_while_handling), "an older node must fetch, process and ack in turn"
+            assert door.fetches_started >= 20
 
 
 class FakeClock:

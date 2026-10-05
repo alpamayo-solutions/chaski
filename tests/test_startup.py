@@ -13,6 +13,7 @@ import urllib.request
 
 import httpx
 import pytest
+from ports import reserved_port
 
 import chaski.service as service_module
 from chaski.connector import ConnectorService, start_health_server
@@ -218,9 +219,8 @@ def test_a_dataops_service_health_door_answers_while_colca_is_away(monkeypatch, 
     """The DataOps door is up before the node answers and reports why."""
     from chaski.dataops import DataOpsService
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        closed_port = probe.getsockname()[1]
+    # Nothing listens there, and no other test's listener on port 0 can take it.
+    closed_port = reserved_port()
     door = service_module.LocalDoor(host="127.0.0.1", http_port=closed_port, mqtt_port=closed_port)
     svc = DataOpsService("dataops", node=door, state_dir=tmp_path, health_port=0)
     ports: list[int] = []

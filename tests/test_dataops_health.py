@@ -24,12 +24,8 @@ def _get(port: int):
         return refused.code, json.loads(refused.read())
 
 
-def _free_port() -> int:
-    import socket
-
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _port(server: asyncio.AbstractServer) -> int:
+    return server.sockets[0].getsockname()[1]
 
 
 def run_async(fn):
@@ -44,8 +40,8 @@ def run_async(fn):
 async def test_a_running_ingest_answers_200_with_the_service_facts():
     state = HealthState(producers=3, generation="01GEN")
     state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
-    port = _free_port()
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = _port(server)
     try:
         status, body = await asyncio.to_thread(_get, port)
         assert status == 200, body
@@ -70,8 +66,8 @@ async def test_a_dead_ingest_loop_turns_the_probe_503():
     state = HealthState()
     state.ingest_task = asyncio.ensure_future(_dies())
     await asyncio.sleep(0)  # let it die
-    port = _free_port()
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = _port(server)
     try:
         status, body = await asyncio.to_thread(_get, port)
         assert status == 503, body
@@ -94,8 +90,8 @@ async def test_a_coordinated_step_loop_that_stopped_turns_the_probe_503():
     last_drain = [time.monotonic() - 301.0]
     state = HealthState(last_drain_at=lambda: last_drain[0], stall_after_s=300.0)
     state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
-    port = _free_port()
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = _port(server)
     try:
         status, body = await asyncio.to_thread(_get, port)
         assert status == 503, body
@@ -139,8 +135,8 @@ async def test_the_nodes_cursor_lag_finding_turns_the_probe_503_and_an_idle_stre
     lag = ["historian has records on metrics waiting 75 s that it has not read"]
     state = HealthState(cursor_lag=lambda: lag[0])
     state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
-    port = _free_port()
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = _port(server)
     try:
         status, body = await asyncio.to_thread(_get, port)
         assert status == 503, body
@@ -164,8 +160,8 @@ async def test_an_identity_conflict_turns_the_probe_503():
     session back and forth and consumers stop being woken."""
     conflict = ["another process is connected as svc1"]
     state = HealthState(identity_conflict=lambda: conflict[0])
-    port = _free_port()
-    server = await serve(state, port=port)
+    server = await serve(state, port=0)
+    port = _port(server)
     try:
         status, body = await asyncio.to_thread(_get, port)
         assert status == 503, body

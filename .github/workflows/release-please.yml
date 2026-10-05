@@ -18,15 +18,32 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+    env:
+      APP_CLIENT_ID: ${{ secrets.RELEASE_PLEASE_APP_CLIENT_ID }}
     steps:
+      # Pull requests and tags made with the workflow token start no checks of
+      # their own (a release pull request waits for "Approve and run"). With the
+      # release GitHub App configured, release-please acts as that App instead,
+      # and its pull requests and tags start ci like anyone's.
+      - id: app
+        if: env.APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ env.APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
         with:
+          token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-      # A tag created with the workflow token starts no workflow, so start the publish run here.
+      # A tag created with the workflow token starts no workflow, so start the
+      # publish run here; a tag the App created started it already.
       - name: Publish the release
-        if: steps.release.outputs.release_created == 'true'
+        if: steps.release.outputs.release_created == 'true' && steps.app.outputs.token == ''
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag_name }}

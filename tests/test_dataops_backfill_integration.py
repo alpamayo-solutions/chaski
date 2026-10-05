@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 
+import httpx
 import pandas as pd
 import pytest
 from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
@@ -27,6 +28,7 @@ from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 import chaski
 from chaski.dataops import Backfill, NodeHistorian, Producer, SignalOutput, SignalRangeInput, on_metric
 from chaski.dataops.backfill import INITIAL
+from chaski.retry import retry_after
 from chaski.service import LocalDoor
 
 pytestmark = pytest.mark.skipif(
@@ -137,7 +139,12 @@ def _serving(node, data_dir, producer_cls, **kwargs):
     """A DataOps service on the node's local door, served on its own loop."""
     door = LocalDoor(host="127.0.0.1", http_port=node._ports["api_local"], mqtt_port=node._ports["mqtt_local"])
     svc = chaski.DataOpsService(
-        "dataops", node=door, state_dir=node.data_dir / "services" / "dataops", data_dir=data_dir, **kwargs
+        "dataops",
+        node=door,
+        state_dir=node.data_dir / "services" / "dataops",
+        data_dir=data_dir,
+        health_port=0,
+        **kwargs,
     )
     svc.add(producer_cls)
     loop = asyncio.new_event_loop()
@@ -172,9 +179,25 @@ def _publish(machine, rows) -> None:
         machine.publish("state", value, timestamp=ts)
 
 
+def _patiently(read):
+    """Run one read of the test's reader, waiting out a node that refuses it
+    for load (429). On the local door every caller on this host shares one
+    request budget, the service under test included, and a busy backfill can
+    use it up for a moment; the service's own loops back off the same way."""
+    deadline = time.monotonic() + 60.0
+    while True:
+        try:
+            return read()
+        except httpx.HTTPStatusError as refused:
+            delay = retry_after(refused)
+            if delay is None or time.monotonic() + delay > deadline:
+                raise
+            time.sleep(delay)
+
+
 def _signal_id(reader, name: str) -> str:
     def find():
-        for row in reader.kv("", contract="_Signal"):
+        for row in _patiently(lambda: reader.kv("", contract="_Signal")):
             if row.payload and row.payload.get("name") == name:
                 return row.payload["id"]
         return None
@@ -186,9 +209,12 @@ def _outputs(reader) -> list[tuple[float, float]]:
     """Every ``cycle_seconds`` sample in the node's metrics stream, in stream order."""
     signal_id = _signal_id(reader, "cycle_seconds")
     stream = reader.stream("metrics", cursor=f"read-{uuid.uuid4().hex[:8]}", signal_ids=[signal_id])
-    records = list(stream)
-    stream.retire()
-    return [(float(r.payload["timestamp"]), float(r.payload["value"])) for r in records]
+    # A drain refused part way reads again from the cursor; a page it had
+    # yielded but not acked comes twice, so records are kept by offset.
+    records: dict[int, chaski.Record] = {}
+    _patiently(lambda: records.update((r.offset, r) for r in stream))
+    _patiently(stream.retire)
+    return [(float(r.payload["timestamp"]), float(r.payload["value"])) for _, r in sorted(records.items())]
 
 
 def _until_outputs(reader, count: int) -> list[tuple[float, float]]:
@@ -196,7 +222,8 @@ def _until_outputs(reader, count: int) -> list[tuple[float, float]]:
         rows = _outputs(reader)
         return rows if len({ts for ts, _ in rows}) >= count else None
 
-    return _wait(enough)
+    # Each look reads the stream again: not more often than the node's budget needs.
+    return _wait(enough, interval=0.5)
 
 
 def _seed(node, machine, reader, archive, recent) -> FakeHistorian:
