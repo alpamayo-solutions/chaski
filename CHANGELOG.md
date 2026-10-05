@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.6](https://github.com/alpamayo-solutions/chaski/compare/v0.23.5...v0.23.6) (2026-10-05)
+
+
+### Fixes
+
+* **connector:** wake polling after the host clock is stepped back ([ac2109d](https://github.com/alpamayo-solutions/chaski/commit/ac2109d55c822b53d3f68618efd123352c4a573f))
+
 ## [0.23.5](https://github.com/alpamayo-solutions/chaski/compare/v0.23.4...v0.23.5) (2026-10-05)
 
 
