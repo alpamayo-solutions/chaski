@@ -538,15 +538,18 @@ class Stream:
         self._advance(offset)
         return moved
 
-    def observe(self, page: Page) -> None:
+    def observe(self, page: Page, before: int) -> None:
         """Learn the cursor's stored position from a page read from it.
 
-        A page read from the cursor starts right after its stored position. One
-        that starts below :attr:`position` means the node lost acknowledged
-        records (its data was reset or restored): the position goes back to the
-        node's, so acks and stream-change hints below the old one count again.
+        ``before`` is :attr:`position` captured before the fetch. A page read
+        from the cursor starts right after its stored position. One that starts
+        below ``before`` means the node lost acknowledged records (its data was
+        reset or restored): the position goes back to the node's, so acks and
+        stream-change hints below the old one count again. An ack from another
+        thread during the fetch only moves the position forward, so it is
+        never mistaken for a reset.
         """
-        if page.start is not None and page.start - 1 < self._acknowledged:
+        if page.start is not None and page.start - 1 < before and self._acknowledged == before:
             log.warning(
                 "stream=%s cursor=%s: the node holds the cursor at %d, behind %d acknowledged here; following the node",
                 self.name,
@@ -618,9 +621,10 @@ class Stream:
             head = self.head()
         first = True
         while stop is None or not stop.is_set():
+            before = self.position
             page = self.fetch()
             if first:
-                self.observe(page)
+                self.observe(page, before)
                 first = False
             if page.gap is not None:
                 raise StreamGapError(

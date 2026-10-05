@@ -399,9 +399,10 @@ class CommandExecutor:
             head = await asyncio.to_thread(self._stream.head)
         first = True
         while True:
+            before = self._stream.position
             page: Page = await asyncio.to_thread(self._stream.fetch)
             if first:
-                self._stream.observe(page)
+                self._stream.observe(page, before)
                 first = False
             if page.gap is not None:
                 raise StreamGapError(

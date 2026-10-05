@@ -237,7 +237,8 @@ A watch narrowed to `contracts` reports no head (`head=None`), so its
 consumers read the tail: colcad up to 0.29.1 could send a narrowed hint whose
 offset missed the record that woke it. A drain whose first page starts below
 the position known in this process (the node's data was reset or restored)
-follows the node's position, so later acks and hints count again.
+follows the node's position, so later acks and hints count again; a retained
+view rebuilds from a fresh snapshot instead.
 
 Run one process per service name on a node. A second process with the same
 name connects with the same MQTT client id; the broker hands the one session

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import httpx
 
 from chaski.consume import consume
-from chaski.door import Hint, Page, Stream
+from chaski.door import Hint, KvEntry, Page, Stream
 from chaski.executor import CommandExecutor
 from chaski.failures import HandlerHealth
 from chaski.retained_view import RetainedView, ViewScope
@@ -484,20 +484,50 @@ def test_follow_catches_up_after_the_node_lost_acknowledged_records():
         worker.join(5)
 
 
-def test_the_view_follows_the_node_after_it_lost_acknowledged_records():
-    door = KvDoor()
+class StateDoor(Door):
+    """Door whose /kv holds the newest record of the one topic."""
+
+    def kv(self, prefix, *, contract, depth=None):
+        if not self.records or self.records[-1].payload is None:
+            return []
+        r = self.records[-1]
+        return [KvEntry("temperature", "node", TOPIC, r.payload, 0, r.offset)]
+
+
+def test_the_view_rebuilds_after_the_node_lost_acknowledged_records():
+    door = StateDoor()
     for value in range(3):
         door.put({"value": value})
     view = RetainedView(door, ["_Metric"], ["metrics"], "c/worker/view", scope=ViewScope.whole_node())
     view.synchronize()
+    assert view.read()[0].payload == {"value": 2}
     assert view.position() == 3
     with door.lock:  # restored with one record, already read
         door.records = door.records[:1]
         door.cursor = 1
+    door.put({"value": 9})  # offset 2, below the topic's old offset 3
     _hint(view, door, subscription=2)
     view._refresh_changed()
-    assert view.position() == 1
-    door.put({"value": 9})
-    _hint(view, door, subscription=2)
-    view._refresh_changed()
+    assert [e.payload for e in view.read()] == [{"value": 9}]
     assert view.position() == 2
+    door.put({"value": 10})
+    _hint(view, door, subscription=2)
+    view._refresh_changed()
+    assert [e.payload for e in view.read()] == [{"value": 10}]
+    assert view.position() == 3
+
+
+def test_observe_does_not_take_a_concurrent_ack_for_a_reset():
+    door = Door()
+    for value in range(4):
+        door.put(value)
+    stream = Stream(door, "metrics", "c/worker/metrics")
+    stream.ack(2)
+    before = stream.position
+    page = stream.fetch()  # starts at 3
+    stream.ack(4)  # another thread acks during the fetch
+    stream.observe(page, before)
+    assert stream.position == 4
+    # A page starting below the position captured before the fetch is a reset.
+    stream.observe(Page([], 2, start=1), 4)
+    assert stream.position == 0

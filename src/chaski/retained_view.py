@@ -340,12 +340,19 @@ class RetainedView:
                         page = self.door.fetch(
                             stream, self.cursor, max=1000, contracts=sorted(self.contracts), **self._topics
                         )
-                        if first and page.start is not None and page.start - 1 < self.positions.get(stream, 0):
-                            # The node lost acknowledged records (a reset or
-                            # restore): follow its position, not the old one.
-                            self.positions[stream] = page.start - 1
+                        reset = first and page.start is not None and page.start - 1 < self.positions.get(stream, 0)
                         first = False
-                        if page.gap is not None:
+                        if reset:
+                            # The node lost acknowledged records (a reset or
+                            # restore). Entries and per-topic offsets from
+                            # before it would hide newer records at lower
+                            # offsets and keep deleted paths: rebuild.
+                            log.warning(
+                                "Retained view %s: %s restarted below the applied position; rebuilding",
+                                self.cursor,
+                                stream,
+                            )
+                        if reset or page.gap is not None:
                             self.initialized = False
                             gap = True
                             break
