@@ -582,16 +582,21 @@ class Stream:
     def __iter__(self) -> Iterator[Record]:
         return self.drain()
 
-    def drain(self, *, stop: threading.Event | None = None) -> Iterator[Record]:
+    def drain(self, *, stop: threading.Event | None = None, head: int | None = None) -> Iterator[Record]:
         """Yield every record from the cursor's position to the head, page
         by page, acking each page after its records were consumed. Capture a
         finite head so continuous producers cannot keep this call open forever.
         Cancellation leaves a partially consumed page unacknowledged for replay.
         The final page may include records admitted after the captured head.
+
+        ``head`` is a boundary the caller already holds, such as the
+        :attr:`chaski.stream_changes.StreamChange.head` of the hint that woke
+        it; ``None`` reads it with :meth:`head` first.
         """
         if stop is not None and stop.is_set():
             return
-        head = self.head()
+        if head is None:
+            head = self.head()
         while stop is None or not stop.is_set():
             page = self.fetch()
             if page.gap is not None:
@@ -634,20 +639,34 @@ class Stream:
         After ``idle_drain_s`` without a ring it drains anyway: a filtered
         stream whose topics stay silent still walks its cursor past the
         records it skips, so it does not hold the node's retention (``None``
-        waits for the bell alone)."""
+        waits for the bell alone).
+
+        Without a ``bell`` it watches the stream's growth, and each hint's
+        head bounds the drain: a hint the cursor already passed costs no
+        request, and a drain reads no tail first."""
         stop = stop or threading.Event()
         if bell is None:
             from .stream_changes import StreamChanges
 
             watch = StreamChanges(self._door, [self.name], stop=stop).start()
             try:
-                yield from self.follow(watch[self.name], stop=stop, idle_drain_s=idle_drain_s)
+                yield from self._follow(watch[self.name], watch, stop, idle_drain_s)
             finally:
                 watch.close()
             return
+        yield from self._follow(bell, None, stop, idle_drain_s)
+
+    def _follow(
+        self, bell: Doorbell, watch: Any, stop: threading.Event, idle_drain_s: float | None
+    ) -> Iterator[Record]:
+        drained_on = None
         while not stop.is_set():
             seen = bell.generation
-            yield from self.drain(stop=stop)
+            change = watch.latest(self.name) if watch is not None else None
+            if change is None or not change.covers(self.position, drained_on):
+                yield from self.drain(stop=stop, head=None if change is None else change.head)
+                if change is not None and not stop.is_set():
+                    drained_on = change.subscription
             if stop.is_set():
                 return
             bell.wait_after(seen, idle_drain_s, stop=stop)

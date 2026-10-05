@@ -273,6 +273,10 @@ class CommandExecutor:
         self._link = asyncio.Event()
         self._link.set()
         self._stop = asyncio.Event()
+        # The stream watch while running, and the subscription of the hint the
+        # last complete drain started from (see StreamChange.covers).
+        self._watch: Any = None
+        self._drained_on: int | None = None
         self._answered: OrderedDict[str, None] = OrderedDict()
         self._contracts = sorted({*(contracts if contracts is not None else (c for c, _p in handlers)), ACK_CONTRACT})
 
@@ -309,11 +313,13 @@ class CommandExecutor:
             self._door,
             [STREAM],
             contracts=self._contracts,
-            on_change=lambda: loop.call_soon_threadsafe(self.wake),
+            on_change=lambda _changes: loop.call_soon_threadsafe(self.wake),
         ).start()
+        self._watch = watch
         try:
             await self._serve(stop)
         finally:
+            self._watch = None
             await asyncio.to_thread(watch.close)
 
     async def _serve(self, stop: asyncio.Event) -> None:
@@ -378,9 +384,19 @@ class CommandExecutor:
     async def drain(self) -> int:
         """Handle every command up to the head of the stream, acking page by
         page once every answer on the page is published. Returns how many
-        records were read."""
+        records were read.
+
+        The head of the newest stream-change hint bounds it, and a hint the
+        cursor already passed costs no request; without one it reads the
+        head first."""
         seen = 0
-        head = await asyncio.to_thread(self._stream.head)
+        change = self._watch.latest(self._stream.name) if self._watch is not None else None
+        if change is not None and change.covers(self._stream.position, self._drained_on):
+            return 0
+        if change is not None and change.head is not None:
+            head = change.head
+        else:
+            head = await asyncio.to_thread(self._stream.head)
         while True:
             page: Page = await asyncio.to_thread(self._stream.fetch)
             if page.gap is not None:
@@ -399,10 +415,16 @@ class CommandExecutor:
             if ack_offset is None:
                 if page.next <= head:
                     raise RuntimeError(f"commands: the stream stopped at {page.next} before its head {head}")
-                return seen
+                if not page.records and page.gap is None:
+                    # Nothing after the cursor: it already stands at the head.
+                    self._stream._advance(page.next - 1)
+                break
             await asyncio.to_thread(self._stream.ack, ack_offset)
             if ack_offset >= head:
-                return seen
+                break
+        if change is not None:
+            self._drained_on = change.subscription
+        return seen
 
     # -- answered commands ----------------------------------------------------
 
