@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.4](https://github.com/alpamayo-solutions/chaski/compare/v0.23.3...v0.23.4) (2026-10-05)
+
+
+### Fixes
+
+* **dataops:** log per-handler dispatch and schedule lines at DEBUG ([#144](https://github.com/alpamayo-solutions/chaski/issues/144)) ([a9b4ca2](https://github.com/alpamayo-solutions/chaski/commit/a9b4ca2cfeda1e7d8108bcc34925d5a197bddeb4))
+
 ## [0.23.3](https://github.com/alpamayo-solutions/chaski/compare/v0.23.2...v0.23.3) (2026-10-05)
 
 
