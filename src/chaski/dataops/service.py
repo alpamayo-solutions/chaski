@@ -290,8 +290,10 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
             max_instances=1,  # never overlap a slow method with itself
             misfire_grace_time=60,
         )
-        log.info("Scheduled %s.%s with %s", instance.name, method_name, kind)
+        log.debug("Scheduled %s.%s with %s", instance.name, method_name, kind)
         count += 1
+    if count:
+        log.info("Scheduled %d periodic job(s) for %s", count, instance.name)
     return count
 
 
@@ -414,7 +416,10 @@ def _resolve_dispatch(
             method = getattr(instance, method_name)
             domain = getattr(instance, spec.input_name).time_domain
             dispatch.setdefault(signal_id, []).append(make_handler(method, time_domain=domain))
-            log.info(
+            # One line per handler is DEBUG: a node with many producers re-resolves
+            # on every definition change, and the per-handler lines then dominate
+            # its log. The INFO summary below states the outcome once per pass.
+            log.debug(
                 "Will dispatch %s.%s for signal_id=%s (input %s)",
                 instance.name,
                 method_name,
@@ -422,6 +427,13 @@ def _resolve_dispatch(
                 spec.input_name,
             )
 
+    log.info(
+        "Dispatch bound: %d handler(s) on %d signal(s) for %d producer(s); %d input(s) unresolved",
+        sum(len(handlers) for handlers in dispatch.values()),
+        len(dispatch),
+        len(instances),
+        unresolved,
+    )
     return dispatch, list(signal_ids), unresolved
 
 
