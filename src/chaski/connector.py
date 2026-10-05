@@ -444,6 +444,13 @@ class ConnectorService(Service):
     may last before it is logged again (the first failure and the recovery
     are always logged); ``summary_interval`` the cadence of the ``[DATA]``
     throughput line.
+
+    Readings are reported by exception: a value equal to the last one
+    published for its Signal (within the Signal's precision) is not sent
+    again. ``integrity_interval`` bounds the silence: an unchanged value is
+    republished once that many seconds have passed since it was last sent,
+    so a consumer can tell a steady signal from a dead one. Set
+    ``report_by_exception=False`` to publish every reading.
     """
 
     def __init__(
@@ -460,6 +467,8 @@ class ConnectorService(Service):
         summary_interval: float = 60.0,
         telemetry: Telemetry | None = None,
         timestamp_source: Literal["acquisition", "source"] = "acquisition",
+        report_by_exception: bool = True,
+        integrity_interval: float = 60.0,
         **service_kwargs: Any,
     ) -> None:
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
@@ -472,6 +481,10 @@ class ConnectorService(Service):
         self.timestamp_source = timestamp_source
         self.interval = float(interval)
         self.heartbeat_interval = float(heartbeat_interval)
+        if integrity_interval <= 0:
+            raise ValueError("integrity_interval must be positive")
+        self.report_by_exception = bool(report_by_exception)
+        self.integrity_interval = float(integrity_interval)
         self.max_pending = int(max_pending)
         self.reconnect_retries = int(reconnect_retries)
         self.outage_reminder = float(outage_reminder)
@@ -491,6 +504,9 @@ class ConnectorService(Service):
         # whenever a binding changes; the loop copies it under the lock.
         self._targets: list[Target] = []
         self._latest_by_topic: dict[str, Metric] = {}
+        # When each topic's latest value was last sent (loop clock), for the
+        # integrity interval of report-by-exception.
+        self._published_at: dict[str, float] = {}
         # Last is_connected value successfully published, per metric topic:
         # report-on-change per bound Signal, independent of the per-cycle
         # dedup, so a live source drop surfaces while the broker stays up.
@@ -953,8 +969,21 @@ class ConnectorService(Service):
                         must_record=False,
                     )
                     continue
+                # Report by exception: an unchanged value is not sent again
+                # until the integrity interval has passed since it last was.
+                sent_at = self._published_at.get(key)
+                last = self._latest_by_topic.get(key)
+                if (
+                    self.report_by_exception
+                    and last is not None
+                    and sent_at is not None
+                    and self._now() - sent_at < self.integrity_interval
+                    and is_equal(last.value, value, precision)
+                ):
+                    continue
                 metric = Metric(value=value, timestamp=timestamp, signal_id=signal.id)
                 self._latest_by_topic[key] = metric
+                self._published_at[key] = self._now()
                 batch.append((topic, metric))
 
             self._publish_batch(batch)
