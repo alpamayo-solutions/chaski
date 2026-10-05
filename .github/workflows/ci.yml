@@ -187,7 +187,7 @@ jobs:
         # Most of a test waits on a colcad process, so several run at once.
         run: >-
           uv run --python ${{ matrix.python-version }} --extra test
-          pytest -n 4 --dist worksteal --durations=30
+          pytest -n 6 --dist worksteal --durations=30
 
   # Pushes to main and version tags build the package once lint and tests pass;
   # a version tag also publishes a release.
