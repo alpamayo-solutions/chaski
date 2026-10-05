@@ -1,5 +1,7 @@
 # Changelog
 
+Probe of the release pull request path.
+
 ## [0.23.6](https://github.com/alpamayo-solutions/chaski/compare/v0.23.5...v0.23.6) (2026-10-05)
 
 
