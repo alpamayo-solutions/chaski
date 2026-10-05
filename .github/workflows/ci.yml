@@ -28,8 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
-          # colca v0.26.0: grants relative to the node a person signs in at.
-          ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
+          # colca v0.27.1: payloads decode tolerantly; _SystemElement drops its external asset fields.
+          ref: cd342f8679a7dcc6546e0b76710372dc5b83ddd2
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: alpamayo-solutions/colca
           # Same broker revision as lint/contracts above.
-          ref: 5b3c2080b1c4a3c3da0dd2d0a24ecd40e6ba955e
+          ref: cd342f8679a7dcc6546e0b76710372dc5b83ddd2
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
