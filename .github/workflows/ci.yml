@@ -11,12 +11,60 @@ on:
 permissions:
   contents: read
 
+env:
+  # The colca chaski is developed against: its data contracts and the broker of
+  # the integration tests. colca v0.29.0: log forwarding by level, collapsed and
+  # capped repeats, fetchLogs.
+  COLCA_REF: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
+
+# A newer push to a pull request or to main supersedes the running checks. A
+# release commit gets a group of its own, so its run (whose verdict the tag
+# run reuses) always finishes; tag runs are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.ref }}${{ startsWith(github.event.head_commit.message, 'chore(main): release')
+    && format('-release-{0}', github.sha) || '' }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'
+    && !startsWith(github.event.head_commit.message, 'chore(main): release')) }}
 
 jobs:
+  # A version tag points at a release commit whose push to main already ran
+  # lint and the tests. The tag run waits for that run and reuses its verdict
+  # rather than test the same commit again; without one it tests as usual.
+  verified:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+    outputs:
+      on-main: ${{ steps.main.outputs.passed }}
+    steps:
+      - id: main
+        name: Checks of this commit on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=$GITHUB_SHA"
+          deadline=$((SECONDS + 25 * 60))
+          while :; do
+            state=$(gh api "$runs" --jq '.workflow_runs
+              | if any(.[]; .conclusion == "success") then "passed"
+                elif any(.[]; .status != "completed") then "running"
+                else "none" end')
+            echo "ci on main for $GITHUB_SHA: $state"
+            if [[ "$state" != running ]] || ((SECONDS > deadline)); then
+              break
+            fi
+            sleep 20
+          done
+          if [[ "$state" == passed ]]; then passed=true; else passed=false; fi
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+
   lint:
+    needs: [verified]
+    if: ${{ !cancelled() && needs.verified.outputs.on-main != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -28,8 +76,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: alpamayo-solutions/colca
-          # colca v0.29.0: log forwarding by level, collapsed and capped repeats, fetchLogs.
-          ref: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
+          ref: ${{ env.COLCA_REF }}
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
@@ -68,6 +115,8 @@ jobs:
         run: scripts/check-no-working-notes.sh "origin/${{ github.base_ref }}"
 
   test:
+    needs: [verified]
+    if: ${{ !cancelled() && needs.verified.outputs.on-main != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -78,36 +127,76 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: chaski
+          # The merge commit and its base, to see what a pull request changes.
+          fetch-depth: 2
+      # A release pull request only moves the version and the changelog; the
+      # release commit is tested on main, where the tag run reuses the verdict.
+      # The job still runs, so the required check reports.
+      - id: scope
+        name: Release notes only
+        working-directory: chaski
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          only=false
+          if [[ "$GITHUB_EVENT_NAME" == pull_request && "$HEAD_REF" == release-please--* ]]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            echo "$changed"
+            notes='^(CHANGELOG\.md|\.release-please-manifest\.json|version\.txt)$'
+            if [[ -n "$changed" ]] && ! grep -qvE "$notes" <<< "$changed"; then
+              only=true
+            fi
+          fi
+          echo "release-notes-only=$only" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: steps.scope.outputs.release-notes-only != 'true'
         with:
           repository: alpamayo-solutions/colca
-          # Same broker revision as lint/contracts above.
-          ref: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
+          ref: ${{ env.COLCA_REF }}
           path: colca
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        if: steps.scope.outputs.release-notes-only != 'true'
         with:
           version: "0.11.17"
+      # The broker and its contracts bundle depend on nothing but the colca commit.
+      - id: broker
+        if: steps.scope.outputs.release-notes-only != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            colca/build/colcad
+            colca/build/bundle/contracts-bundle.json
+          key: colcad-${{ runner.os }}-${{ runner.arch }}-${{ env.COLCA_REF }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        if: steps.scope.outputs.release-notes-only != 'true' && steps.broker.outputs.cache-hit != 'true'
         with:
           go-version-file: colca/go.mod
+          cache-dependency-path: colca/go.sum
       - name: Build broker for consumer conformance tests
+        if: steps.scope.outputs.release-notes-only != 'true' && steps.broker.outputs.cache-hit != 'true'
         working-directory: colca
         run: |
           make bundle
           go build -o build/colcad ./cmd/colcad
       - name: Tests including broker reconnect and recovery
+        if: steps.scope.outputs.release-notes-only != 'true'
         working-directory: chaski
         env:
           COLCAD_BINARY: ${{ github.workspace }}/colca/build/colcad
           COLCAD_CONTRACTS_BUNDLE: ${{ github.workspace }}/colca/build/bundle/contracts-bundle.json
-        run: uv run --python ${{ matrix.python-version }} --extra test pytest
+        # Most of a test waits on a colcad process, so several run at once.
+        run: >-
+          uv run --python ${{ matrix.python-version }} --extra test
+          pytest -n 4 --dist worksteal --durations=30
 
   # Pushes to main and version tags build the package once lint and tests pass;
   # a version tag also publishes a release.
 
   package:
-    needs: [lint, test]
-    if: github.event_name != 'pull_request'
+    needs: [verified, lint, test]
+    if: >-
+      ${{ !cancelled() && github.event_name != 'pull_request' && (needs.verified.outputs.on-main == 'true'
+      || (needs.lint.result == 'success' && needs.test.result == 'success')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -177,7 +266,8 @@ jobs:
 
   release:
     needs: [package]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A skipped lint and test upstream would skip this job by default.
+    if: ${{ !cancelled() && needs.package.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -224,7 +314,9 @@ jobs:
   # environment, so no token is stored anywhere.
   pypi:
     needs: [package]
-    if: startsWith(github.ref, 'refs/tags/v') && github.event.repository.visibility == 'public'
+    if: >-
+      ${{ !cancelled() && needs.package.result == 'success' && startsWith(github.ref, 'refs/tags/v')
+      && github.event.repository.visibility == 'public' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
