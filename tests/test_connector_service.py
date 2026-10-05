@@ -383,6 +383,34 @@ def test_factory_clock_accelerates_reads_and_pause_keeps_heartbeat(node, driver,
     assert 0 < svc.slept[-1] <= 1
 
 
+def test_a_host_clock_stepped_back_wakes_polling_once_it_caught_up(node, driver, monkeypatch):
+    """An operator corrects an edge clock that ran 40 s fast. The application
+    clock refuses timestamps until real time passes the last emitted one, and
+    no clock event announces that moment, so the loop must wake on its own
+    instead of waiting for a change that never comes (Schneeberger 2026-10-05)."""
+    from chaski.clock import Clock as ApplicationClock
+
+    real = Clock()
+    svc = started(node, driver, monkeypatch, clock=real)
+    svc.interval = 1
+    wait = svc.clock.changes.wait_async
+    svc.clock = ApplicationClock(wall=real)
+    svc.clock.changes.wait_async = wait
+    bind(node, svc, "Axis1/Temperature", path="temperature", signal_id="temp")
+    poll(svc)
+    assert len(driver.reads) == 1
+
+    real.now -= 40
+    svc.slept.clear()
+    poll(svc)
+    assert len(driver.reads) == 1
+    assert svc.slept and svc.slept[-1] == pytest.approx(40)
+
+    real.now += svc.slept[-1] + 0.001
+    poll(svc)
+    assert len(driver.reads) == 2
+
+
 @pytest.mark.parametrize("heartbeat", [False, True])
 def test_future_start_wakes_acquisition_and_nothing_else(node, driver, monkeypatch, heartbeat):
     from colca_data_contracts.payload import ClockDefinition

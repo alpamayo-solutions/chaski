@@ -110,6 +110,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from franzmq import Topic
 from franzmq.errors import PublishRejected, PublishTimeout
 
+from .clock import CLOCK_BEHIND
 from .executor import Command, CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
 from .failures import Reject
 from .outage import Outage, expected_failure
@@ -1057,6 +1058,14 @@ class ConnectorService(Service):
                 clock_delay = self.clock.delay_until(clock_status.factory_now + max(self.interval, 1e-6))
                 if clock_delay is not None:
                     delay = clock_delay if delay is None else min(delay, clock_delay)
+            elif self.step is None and clock_status.reason == CLOCK_BEHIND:
+                # The host clock was stepped back behind the last sample (an
+                # operator corrected a clock that ran fast). Nothing notifies the
+                # moment real time catches up, so wake then instead of waiting
+                # for a clock change that never comes.
+                clock_delay = self.clock.delay_until(self.clock.real_now())
+                delay_behind = self.interval if clock_delay is None else max(clock_delay, 0.0)
+                delay = delay_behind if delay is None else min(delay, delay_behind)
             deadline = self.step.wait_delay(delay) if self.step is not None else delay
             await self.clock.changes.wait_async(change_version, deadline, stop=self._stopping)
             return

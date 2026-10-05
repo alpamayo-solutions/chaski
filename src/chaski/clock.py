@@ -31,6 +31,12 @@ def _current_task() -> asyncio.Task | None:
         return None
 
 
+#: ``ClockStatus.reason`` while the host clock is behind the last emitted
+#: timestamp (it was stepped back). Resolves by itself once real time catches
+#: up; no clock event announces that moment.
+CLOCK_BEHIND = "clock moved behind the last emitted timestamp"
+
+
 class ClockNotReady(RuntimeError):
     """Application time is unavailable; keep infrastructure alive and retry."""
 
@@ -242,7 +248,7 @@ class Clock:
             # Expose the problem until real/factory time catches up; do not make
             # up duplicate timestamps by clamping them to the previous sample.
             if self._last is not None and value < self._last - 1e-6:
-                raise ClockNotReady("clock moved behind the last emitted timestamp")
+                raise ClockNotReady(CLOCK_BEHIND)
             self._last = value
             return value
 
@@ -327,7 +333,7 @@ class Clock:
             raise ValueError("timestamp must be finite")
         with self._lock:
             status = self.status()
-            if not status.ready and status.reason != "clock moved behind the last emitted timestamp":
+            if not status.ready and status.reason != CLOCK_BEHIND:
                 return None
             if not status.ready and self._last is not None:
                 timestamp = max(timestamp, self._last)
