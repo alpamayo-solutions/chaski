@@ -58,6 +58,12 @@ def consume(
     fetch or ack is retried with the same backoff as a failed handler. A
     retry waiting out its backoff runs at once when the node's link comes back
     (the door's ``link_up``), and the backoff starts over.
+
+    Without a ``bell`` each stream-change hint's head bounds the drain, and a
+    hint the cursor already passed costs no request
+    (:class:`chaski.stream_changes.StreamChange`). The idle drain is skipped
+    too while the newest hint shows the cursor at the head: it has already
+    walked past every record up to it.
     """
     stop = stop or threading.Event()
     name = consumer or stream.cursor
@@ -80,12 +86,19 @@ def consume(
         elif link.wait_after(since, delay, stop=stop):
             backoff.reset()
 
+    # The subscription the last complete drain started from (see StreamChange.covers).
+    drained_on = None
     try:
         while not stop.is_set():
             seen = bell.generation
             link_seen = link.generation if link is not None else 0
+            change = watch.latest(stream.name) if watch is not None else None
+            if change is not None and change.covers(stream.position, drained_on):
+                # The hint's head is behind the cursor already: nothing to fetch.
+                bell.wait_after(seen, idle_drain_s, stop=stop)
+                continue
             try:
-                _drain(stream, handler, stop, health, reject, name)
+                _drain(stream, handler, stop, health, reject, name, None if change is None else change.head)
             except StreamGapError:
                 raise
             except _HandlerFailed as failed:
@@ -108,6 +121,8 @@ def consume(
                     log.error("%s: reading %s failed; retrying in %.1fs", name, stream.name, delay, exc_info=exc)
                 retry_after(delay, link_seen)
                 continue
+            if change is not None:
+                drained_on = change.subscription
             backoff.reset()
             reading.recovered()
             handling.recovered()
@@ -128,10 +143,11 @@ def _drain(
     health: HandlerHealth,
     reject: RejectFn,
     name: str,
+    head: int | None = None,
 ) -> None:
     current: Record | None = None
     try:
-        for record in stream.drain(stop=stop):
+        for record in stream.drain(stop=stop, head=head):
             current = record
             try:
                 handler(record)

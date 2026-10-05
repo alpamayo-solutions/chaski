@@ -206,6 +206,40 @@ moved by every acknowledgement and set to the head when a drain finds the
 cursor already there, and `stream.wait_caught_up(stream.head(), timeout=2)`
 waits for the consumer to get there.
 
+#### Stream-change hints carry the head
+
+Every `/watch` hint names the streams that grew and each one's next offset.
+`svc.watch_streams(...)` returns the subscription; `watch.latest(stream)` is
+the newest hint for a stream as a `chaski.stream_changes.StreamChange`:
+
+```python
+watch = svc.watch_streams("metrics")
+change = watch.latest("metrics")   # StreamChange(stream="metrics", head=4711, subscription=1)
+```
+
+`head` is the last offset the stream had admitted when the node sent the hint
+(`None` from a node that sends no offset); hints coalesce, so it is the newest
+one. `subscription` counts the established subscriptions and changes on every
+reconnect. It is recorded before the stream's signal rings, so read it after
+capturing the signal's version. `change.covers(position, drained_on)` says
+whether a cursor at `position`, last drained on subscription `drained_on`, has
+nothing to read; `stream.drain(head=change.head)` stops at the hint's head
+without reading the tail first. Any record admitted after it brings another
+hint while the subscription lasts, and a new subscription is always drained
+once, also at the same head.
+
+`svc.consume`, `stream.follow`, the command executor and retained views do
+this themselves when they watch the stream: a hint their cursor already passed
+costs no request, and a drain reads no tail. A consumer handed its own `bell`
+reads the tail as before, and a causal `view.synchronize()` always reads it.
+
+A watch narrowed to `contracts` reports no head (`head=None`), so its
+consumers read the tail: colcad up to 0.29.1 could send a narrowed hint whose
+offset missed the record that woke it. A drain whose first page starts below
+the position known in this process (the node's data was reset or restored)
+follows the node's position, so later acks and hints count again; a retained
+view rebuilds from a fresh snapshot instead.
+
 Run one process per service name on a node. A second process with the same
 name connects with the same MQTT client id; the broker hands the one session
 back and forth, and each process's unsubscribes remove the other's

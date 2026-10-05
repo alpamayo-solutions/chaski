@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from ._wakeup import Wakeup
 from .outage import Outage
@@ -13,25 +15,77 @@ from .retry import Backoff
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class StreamChange:
+    """What the newest hint said about one stream.
+
+    ``head`` is the last offset the stream had admitted when the node sent
+    the hint (the hint's next offset minus one), ``None`` when the node sent
+    no offset or the watch is narrowed to contracts. Hints coalesce, so
+    ``head`` is the newest one, not one per record. ``subscription`` numbers the established subscription that
+    delivered the hint, from 1; it changes on every reconnect.
+    """
+
+    stream: str
+    head: int | None
+    subscription: int
+
+    def covers(self, position: int, drained_on: int | None) -> bool:
+        """Whether a consumer has nothing to read on this hint: its cursor
+        passed ``head`` (``position``) in a drain on the same subscription
+        (``drained_on``, the :attr:`subscription` of the change that drain
+        started from). A new subscription is always drained once: the node
+        may have restarted, and the first hint of a connection names every
+        stream so a reconnect misses nothing."""
+        return self.head is not None and drained_on == self.subscription and position >= self.head
+
+
 class StreamChanges:
     """One subscription fans out to independent durable consumers.
 
     Capture ``signal.version`` before draining, then call ``wait``. Hints may
     coalesce freely; fetching and acknowledging remain the consumer's job.
 
+    Each hint carries the stream's head. :meth:`latest` returns it as a
+    :class:`StreamChange`, recorded before the stream's signal rings, so a
+    consumer reads it after capturing the version: a consumer whose cursor
+    already passed it skips the fetch (:meth:`StreamChange.covers`), and one
+    that drains stops at it instead of reading the tail first. Any record
+    admitted after it brings another hint while the subscription lasts, and a
+    new subscription starts with a hint for every stream.
+
+    ``on_change`` is called on the subscription's thread with the
+    :class:`StreamChange` of every stream a hint named.
+
     ``contracts`` narrows the hints to growth by those contracts. A filtered
     consumer woken only by them leaves its cursor behind the records it skips
     between hints, which holds back the node's pruner; leave it empty unless
-    something else wakes the consumer past them.
+    something else wakes the consumer past them. Such a watch reports no
+    ``head``: colcad up to 0.29.1 read a narrowed hint's offset apart from
+    the growth it announced, so the offset could miss the record that woke
+    it, and no later hint would follow. Its consumers read the tail.
     """
 
-    def __init__(self, door, streams, *, stop=None, disconnected=None, contracts=(), on_change=None):
+    def __init__(
+        self,
+        door,
+        streams: Iterable[str],
+        *,
+        stop: threading.Event | None = None,
+        disconnected: Callable[[], None] | None = None,
+        contracts: Iterable[str] = (),
+        on_change: Callable[[tuple[StreamChange, ...]], object] | None = None,
+    ):
         self.on_change = on_change
         self.door = door
         self.contracts = tuple(contracts)
         self.connected = False
         self.disconnected = disconnected
         self.signals = {name: Wakeup() for name in streams}
+        self._latest: dict[str, StreamChange] = {}
+        self._lock = threading.Lock()
+        #: How many times the subscription was established; 0 before the first.
+        self.subscription = 0
         self.changes = Wakeup()
         #: Rung each time the subscription is established again after it failed.
         self.reconnected = Wakeup()
@@ -45,6 +99,11 @@ class StreamChanges:
     def __getitem__(self, stream):
         return self.signals[stream]
 
+    def latest(self, stream: str) -> StreamChange | None:
+        """The newest hint for ``stream``; ``None`` before the first one."""
+        with self._lock:
+            return self._latest.get(stream)
+
     def _run(self):
         backoff = Backoff()
         outage = Outage(log, f"Stream subscription {', '.join(self.signals)}")
@@ -56,10 +115,14 @@ class StreamChanges:
             error = None
             connected_at = time.monotonic()
             link_seen = link.generation if link is not None else 0
+            subscription = None
             try:
                 for hint in self.door.watch(
                     self.signals, stop=self.stop.is_set, contracts=self.contracts, interval_ms=0
                 ):
+                    if subscription is None:
+                        self.subscription += 1
+                        subscription = self.subscription
                     if failed:
                         failed = False
                         outage.recovered()
@@ -67,12 +130,12 @@ class StreamChanges:
                     self.connected = True
                     if time.monotonic() - connected_at >= 30:
                         backoff.reset()
-                    for stream in hint.streams:
-                        if stream in self.signals:
-                            self.signals[stream].notify()
+                    changes = self._record(hint, subscription)
+                    for change in changes:
+                        self.signals[change.stream].notify()
                     self.changes.notify()
                     if self.on_change is not None:
-                        self.on_change()
+                        self.on_change(changes)
             except Exception as exc:
                 error = exc
                 failed = True
@@ -90,6 +153,20 @@ class StreamChanges:
         self.changes.notify()
         for signal in self.signals.values():
             signal.notify()
+
+    def _record(self, hint, subscription: int) -> tuple[StreamChange, ...]:
+        offsets = getattr(hint, "next", None) or {}
+        changes = []
+        with self._lock:
+            for stream in hint.streams:
+                if stream not in self.signals:
+                    continue
+                following = None if self.contracts else offsets.get(stream)
+                head = None if following is None else max(0, int(following) - 1)
+                change = StreamChange(stream, head, subscription)
+                self._latest[stream] = change
+                changes.append(change)
+        return tuple(changes)
 
     def close(self):
         self.stop.set()

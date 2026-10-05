@@ -155,6 +155,9 @@ class RetainedView:
         self.offsets: dict[str, int] = {}
         self.positions: dict[str, int] = {}
         self._stream_versions: dict[str, int] = {}
+        # Per stream, the subscription of the hint its last complete drain
+        # started from (see StreamChange.covers).
+        self._drained_on: dict[str, int] = {}
         self.initialized = False
         self.available = False
         self.revision = 0
@@ -189,6 +192,7 @@ class RetainedView:
             if head:
                 self.door.ack(stream, self.cursor, head)
         self.positions = heads
+        self._drained_on = {}
         self.initialized = True
         self.revision += 1
         self._applied.ring()
@@ -297,11 +301,15 @@ class RetainedView:
                 if self.on_change is not None:
                     self.on_change()
 
-    def _snapshot(self, streams=None, *, copy_result=True):
+    def _snapshot(self, streams=None, *, copy_result=True, hinted=False):
         """Flush available updates before a causal read, then return a copy.
 
         Background wakeups usually drain first. This final drain also covers a
         dependency completion arriving ahead of its stream-change hint.
+
+        ``hinted`` (the background drain) bounds each stream by the head of its
+        newest hint instead of reading the tail, and skips a stream whose hint
+        the view already applied. A causal read keeps reading the tail.
         """
         with self.lock:
             previous_revision = self.revision
@@ -314,15 +322,37 @@ class RetainedView:
                     self._bootstrap()
                 gap = False
                 for stream in selected:
+                    change = self.watch.latest(stream) if hinted else None
+                    if change is not None and change.covers(
+                        self.positions.get(stream, 0), self._drained_on.get(stream)
+                    ):
+                        continue
                     # Fetch at least once, also at the head: the node counts
                     # unread records by the cursor's last fetch filter, and a
-                    # tail read or an ack does not replace an earlier one.
-                    head = self.door.fetch(stream, self.cursor, max=1, tail=True).next - 1
+                    # tail read or an ack does not replace an earlier one. A
+                    # new subscription is drained once, so this holds.
+                    if change is not None and change.head is not None:
+                        head = change.head
+                    else:
+                        head = self.door.fetch(stream, self.cursor, max=1, tail=True).next - 1
+                    first = True
                     while not self.stop.is_set():
                         page = self.door.fetch(
                             stream, self.cursor, max=1000, contracts=sorted(self.contracts), **self._topics
                         )
-                        if page.gap is not None:
+                        reset = first and page.start is not None and page.start - 1 < self.positions.get(stream, 0)
+                        first = False
+                        if reset:
+                            # The node lost acknowledged records (a reset or
+                            # restore). Entries and per-topic offsets from
+                            # before it would hide newer records at lower
+                            # offsets and keep deleted paths: rebuild.
+                            log.warning(
+                                "Retained view %s: %s restarted below the applied position; rebuilding",
+                                self.cursor,
+                                stream,
+                            )
+                        if reset or page.gap is not None:
                             self.initialized = False
                             gap = True
                             break
@@ -353,6 +383,10 @@ class RetainedView:
                         if ack_offset is None:
                             if page.next <= head:
                                 raise ColcaUnavailable(f"{stream} stopped before its captured head")
+                            if not page.records and page.next - 1 > self.positions.get(stream, 0):
+                                # Nothing after the cursor: it already stands at the head.
+                                self.positions[stream] = page.next - 1
+                                self._applied.ring()
                             break
                         self.door.ack(stream, self.cursor, ack_offset)
                         self.positions[stream] = ack_offset
@@ -361,6 +395,8 @@ class RetainedView:
                             break
                     if gap:
                         break
+                    if change is not None and not self.stop.is_set():
+                        self._drained_on[stream] = change.subscription
                 if not gap and not self.stop.is_set():
                     if not self.available:
                         self.revision += 1
@@ -380,7 +416,7 @@ class RetainedView:
                 s for s in self.streams if not self.available or self.watch[s].version != self._stream_versions.get(s)
             ]
             if streams:
-                self._snapshot(streams, copy_result=False)
+                self._snapshot(streams, copy_result=False, hinted=True)
 
     def _run(self):
         backoff = Backoff()
