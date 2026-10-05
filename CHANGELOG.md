@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.7](https://github.com/alpamayo-solutions/chaski/compare/v0.23.6...v0.23.7) (2026-10-05)
+
+
+### Fixes
+
+* **stream-changes:** carry each hint's head to consumers ([#148](https://github.com/alpamayo-solutions/chaski/issues/148)) ([4e5d5f6](https://github.com/alpamayo-solutions/chaski/commit/4e5d5f6c9aca6935c8765d40d7d4c907e965c2e9))
+
 ## [0.23.6](https://github.com/alpamayo-solutions/chaski/compare/v0.23.5...v0.23.6) (2026-10-05)
 
 
