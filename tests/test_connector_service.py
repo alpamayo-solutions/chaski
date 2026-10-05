@@ -621,9 +621,11 @@ def test_two_signals_may_read_the_same_tag(node, driver, monkeypatch):
 # ── publish on change, precision, heartbeat ────────────────────────────
 
 
-def test_unchanged_measurements_are_preserved_and_heartbeat_only_flips_on_its_interval(node, driver, monkeypatch):
+def test_unchanged_measurements_are_reported_by_exception_and_heartbeat_flips_on_its_interval(
+    node, driver, monkeypatch
+):
     clock = Clock()
-    svc = started(node, driver, monkeypatch, clock=clock, heartbeat_interval=5.0)
+    svc = started(node, driver, monkeypatch, clock=clock, heartbeat_interval=5.0, integrity_interval=60.0)
     bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
     bind(node, svc, HEARTBEAT_TAG_SOURCE, path="line1/heartbeat", signal_id="s-hb")
 
@@ -633,14 +635,12 @@ def test_unchanged_measurements_are_preserved_and_heartbeat_only_flips_on_its_in
 
     poll(svc)
     svc._publish_heartbeat()
-    assert [m.signal_id for _t, m in node.metrics()[2:]] == ["s-temp"], (
-        "the stable measurement is a new observation; the heartbeat is unchanged"
-    )
+    assert node.metrics()[2:] == [], "an unchanged value and an unflipped heartbeat are not sent again"
 
     clock.now += 5.0
     poll(svc)
     svc._publish_heartbeat()
-    assert [m.signal_id for _t, m in node.metrics()[3:]] == ["s-temp", "s-hb"]
+    assert [m.signal_id for _t, m in node.metrics()[2:]] == ["s-hb"]
     assert node.metrics()[-1][1].value != node.metrics()[1][1].value
 
     driver.values["Axis1/Temperature"] = 43.0
@@ -648,7 +648,32 @@ def test_unchanged_measurements_are_preserved_and_heartbeat_only_flips_on_its_in
     assert node.metrics()[-1][1].signal_id == "s-temp" and node.metrics()[-1][1].value == 43.0
 
 
-def test_precision_rounds_values_without_suppressing_observations(node, driver, monkeypatch):
+def test_an_unchanged_value_is_republished_after_the_integrity_interval(node, driver, monkeypatch):
+    clock = Clock()
+    svc = started(node, driver, monkeypatch, clock=clock, integrity_interval=60.0)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+
+    poll(svc)
+    clock.now += 59.0
+    poll(svc)
+    assert [m.signal_id for _t, m in node.metrics()] == ["s-temp"]
+
+    clock.now += 1.0
+    poll(svc)
+    assert [m.signal_id for _t, m in node.metrics()] == ["s-temp", "s-temp"], (
+        "a steady value is sent again once the integrity interval has passed"
+    )
+
+
+def test_report_by_exception_can_be_switched_off(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch, report_by_exception=False)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    poll(svc)
+    poll(svc)
+    assert [m.signal_id for _t, m in node.metrics()] == ["s-temp", "s-temp"]
+
+
+def test_precision_rounds_values_and_decides_what_is_a_change(node, driver, monkeypatch):
     svc = started(node, driver, monkeypatch)
     bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s", precision=1)
     driver.values["Axis1/Temperature"] = 42.04
@@ -657,7 +682,7 @@ def test_precision_rounds_values_without_suppressing_observations(node, driver, 
     poll(svc)
     driver.values["Axis1/Temperature"] = 42.14  # still 42.1: not a change
     poll(svc)
-    assert [m.value for _t, m in node.metrics()] == [42.0, 42.1, 42.1]
+    assert [m.value for _t, m in node.metrics()] == [42.0, 42.1]
 
 
 def test_every_metric_of_one_poll_carries_the_same_timestamp(node, driver, monkeypatch):
