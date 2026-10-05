@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.2](https://github.com/alpamayo-solutions/chaski/compare/v0.23.1...v0.23.2) (2026-10-05)
+
+
+### Fixes
+
+* **connector:** report readings by exception again ([#141](https://github.com/alpamayo-solutions/chaski/issues/141)) ([31dd2c2](https://github.com/alpamayo-solutions/chaski/commit/31dd2c28932487309aeeb85b68fca00669ab1c38))
+* **deps:** accept colca 0.27 ([#139](https://github.com/alpamayo-solutions/chaski/issues/139)) ([56ad693](https://github.com/alpamayo-solutions/chaski/commit/56ad69368e8d41e76ba29add9dc42edd62bedf17))
+
 ## [0.23.1](https://github.com/alpamayo-solutions/chaski/compare/v0.23.0...v0.23.1) (2026-10-04)
 
 
