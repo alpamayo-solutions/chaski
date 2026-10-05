@@ -906,3 +906,21 @@ def test_health_counts_lag_on_live_cursors_only(tmp_path):
         assert svc.cursor_lag == "" and svc._live_cursor_lag() == ""
     finally:
         svc._local_buffer.close()
+
+
+# ─── log volume: per-handler lines are DEBUG, the pass summary is INFO ──────
+
+
+def test_dispatch_pass_logs_one_info_summary_and_per_handler_lines_at_debug(runtime, caplog):
+    """A node re-resolves on every definition change; one INFO line per
+    handler made these lines most of a node's forwarded log volume."""
+    instances = _instantiate(runtime, TickOnlyProducer, EventDrivenProducer)
+    import chaski.dataops.service as service_module
+
+    with caplog.at_level(logging.DEBUG, logger=service_module.log.name):
+        build_dispatch(runtime, instances)
+    per_handler = [r for r in caplog.records if r.getMessage().startswith("Will dispatch")]
+    summaries = [r for r in caplog.records if r.getMessage().startswith("Dispatch bound")]
+    assert per_handler and all(r.levelno == logging.DEBUG for r in per_handler)
+    assert len(summaries) == 1 and summaries[0].levelno == logging.INFO
+    assert "1 handler(s) on 1 signal(s) for 2 producer(s)" in summaries[0].getMessage()
