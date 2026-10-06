@@ -800,10 +800,38 @@ def test_buffer_trim_preserves_a_slow_factory_timer_and_uses_real_health_time(ru
     runtime.buffer.append("sig-event", 9970, -1)
     runtime.buffer.append("sig-event", 9980, 0)
     runtime.buffer.append("sig-event", 9999, 1)
-    runtime.buffer.set_watermark(timer_key(instance, "tick", type(instance)._triggers[0][1]), 1060, "clock-v1")
+    runtime.buffer.set_timer_position(timer_key(instance, "tick", type(instance)._triggers[0][1]), "run", 1060)
     trim_buffer(runtime.buffer, [instance], 10, clock)
     assert runtime.buffer.earliest("sig-tick") == 1040
     assert runtime.buffer.earliest("sig-event") == 9980
+
+
+def test_buffer_trim_ignores_timer_progress_of_another_clock_run(runtime):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski.clock import Clock
+    from chaski.dataops.scheduling import timer_key
+
+    clock = Clock(wall=lambda: 10000)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 9990, 1000, 1000))
+
+    class Timed(Producer):
+        name = "slow_timer"
+        system_element_name = "SE-Event"
+        values = SignalRangeInput("tick_only_signal", window=10)
+
+        @every("10s")
+        async def tick(self):
+            pass
+
+    instance = Timed().attach(runtime)
+    runtime.buffer.append("sig-tick", 1030, 0)
+    runtime.buffer.append("sig-tick", 1040, 1)
+    runtime.buffer.append("sig-tick", 1050, 2)
+    runtime.buffer.set_timer_position(timer_key(instance, "tick", type(instance)._triggers[0][1]), "old-run", 1060)
+    trim_buffer(runtime.buffer, [instance], 10, clock)
+    # This run's timer has not fired yet; it still needs the window from the run's start.
+    assert runtime.buffer.earliest("sig-tick") == 1030
 
 
 # ─── ingest cursors of earlier buffer generations ──────────────────────────

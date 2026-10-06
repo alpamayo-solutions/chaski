@@ -108,7 +108,7 @@ from .buffer import Buffer
 from .ingest import Ingest, consumer_name, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
-from .scheduling import record_rejection, run_due, run_periodic, timer_key
+from .scheduling import first_position, record_rejection, run_due, run_periodic, timer_key
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
@@ -600,12 +600,14 @@ def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float, c
         if definition is not None:
             # Keep the input window needed by the slowest timer, including a
             # newly started timer. Requested speed must never prune its backlog.
-            start = definition.start_at if definition.start_at is not None else definition.factory_anchor
+            now = application_now
             for instance in instances:
                 for method, spec in type(instance)._triggers:
                     if isinstance(spec, CronSpec | IntervalSpec):
-                        progress = buffer.watermark(timer_key(instance, method, spec))
-                        application_now = min(application_now, progress if progress is not None else start)
+                        progress = buffer.timer_position(timer_key(instance, method, spec), definition.run_id)
+                        if progress is None:
+                            progress = first_position(spec, definition, now)
+                        application_now = min(application_now, progress)
         deleted = buffer.trim(
             compute_trim_horizons(instances, retention_s, time_domain="application"), now=application_now
         )

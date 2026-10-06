@@ -779,6 +779,13 @@ window length. It does not make slow hardware run faster.
 
 Completion positions survive restarts. Callbacks must be idempotent because a
 crash between committing an effect and recording completion can replay it.
+DataOps keeps each `@every`/`@cron` callback's last tick per clock run. A
+restart within the run continues after that tick; a tick from another run is
+never continued. Without progress in the run, a callback starts at the run's
+start when it meets the run at its first revision, otherwise at the window it
+enters (the anchor of the definition in force, interval ticks kept on the run's
+grid). Ticks before a worker first takes part in a run are skipped, not caught
+up.
 Missing, inactive, stale or wrong-run dependency progress holds the window.
 `service.report_progress(processed_at)` is available for continuous workers;
 report committed work, never the target clock. Its liveness heartbeat uses real

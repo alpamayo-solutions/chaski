@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import math
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
@@ -22,6 +23,25 @@ log = logging.getLogger(__name__)
 
 def timer_key(instance: Producer, method_name: str, spec: CronSpec | IntervalSpec) -> str:
     return f"__clock__:{instance.name}:{method_name}:{spec!r}"
+
+
+def first_position(spec: CronSpec | IntervalSpec, definition: Any, now: float) -> float:
+    """The tick a timer with no progress in the current clock run counts from.
+
+    At the run's first revision that is the run's start, so a fresh run fires
+    every tick. A worker that meets the run later (it joined late, or its
+    progress came from a release that did not record the run) starts where it
+    enters: the anchor of the definition in force (a coordinated window's
+    start), never after ``now``. Ticks of the run before that are skipped
+    rather than caught up. Interval ticks stay on the run's grid.
+    """
+    start = definition.start_at if definition.start_at is not None else definition.factory_anchor
+    if definition.revision == 1:
+        return start
+    entry = max(start, min(definition.factory_anchor, now))
+    if isinstance(spec, IntervalSpec):
+        return start + math.floor((entry - start) / spec.seconds) * spec.seconds
+    return entry
 
 
 def next_tick(spec: CronSpec | IntervalSpec, previous: float) -> float | None:
@@ -42,14 +62,14 @@ def record_rejection(runtime: Any, consumer: str, subject: dict[str, Any], rejec
     reject(consumer, subject, rejected)
 
 
-def _call(instance: Producer, method_name: str, key: str, due: float) -> None:
-    """Run one tick's callback and commit its progress; a rejected tick is
-    recorded and passed."""
+def _call(instance: Producer, method_name: str, key: str, run_id: str, due: float) -> None:
+    """Run one tick's callback and commit its progress in clock run ``run_id``;
+    a rejected tick is recorded and passed."""
     try:
         asyncio.run(getattr(instance, method_name)())
     except Reject as rejected:
         record_rejection(instance.runtime, f"{instance.name}.{method_name}", {"timer": key, "due": due}, rejected)
-    instance.runtime.buffer.set_watermark(key, due, "clock-v1")
+    instance.runtime.buffer.set_timer_position(key, run_id, due)
 
 
 async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | IntervalSpec, clock: Clock) -> None:
@@ -61,21 +81,25 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
     ``reject``) and passed. Callbacks must use idempotent
     output identities: a crash after output but before progress commits replays
     that tick. A bounded yield gives ingest and health work CPU even at 1000x.
+
+    Progress belongs to the clock run it was made in: a restart within the run
+    continues after the last committed tick; without progress in the run the
+    timer starts at :func:`first_position`.
     """
     key = timer_key(instance, method_name, spec)
-    buffer = instance.runtime.buffer
-    previous = buffer.watermark(key)
-    while previous is None:
+    while True:
         version = clock.changes.version
         try:
             definition = clock.definition
-            previous = (
-                (definition.start_at if definition.start_at is not None else definition.factory_anchor)
-                if definition
-                else clock.now()
-            )
+            if definition is not None:
+                previous = await asyncio.to_thread(instance.runtime.buffer.timer_position, key, definition.run_id)
+                if previous is None:
+                    previous = first_position(spec, definition, clock.now())
+                break
         except ClockNotReady:
-            await clock.changes.wait_async(version)
+            pass
+        await clock.changes.wait_async(version)
+    run_id = definition.run_id
     consumer = f"{instance.name}.{method_name}"
     health = getattr(instance.runtime, "handler_health", None)
     retry = Backoff()
@@ -85,7 +109,7 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
 
         def invoke() -> None:
             with instance._lock, clock.at(due):
-                _call(instance, method_name, key, due)
+                _call(instance, method_name, key, run_id, due)
 
         try:
             worker = asyncio.create_task(asyncio.to_thread(invoke))
@@ -127,7 +151,7 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
     definition = clock.definition
     if definition is None:
         raise ValueError("coordinated callbacks require a clock definition")
-    start = definition.start_at if definition.start_at is not None else definition.factory_anchor
+    run_id = definition.run_id
     while True:
         pending = []
         for instance in instances:
@@ -135,8 +159,10 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
                 if not isinstance(spec, (IntervalSpec, CronSpec)):
                     continue
                 key = timer_key(instance, method_name, spec)
-                previous = instance.runtime.buffer.watermark(key)
-                due = next_tick(spec, previous if previous is not None else start)
+                previous = instance.runtime.buffer.timer_position(key, run_id)
+                if previous is None:
+                    previous = first_position(spec, definition, boundary)
+                due = next_tick(spec, previous)
                 if due is not None and (due <= boundary if inclusive else due < boundary):
                     pending.append((due, instance.name, method_name, instance, key))
         if not pending:
@@ -145,7 +171,7 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
 
         def invoke(instance=instance, due=due, method_name=method_name, key=key) -> None:
             with instance._lock, clock.at(due):
-                _call(instance, method_name, key, due)
+                _call(instance, method_name, key, run_id, due)
 
         worker = asyncio.create_task(asyncio.to_thread(invoke))
         try:
