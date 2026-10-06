@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/alpamayo-solutions/chaski/compare/v0.23.8...v0.24.0) (2026-10-06)
+
+
+### Features
+
+* **service:** publish() states a path's semantic type and description ([#156](https://github.com/alpamayo-solutions/chaski/issues/156)) ([670d582](https://github.com/alpamayo-solutions/chaski/commit/670d5828087581efbf5db77ba6776960465e1318))
+
 ## [0.23.8](https://github.com/alpamayo-solutions/chaski/compare/v0.23.7...v0.23.8) (2026-10-06)
 
 
