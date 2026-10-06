@@ -127,6 +127,21 @@ def test_a_multi_segment_path_binds_under_the_subscribed_mount_and_still_matches
     assert metrics[0].signal_id == "sig-2"
 
 
+def test_publish_carries_the_semantic_type_into_the_catalogue_and_republishes_a_change(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch)
+
+    svc.publish("press3/work_item", "A-1", semantic_type="work_item", description="current order")
+    svc.publish("press3/work_item", "A-2", semantic_type="work_item", description="current order")
+    svc.publish("press3/work_item", "A-3", semantic_type="order")
+
+    catalogues = [p for _t, p in client.published if isinstance(p, DataTags)]
+    assert [c.data_tags[0].meta for c in catalogues] == [
+        {"element": "line1/press3", "semantic_type": "work_item", "description": "current order"},
+        {"element": "line1/press3", "semantic_type": "order", "description": "current order"},
+    ], "an unchanged entry is not republished; a changed semantic type is"
+    assert len({c.data_tags[0].id for c in catalogues}) == 1, "the tag keeps its id"
+
+
 def test_publish_after_binding_goes_straight_to_metric(tmp_path, monkeypatch):
     svc, client = _service(tmp_path, monkeypatch)
     svc.publish("temp", 1.0)

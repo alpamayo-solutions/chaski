@@ -65,6 +65,12 @@ what to enroll. `svc.wait_enrolled(timeout)` waits instead of raising.
 Every path a service publishes becomes a tag in its catalogue. Once the node
 binds a tag to a signal, the values appear in the tree.
 
+A published path can say what it is: `svc.publish("line1/oee", 0.82,
+unit="%", semantic_type="availability", description="share of planned time
+running")`. These travel in the path's catalogue entry; the node applies them
+to the signal it binds and follows later changes. A semantic type names a
+semantic tag the node knows; the node ignores a name it does not know.
+
 ## Write records and send commands
 
 Everything a service writes goes over its MQTT session, at QoS 1 with the

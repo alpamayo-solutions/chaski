@@ -11,7 +11,8 @@ One constructor, ``Service(name, mount="", *, node=None, ...)``, where
 * ``node=LocalDoor(...)``: an embedded node's local door, passed by
   ``chaski.Node.service()``.
 
-``publish(path, value, unit=, timestamp=)`` works the same on every door.
+``publish(path, value, unit=, timestamp=, semantic_type=, description=)``
+works the same on every door.
 Each path becomes a ``DataTag`` (see ``catalogue.py``), the catalogue is
 republished when it changes, and each sample is written as a ``_Metric`` for
 the Signal the node bound to its tag. Samples for a path without a Signal are
@@ -1336,8 +1337,16 @@ class Service:
         *,
         unit: str | None = None,
         timestamp: Any | None = None,
+        semantic_type: str | None = None,
+        description: str | None = None,
     ) -> None:
         """Publish one sample at ``path``.
+
+        ``unit``, ``semantic_type`` (the name of a semantic tag the node
+        knows, such as ``availability``) and ``description`` travel in the
+        path's catalogue entry. The node applies them to the signal it binds
+        and follows later changes: a call naming a different value updates
+        the entry; one naming none keeps what the entry says.
 
         The first call for a never-seen ``path`` mints a DataTag and grows
         the catalogue (republished immediately); every call resolves the
@@ -1351,7 +1360,9 @@ class Service:
             raise RuntimeError("chaski.Service: call start() (or use `with Service(...) as svc:`) before publish()")
         timestamp = self.clock.now() if timestamp is None else _epoch(timestamp)
         with self._lock:
-            tag_id, _changed = self._started_catalogue.ensure(path, value, unit)
+            tag_id, _changed = self._started_catalogue.ensure(
+                path, value, unit, semantic_type=semantic_type, description=description
+            )
             self._seen.add(path)
             catalogue = self._catalogue_to_publish()
             bound = self._bindings_for(tag_id)
