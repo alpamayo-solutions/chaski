@@ -63,6 +63,32 @@ def test_ensure_emits_the_mount_joined_element_and_the_unit_for_a_published_path
     assert tag.name == "temp" and tag.source == "press3/temp" and tag.data_type == "float"
 
 
+def test_ensure_emits_the_semantic_type_and_description_a_published_path_names():
+    cat = Catalogue(connector="svc1", mount="line1")
+    cat.ensure("press3/work_item", "A-1", semantic_type="work_item", description="current order")
+    tag = cat.tag("press3/work_item")
+    assert tag is not None
+    assert tag.meta == {"element": "line1/press3", "semantic_type": "work_item", "description": "current order"}
+
+
+def test_a_changed_semantic_type_updates_the_tag_and_an_omitted_one_keeps_it():
+    # The node retags the bound signal when the catalogue entry changes, so a
+    # changed semantic type has to change the entry and mark it for republish.
+    cat = Catalogue(connector="svc1")
+    tag_id, _ = cat.ensure("press3/state", "run", unit="s", semantic_type="state")
+    cat.record_published(cat.revision())
+
+    assert cat.ensure("press3/state", "run", semantic_type="state") == (tag_id, False)
+    assert cat.ensure("press3/state", "stop") == (tag_id, False), "naming none keeps the entry"
+    assert not cat.dirty
+
+    assert cat.ensure("press3/state", "run", semantic_type="work_item") == (tag_id, True)
+    assert cat.dirty
+    tag = cat.tag("press3/state")
+    assert tag is not None
+    assert tag.meta == {"element": "press3", "unit": "s", "semantic_type": "work_item"}
+
+
 def test_ensure_emits_no_element_for_a_top_level_path_on_a_mounted_catalogue():
     # Without a parent there is no meta.element; the node places the tag at
     # the service's mount by default.

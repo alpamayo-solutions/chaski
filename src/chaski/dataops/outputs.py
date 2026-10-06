@@ -42,6 +42,7 @@ from colca_data_contracts import (
 )
 from franzmq import Topic
 
+from ..catalogue import tag_meta
 from . import resolve
 from .base import runtime_now
 from .inputs import _PerInstance
@@ -65,24 +66,13 @@ def _epoch(ts: Any) -> float:
 
 
 def _catalogue_meta(output: SignalOutput) -> dict[str, Any]:
-    """What a catalogue entry says about an output beyond its name and type.
-
-    ``element`` is the node-local path the node places the signal under, so
-    one service can compute for several machines. ``unit``,
-    ``semantic_type`` and ``description`` are applied to the signal the node
-    binds to the tag, and updated there when they change. Each is left out
-    when the output names none.
-    """
-    meta: dict[str, Any] = {}
-    if output.description:
-        meta["description"] = output.description
-    if output.system_element_name:
-        meta["element"] = output.system_element_name
-    if output.unit:
-        meta["unit"] = output.unit
-    if output.semantic_type:
-        meta["semantic_type"] = output.semantic_type
-    return meta
+    """The catalogue entry's meta for an output (see :func:`tag_meta`)."""
+    return tag_meta(
+        element=output.system_element_name,
+        unit=output.unit,
+        semantic_type=output.semantic_type,
+        description=output.description,
+    )
 
 
 class SignalOutput(_PerInstance):

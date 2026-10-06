@@ -3,8 +3,9 @@
 A catalogue is the set of sources a service offers, each with an id that stays
 the same for as long as the source is known. It grows in two ways:
 
-* ``ensure(path, value, unit)``, the ``publish()`` path: a new path mints a
-  tag, a stale one is revived.
+* ``ensure(path, value, ...)``, the ``publish()`` path: a new path mints a
+  tag, a stale one is revived, and a changed unit, semantic type or
+  description updates the tag.
 * ``declare(tags)``, the discovery path (``ConnectorService``): ids are reused
   by ``source``, new sources mint, and a vanished source stays in the catalogue
   marked ``is_stale`` so a Signal bound to it stays bound.
@@ -48,6 +49,32 @@ def element_for(path: str, mount: str = "") -> str:
     if not mount:
         return parent
     return f"{mount}/{parent}"
+
+
+def tag_meta(
+    *,
+    element: str | None = None,
+    unit: str | None = None,
+    semantic_type: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """What a catalogue entry says about a source beyond its name and type.
+
+    ``element`` is the node-local path the node places the signal under.
+    ``unit``, ``semantic_type`` (the name or id of a semantic tag the node
+    knows) and ``description`` are applied to the signal the node binds to
+    the tag, and updated there when they change. Each is left out when empty.
+    """
+    meta: dict[str, Any] = {}
+    if description:
+        meta["description"] = description
+    if element:
+        meta["element"] = element
+    if unit:
+        meta["unit"] = unit
+    if semantic_type:
+        meta["semantic_type"] = semantic_type
+    return meta
 
 
 def _tag_from_record(raw: Mapping[str, Any]) -> DataTag:
@@ -111,20 +138,25 @@ class Catalogue:
 
     # -- the two mutators ------------------------------------------------
 
-    def ensure(self, path: str, value: Any, unit: str | None = None) -> tuple[str, bool]:
+    def ensure(
+        self,
+        path: str,
+        value: Any,
+        unit: str | None = None,
+        *,
+        semantic_type: str | None = None,
+        description: str | None = None,
+    ) -> tuple[str, bool]:
         """The ``publish()`` path: return ``(tag_id, changed)`` for ``path``,
         minting a tag the first time the path is seen or reviving a stale
-        one. ``data_type`` is inferred from the first value; ``unit`` lands
-        in ``meta.unit``; a multi-segment path's parent becomes
-        ``meta.element`` (node-local)."""
+        one. ``data_type`` is inferred from the first value; a multi-segment
+        path's parent becomes ``meta.element`` (node-local); ``unit``,
+        ``semantic_type`` and ``description`` land in ``meta`` (see
+        :func:`tag_meta`). A later call naming a different value replaces it;
+        one naming none leaves the stored value as it is."""
+        stated = tag_meta(unit=unit, semantic_type=semantic_type, description=description)
         tag = self._tags.get(path)
         if tag is None:
-            meta: dict[str, Any] = {}
-            element = element_for(path, self.mount)
-            if element:
-                meta["element"] = element
-            if unit is not None:
-                meta["unit"] = unit
             tag = DataTag(
                 id=str(ulid_lib.new()),
                 name=path.rsplit("/", 1)[-1],
@@ -133,7 +165,7 @@ class Catalogue:
                 is_readable=True,
                 data_type=infer_data_type(value),
                 is_stale=False,
-                meta=meta,
+                meta=tag_meta(element=element_for(path, self.mount)) | stated,
             )
             self._tags[path] = tag
             self.dirty = True
@@ -144,8 +176,8 @@ class Catalogue:
             data_type = infer_data_type(value)
             changed = True
         meta = dict(tag.meta)
-        if unit is not None and meta.get("unit") != unit:
-            meta["unit"] = unit
+        if any(meta.get(key) != value for key, value in stated.items()):
+            meta.update(stated)
             changed = True
         if changed:
             self._tags[path] = replace(tag, is_stale=False, data_type=data_type, meta=meta)
