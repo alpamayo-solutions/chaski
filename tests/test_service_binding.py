@@ -70,7 +70,9 @@ class _FakeClient:
         raise AssertionError(f"no subscription matches {topic_str!r}: {list(self.subscriptions)}")
 
 
-def _service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "line1") -> tuple[Service, _FakeClient]:
+def _service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "line1", start: bool = True
+) -> tuple[Service, _FakeClient]:
     client = _FakeClient()
     identity = LocalServiceIdentity(
         service_id="svc-ulid",
@@ -83,7 +85,8 @@ def _service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mount: str = "l
     monkeypatch.setattr("chaski.service.connect_local_mqtt", lambda *a, **k: (client, identity))
     monkeypatch.setattr("chaski.service.attach_log_publisher", lambda *a, **k: None)
     svc = Service("svc1", mount, state_dir=tmp_path)
-    svc.start()
+    if start:
+        svc.start()
     return svc, client
 
 
@@ -140,6 +143,76 @@ def test_publish_carries_the_semantic_type_into_the_catalogue_and_republishes_a_
         {"element": "line1/press3", "semantic_type": "order", "description": "current order"},
     ], "an unchanged entry is not republished; a changed semantic type is"
     assert len({c.data_tags[0].id for c in catalogues}) == 1, "the tag keeps its id"
+
+
+def _catalogues(client: _FakeClient) -> list[DataTags]:
+    return [p for _t, p in client.published if isinstance(p, DataTags)]
+
+
+def test_a_path_declared_before_start_is_in_the_catalogue_published_at_start(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch, start=False)
+
+    svc.declare("events/order_closed", data_type="string", description="an order closed")
+    assert not client.published, "nothing is sent before start"
+    svc.start()
+
+    (catalogue,) = _catalogues(client)
+    (tag,) = catalogue.data_tags
+    assert (tag.source, tag.name, tag.data_type, tag.is_stale) == (
+        "events/order_closed",
+        "order_closed",
+        "string",
+        False,
+    )
+    assert tag.meta == {"element": "line1/events", "description": "an order closed"}
+    assert not [p for _t, p in client.published if isinstance(p, Metric)], "a declaration carries no sample"
+
+
+def test_a_path_declared_after_start_republishes_the_catalogue_once(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch)
+
+    svc.declare("events/a", data_type="string")
+    svc.declare("events/a", data_type="string")
+    svc.declare("events/b", data_type="json", semantic_type="event")
+
+    catalogues = _catalogues(client)
+    assert [[t.source for t in c.data_tags] for c in catalogues] == [["events/a"], ["events/a", "events/b"]]
+    assert catalogues[1].data_tags[1].data_type == "json"
+    assert catalogues[1].data_tags[1].meta["semantic_type"] == "event"
+
+
+def test_a_publish_on_a_declared_path_uses_its_tag_and_the_signal_bound_before_the_first_sample(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch, start=False)
+    svc.declare("events/order_closed", data_type="string")
+    svc.start()
+    tag_id = _minted_tag_id(client)
+    # The node binds the declared tag before any value exists.
+    signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "events", "order_closed"))
+    client.deliver(signal_topic, Signal(id="sig-ev", name="order_closed", data_tag=tag_id, is_published=True))
+
+    svc.publish("events/order_closed", '{"order": 1}')
+
+    assert len(_catalogues(client)) == 1, "the publish did not change the declared entry"
+    drained(svc)
+    metrics = [p for _t, p in client.published if isinstance(p, Metric)]
+    assert [(m.signal_id, m.value) for m in metrics] == [("sig-ev", '{"order": 1}')]
+
+
+def test_a_declared_path_is_not_staled_at_close(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch)
+    svc.declare("events/quiet", data_type="string")
+
+    svc.close()
+
+    assert all(not tag.is_stale for tag in _catalogues(client)[-1].data_tags)
+
+
+def test_declare_refuses_a_data_type_signals_do_not_have(tmp_path, monkeypatch):
+    svc, client = _service(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="unknown data_type 'text'"):
+        svc.declare("events/x", data_type="text")
+    assert not _catalogues(client)
 
 
 def test_publish_after_binding_goes_straight_to_metric(tmp_path, monkeypatch):

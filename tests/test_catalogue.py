@@ -147,6 +147,77 @@ def test_a_revived_path_is_un_staled_and_reported_as_changed():
     assert cat.tag_id("flaky") == tag_id
 
 
+# -- the Service.declare() path: ensure_declared -----------------------------
+
+
+def test_ensure_declared_makes_the_entry_a_publish_would_with_the_stated_type():
+    cat = Catalogue(connector="svc1", mount="line1")
+
+    tag_id, changed = cat.ensure_declared(
+        "events/order_closed", "string", unit="s", semantic_type="event", description="an order closed"
+    )
+
+    assert changed and cat.dirty and ULID.fullmatch(tag_id)
+    tag = cat.tag("events/order_closed")
+    assert tag is not None
+    assert (tag.name, tag.data_type, tag.is_stale, tag.is_readable, tag.is_writable) == (
+        "order_closed",
+        "string",
+        False,
+        True,
+        False,
+    )
+    assert tag.meta == {
+        "element": "line1/events",
+        "unit": "s",
+        "semantic_type": "event",
+        "description": "an order closed",
+    }
+
+
+def test_ensure_declared_again_changes_nothing_and_a_later_publish_keeps_the_id_and_type():
+    cat = Catalogue(connector="svc1")
+    tag_id, _ = cat.ensure_declared("events/count", "float", description="events so far")
+    cat.record_published(cat.revision())
+
+    assert cat.ensure_declared("events/count", "float", description="events so far") == (tag_id, False)
+    # A sample of another Python type must not retype a declared path.
+    assert cat.ensure("events/count", 3) == (tag_id, False)
+    assert not cat.dirty
+    tag = cat.tag("events/count")
+    assert tag is not None and tag.data_type == "float"
+
+
+def test_ensure_declared_replaces_a_type_inferred_by_an_earlier_publish_and_keeps_the_id():
+    cat = Catalogue(connector="svc1")
+    tag_id, _ = cat.ensure("ratio", 1)
+    cat.record_published(cat.revision())
+
+    assert cat.ensure_declared("ratio", "float") == (tag_id, True)
+    assert cat.dirty
+    tag = cat.tag("ratio")
+    assert tag is not None and tag.data_type == "float"
+
+
+def test_ensure_declared_revives_a_stale_path_with_the_same_id():
+    cat = Catalogue(connector="svc1")
+    tag_id, _ = cat.ensure_declared("events/x", "string")
+    cat.seal(seen=set())
+
+    assert cat.ensure_declared("events/x", "string") == (tag_id, True)
+    assert cat.data_tags()[0].is_stale is False
+
+
+def test_ensure_declared_keeps_the_id_from_the_retained_record_across_a_restart():
+    first = Catalogue(connector="svc1")
+    tag_id, _ = first.ensure_declared("events/x", "string")
+    second = Catalogue(connector="svc1")
+    second.load_previous(_retained(first))
+
+    assert second.ensure_declared("events/x", "string") == (tag_id, False)
+    assert second.revision() == second.last_published_revision, "an unchanged catalogue is not republished"
+
+
 # -- the discovery path: declare -----------------------------------------
 
 

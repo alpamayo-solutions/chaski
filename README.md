@@ -71,6 +71,12 @@ running")`. These travel in the path's catalogue entry; the node applies them
 to the signal it binds and follows later changes. A semantic type names a
 semantic tag the node knows; the node ignores a name it does not know.
 
+A path can be in the catalogue before its first value:
+`svc.declare("events/order_closed", data_type="string", description="...")`
+adds the entry without a sample, so the node binds a signal to it at once.
+With no value to infer from, the data type is stated. Declare before or after
+`start()`; a later `publish()` on the path uses the same tag.
+
 ## Write records and send commands
 
 Everything a service writes goes over its MQTT session, at QoS 1 with the

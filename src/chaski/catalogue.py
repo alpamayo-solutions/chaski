@@ -1,11 +1,14 @@
 """The DataTag catalogue every :class:`chaski.Service` publishes.
 
 A catalogue is the set of sources a service offers, each with an id that stays
-the same for as long as the source is known. It grows in two ways:
+the same for as long as the source is known. It grows in three ways:
 
 * ``ensure(path, value, ...)``, the ``publish()`` path: a new path mints a
   tag, a stale one is revived, and a changed unit, semantic type or
   description updates the tag.
+* ``ensure_declared(path, data_type, ...)``, the ``Service.declare()`` path:
+  the same as ``ensure`` without a sample, so the data type is stated rather
+  than inferred, and a stated type replaces the stored one.
 * ``declare(tags)``, the discovery path (``ConnectorService``): ids are reused
   by ``source``, new sources mint, and a vanished source stays in the catalogue
   marked ``is_stale`` so a Signal bound to it stays bound.
@@ -136,7 +139,7 @@ class Catalogue:
         # same tag ids.
         self.dirty = migrated
 
-    # -- the two mutators ------------------------------------------------
+    # -- the mutators ------------------------------------------------
 
     def ensure(
         self,
@@ -155,6 +158,29 @@ class Catalogue:
         :func:`tag_meta`). A later call naming a different value replaces it;
         one naming none leaves the stored value as it is."""
         stated = tag_meta(unit=unit, semantic_type=semantic_type, description=description)
+        return self._upsert(path, infer_data_type(value), stated, state_type=False)
+
+    def ensure_declared(
+        self,
+        path: str,
+        data_type: str,
+        *,
+        unit: str | None = None,
+        semantic_type: str | None = None,
+        description: str | None = None,
+    ) -> tuple[str, bool]:
+        """The ``Service.declare()`` path: :meth:`ensure` without a sample.
+        ``data_type`` is stated, so it replaces a stored type that differs;
+        a later :meth:`ensure` keeps it whatever value it sees. Returns
+        ``(tag_id, changed)``; the id is the one :meth:`ensure` returns for
+        the same path."""
+        stated = tag_meta(unit=unit, semantic_type=semantic_type, description=description)
+        return self._upsert(path, data_type, stated, state_type=True)
+
+    def _upsert(self, path: str, data_type: str, stated: dict[str, Any], *, state_type: bool) -> tuple[str, bool]:
+        """Mint, revive or update the tag for ``path``. ``data_type`` fills a
+        tag that has none; with ``state_type`` it also replaces one that
+        differs."""
         tag = self._tags.get(path)
         if tag is None:
             tag = DataTag(
@@ -163,7 +189,7 @@ class Catalogue:
                 source=path,
                 is_writable=False,
                 is_readable=True,
-                data_type=infer_data_type(value),
+                data_type=data_type,
                 is_stale=False,
                 meta=tag_meta(element=element_for(path, self.mount)) | stated,
             )
@@ -171,10 +197,10 @@ class Catalogue:
             self.dirty = True
             return tag.id, True
         changed = tag.is_stale
-        data_type = tag.data_type
-        if data_type is None:
-            data_type = infer_data_type(value)
+        if tag.data_type is None or (state_type and tag.data_type != data_type):
             changed = True
+        else:
+            data_type = tag.data_type
         meta = dict(tag.meta)
         if any(meta.get(key) != value for key, value in stated.items()):
             meta.update(stated)
