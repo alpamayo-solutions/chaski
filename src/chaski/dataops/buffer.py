@@ -2,7 +2,8 @@
 
 One file under the service's data directory. ``points`` (the
 retained window per input signal), ``watermarks`` (replay progress per
-producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
+producer), ``timers`` (each factory-time callback's last tick, per clock run),
+``meta`` (the store's ``generation``), and ``emitted_annotations``
 (the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
 its own), ``backfill_jobs`` (each backfill's range and committed position, see
 :mod:`chaski.dataops.backfill`), and ``pending_outputs`` (computed samples waiting for a signal binding
@@ -62,6 +63,12 @@ CREATE TABLE IF NOT EXISTS watermarks (
     producer  TEXT PRIMARY KEY,
     position  REAL,
     code_hash TEXT
+);
+
+CREATE TABLE IF NOT EXISTS timers (
+    timer    TEXT PRIMARY KEY,
+    run_id   TEXT NOT NULL,
+    position REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS command_ledger (
@@ -130,10 +137,13 @@ class Buffer:
         self.generation: str = self._load_or_mint_generation()
 
     def _upgrade(self) -> None:
-        """Add the columns a buffer written by an older release lacks."""
+        """Bring a buffer written by an older release to the current schema."""
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(backfill_jobs)")}
         if "window_s" not in columns:
             self._conn.execute("ALTER TABLE backfill_jobs ADD COLUMN window_s REAL")
+        # Older releases kept factory-callback progress in ``watermarks`` without
+        # the clock run it belongs to; no run can continue it.
+        self._conn.execute("DELETE FROM watermarks WHERE substr(producer, 1, 10) = '__clock__:'")
 
     def checkpoint(self, producer: str):
         """Return a producer's versioned JSON state and handled input offsets."""
@@ -442,6 +452,31 @@ class Buffer:
                 "ON CONFLICT(producer) DO UPDATE SET "
                 "position = excluded.position, code_hash = excluded.code_hash",
                 (producer, position, code_hash),
+            )
+            self._conn.commit()
+
+    # ------------------------------------------------------------------ timers
+
+    def timer_position(self, timer: str, run_id: str) -> float | None:
+        """The last tick ``timer`` committed in clock run ``run_id``.
+
+        ``None`` if it has not fired in that run yet; a position written in
+        another run is never continued.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT position FROM timers WHERE timer = ? AND run_id = ?", (timer, run_id)
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def set_timer_position(self, timer: str, run_id: str, position: float) -> None:
+        """Commit ``timer``'s tick at ``position`` in clock run ``run_id``,
+        replacing whatever an earlier run left."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO timers (timer, run_id, position) VALUES (?, ?, ?) "
+                "ON CONFLICT(timer) DO UPDATE SET run_id = excluded.run_id, position = excluded.position",
+                (timer, run_id, position),
             )
             self._conn.commit()
 
