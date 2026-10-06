@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.8](https://github.com/alpamayo-solutions/chaski/compare/v0.23.7...v0.23.8) (2026-10-06)
+
+
+### Fixes
+
+* **dataops:** scope factory-timer progress to the clock run ([#154](https://github.com/alpamayo-solutions/chaski/issues/154)) ([5ae3864](https://github.com/alpamayo-solutions/chaski/commit/5ae386458f2db2ce25bfef84f1d06fd0ac4f7eb6))
+
 ## [0.23.7](https://github.com/alpamayo-solutions/chaski/compare/v0.23.6...v0.23.7) (2026-10-05)
 
 
