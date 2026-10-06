@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/alpamayo-solutions/chaski/compare/v0.24.0...v0.25.0) (2026-10-06)
+
+
+### Features
+
+* **service:** declare a path's catalogue entry before its first sample ([#158](https://github.com/alpamayo-solutions/chaski/issues/158)) ([fd89a57](https://github.com/alpamayo-solutions/chaski/commit/fd89a57b5d541796c8a5604d8e4393217a038c05))
+
 ## [0.24.0](https://github.com/alpamayo-solutions/chaski/compare/v0.23.8...v0.24.0) (2026-10-06)
 
 
