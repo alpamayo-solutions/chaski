@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import math
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
 
-from chaski.clock import Clock
+from chaski.clock import Clock, ClockNotReady
 from chaski.failures import Reject
 from chaski.outage import Outage, warn_failure
 from chaski.retry import Backoff
@@ -24,9 +25,23 @@ def timer_key(instance: Producer, method_name: str, spec: CronSpec | IntervalSpe
     return f"__clock__:{instance.name}:{method_name}:{spec!r}"
 
 
-def run_start(definition: Any) -> float:
-    """Where a clock run's callbacks start when they have not fired in it yet."""
-    return definition.start_at if definition.start_at is not None else definition.factory_anchor
+def first_position(spec: CronSpec | IntervalSpec, definition: Any, now: float) -> float:
+    """The tick a timer with no progress in the current clock run counts from.
+
+    At the run's first revision that is the run's start, so a fresh run fires
+    every tick. A worker that meets the run later (it joined late, or its
+    progress came from a release that did not record the run) starts where it
+    enters: the anchor of the definition in force (a coordinated window's
+    start), never after ``now``. Ticks of the run before that are skipped
+    rather than caught up. Interval ticks stay on the run's grid.
+    """
+    start = definition.start_at if definition.start_at is not None else definition.factory_anchor
+    if definition.revision == 1:
+        return start
+    entry = max(start, min(definition.factory_anchor, now))
+    if isinstance(spec, IntervalSpec):
+        return start + math.floor((entry - start) / spec.seconds) * spec.seconds
+    return entry
 
 
 def next_tick(spec: CronSpec | IntervalSpec, previous: float) -> float | None:
@@ -68,17 +83,23 @@ async def run_periodic(instance: Producer, method_name: str, spec: CronSpec | In
     that tick. A bounded yield gives ingest and health work CPU even at 1000x.
 
     Progress belongs to the clock run it was made in: a restart within the run
-    continues after the last committed tick, a new run starts at its own start.
+    continues after the last committed tick; without progress in the run the
+    timer starts at :func:`first_position`.
     """
     key = timer_key(instance, method_name, spec)
-    while (definition := clock.definition) is None:
+    while True:
         version = clock.changes.version
-        if clock.definition is None:
-            await clock.changes.wait_async(version)
+        try:
+            definition = clock.definition
+            if definition is not None:
+                previous = await asyncio.to_thread(instance.runtime.buffer.timer_position, key, definition.run_id)
+                if previous is None:
+                    previous = first_position(spec, definition, clock.now())
+                break
+        except ClockNotReady:
+            pass
+        await clock.changes.wait_async(version)
     run_id = definition.run_id
-    previous = await asyncio.to_thread(instance.runtime.buffer.timer_position, key, run_id)
-    if previous is None:
-        previous = run_start(definition)
     consumer = f"{instance.name}.{method_name}"
     health = getattr(instance.runtime, "handler_health", None)
     retry = Backoff()
@@ -130,7 +151,7 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
     definition = clock.definition
     if definition is None:
         raise ValueError("coordinated callbacks require a clock definition")
-    run_id, start = definition.run_id, run_start(definition)
+    run_id = definition.run_id
     while True:
         pending = []
         for instance in instances:
@@ -139,7 +160,9 @@ async def run_due(instances: list[Producer], clock: Clock, boundary: float, *, i
                     continue
                 key = timer_key(instance, method_name, spec)
                 previous = instance.runtime.buffer.timer_position(key, run_id)
-                due = next_tick(spec, previous if previous is not None else start)
+                if previous is None:
+                    previous = first_position(spec, definition, boundary)
+                due = next_tick(spec, previous)
                 if due is not None and (due <= boundary if inclusive else due < boundary):
                     pending.append((due, instance.name, method_name, instance, key))
         if not pending:
