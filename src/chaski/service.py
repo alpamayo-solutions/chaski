@@ -81,6 +81,7 @@ from colca_data_contracts.payload import (
     Metric,
     ServiceDetails,
     ServiceType,
+    SignalDataType,
     TimeSync,
 )
 from colca_data_contracts.payload import Signal as SignalRecord
@@ -609,6 +610,9 @@ class Service:
         self._connect_outcome: Any = None
         self._unbound_log_at: dict[str, float] = {}
         self._seen: set[str] = set()
+        # What declare() was told, path -> its arguments: applied to the
+        # catalogue at start (and at once when already started).
+        self._declared: dict[str, dict[str, Any]] = {}
         self._last_status = "healthy"
         self._last_detail = ""
         # What status() was last told, combined with handler_health into what
@@ -685,18 +689,26 @@ class Service:
             else:
                 self._readiness = Readiness("failed", f"{type(exc).__name__}: {exc}", attempts)
             raise
-        if (self._state_dir / "pending-samples.sqlite3").exists():
+        has_pending = (self._state_dir / "pending-samples.sqlite3").exists()
+        if self._declared or has_pending:
             with self._lock:
-                self._open_pending()
-                pending = cast(PendingSamples, self._pending_samples)
-                for path in self._pending_sources:
-                    _, value, _, unit = pending.page(path, 1)[0]
-                    self._started_catalogue.ensure(path, value, unit)
+                # Declared paths first, so a buffered sample does not decide
+                # a declared path's data type.
+                for path, declared in self._declared.items():
+                    self._started_catalogue.ensure_declared(path, **declared)
                     self._seen.add(path)
+                if has_pending:
+                    self._open_pending()
+                    pending = cast(PendingSamples, self._pending_samples)
+                    for path in self._pending_sources:
+                        _, value, _, unit = pending.page(path, 1)[0]
+                        self._started_catalogue.ensure(path, value, unit)
+                        self._seen.add(path)
                 catalogue = self._catalogue_to_publish()
             if catalogue is not None:
                 self._publish_catalogue(catalogue)
-            self._pending_wake.notify()
+            if has_pending:
+                self._pending_wake.notify()
         self._readiness = Readiness("ready", "", attempts)
         return self
 
@@ -1329,6 +1341,55 @@ class Service:
         )
 
     # -- publishing --------------------------------------------------------
+
+    def declare(
+        self,
+        path: str,
+        *,
+        data_type: str,
+        unit: str | None = None,
+        semantic_type: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        """Announce ``path`` in this service's catalogue without a sample.
+
+        The catalogue entry is the one :meth:`publish` makes for ``path``, so
+        the node can bind a Signal to it before the first value: a later
+        ``publish(path, ...)`` uses the same tag and keeps ``data_type``.
+        With no sample to infer it from, ``data_type`` is stated: a Signal
+        data type such as ``"string"``, ``"float"``, ``"int"``,
+        ``"boolean"`` or ``"json"``. ``unit``, ``semantic_type`` and
+        ``description`` are as for :meth:`publish`.
+
+        Before :meth:`start` the declaration is kept and published with the
+        catalogue at start; after it the catalogue is republished at once.
+        Declaring the same thing again publishes nothing; declaring
+        something different updates the entry. A declared path stays in the
+        catalogue for the run, like a published one.
+        """
+        if self._closed:
+            raise RuntimeError("chaski.Service is closed")
+        try:
+            stated_type = SignalDataType(data_type).value
+        except ValueError:
+            known = ", ".join(member.value for member in SignalDataType)
+            raise ValueError(f"chaski.Service.declare: unknown data_type {data_type!r}; use one of {known}") from None
+        declared: dict[str, Any] = {
+            "data_type": stated_type,
+            "unit": unit,
+            "semantic_type": semantic_type,
+            "description": description,
+        }
+        with self._lock:
+            self._declared[path] = declared
+            if self._client is None or self._catalogue is None:
+                return
+            self._started_catalogue.ensure_declared(path, **declared)
+            self._seen.add(path)
+            catalogue = self._catalogue_to_publish()
+        # Outside the lock — see _publish_outside_the_lock.
+        if catalogue is not None:
+            self._publish_catalogue(catalogue)
 
     def publish(
         self,
