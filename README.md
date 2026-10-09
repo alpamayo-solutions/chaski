@@ -256,7 +256,7 @@ Run one process per service name on a node. A second process with the same
 name connects with the same MQTT client id; the broker hands the one session
 back and forth, and each process's unsubscribes remove the other's
 subscriptions, so consumers stop being woken. Both processes log an error on
-every takeover, report `unhealthy` in their `_ServiceDetails`, and fail their
+every takeover, export unhealthy runtime telemetry, and fail their
 health door; `svc.identity_conflict` says why until no takeover has followed
 for 60 s. chaski does not pick which process stops.
 
@@ -801,7 +801,13 @@ up.
 Missing, inactive, stale or wrong-run dependency progress holds the window.
 `service.report_progress(processed_at)` is available for continuous workers;
 report committed work, never the target clock. Its liveness heartbeat uses real
-time and continues while a run is paused.
+time and continues while a run is paused. Completion and live readiness use
+ordered `_ClockProgress` control records. Retained replay and duplicate control
+records do not renew readiness. `_ServiceDetails` contains registration and
+discovery and is published on registration changes and reconnect, rather than
+on a runtime timer. Runtime observations go to a deployment's exporter through
+`ServiceTelemetry.service_health()` and `ServiceTelemetry.clock_progress()`;
+connector `Telemetry` includes these hooks.
 
 The execution gate and clock waits wake on MQTT changes rather than checking on
 an interval. `clock.sleep_until()` schedules a real timer for the factory deadline
@@ -852,8 +858,8 @@ the replay after a producer's code changed, and `Service.consume()`:
   `svc.handler_health`. One failure makes the service `degraded`; five in a row
   (`HandlerHealth(unhealthy_after=...)`) make it `unhealthy`. The first success
   clears the count. The DataOps health door reports `handlers` and `failing`
-  and answers 503 when unhealthy; `_ServiceDetails` turns unhealthy too,
-  combined with what `svc.status()` was told.
+  and answers 503 when unhealthy. Runtime telemetry combines these failures
+  with what `svc.status()` was told, without republishing registration.
 
 To pass an input on purpose, raise `chaski.Reject(reason, detail=...)` from the
 handler. The runner records the rejection durably, as the service's retained

@@ -42,6 +42,7 @@ from .outage import ColcaUnavailable
 from .retained_view import ViewScope
 from .retry import Backoff
 from .service import LocalDoor, NotEnrolled, NotSent, Service, write_deadline
+from .telemetry import ServiceTelemetry
 from .topic_wakeup import TopicWakeup
 
 __all__ = [
@@ -75,6 +76,7 @@ __all__ = [
     "Reject",
     "SentCommand",
     "Service",
+    "ServiceTelemetry",
     "SignalWrite",
     "SourceDisconnectedError",
     "Stream",

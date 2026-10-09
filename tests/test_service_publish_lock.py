@@ -182,8 +182,10 @@ def test_status_completes_when_a_signal_lands_on_the_network_thread(service):
     svc.publish("orders", 1)
     client.arm_delivery(*_signal_for(client))
 
+    before = len(client.published)
     svc.status(ok=False, detail="plc unreachable")
-
+    assert len(client.published) == before
+    client._await_network_thread("dispatch")
     drained(svc)
     assert svc.pending() == [], svc.pending()
 
