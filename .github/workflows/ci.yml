@@ -11,9 +11,8 @@ permissions:
 
 env:
   # The colca chaski is developed against: its data contracts and the broker of
-  # the integration tests. colca v0.29.0: log forwarding by level, collapsed and
-  # capped repeats, fetchLogs.
-  COLCA_REF: 4b3be474c7d6afaf4b1ed50e4eb2205f918c422e
+  # the integration tests. Ordered clock readiness and discovery-only services.
+  COLCA_REF: ec09e48e8a58498b5a31710b868c923517a0d19f
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
