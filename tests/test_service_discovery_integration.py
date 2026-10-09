@@ -50,9 +50,19 @@ def test_paused_control_and_reconnect_do_not_republish_registration(tmp_path):
         before = entities.fetch().next
         assert source.report_progress(1000, force=True)
         assert _ready(sink) == 1000
-        # Force a paused readiness refresh without waiting on a timer.
-        source._last_clock_report = float("-inf")
-        assert source._publish_progress()
+        # The actual real-time readiness timer runs even while factory time pauses.
+        source_topic = str(source._details_topic)
+        observed = sink.step.records(progress_only=True)[source_topic]["clock_progress"]["observed_at"]
+        deadline = time.monotonic() + 10
+        while True:
+            version = sink.step.changes.version
+            progress = sink.step.records(progress_only=True)[source_topic]["clock_progress"]
+            if progress["observed_at"] != observed:
+                assert progress["processed_at"] == 1000
+                break
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "paused readiness timer never published control"
+            sink.step.changes.wait(version, remaining)
         assert entities.fetch().next == before
         reconnect = threading.Event()
         original = sink._reannounce

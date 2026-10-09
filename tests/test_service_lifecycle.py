@@ -142,9 +142,7 @@ def test_exporter_failure_cannot_suppress_ordered_completion(tmp_path, monkeypat
 
     clock = Clock(wall=lambda: 10000)
     clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 0))
-    svc, client = _local_service(
-        tmp_path, monkeypatch, clock=clock, step_dependencies=[], telemetry=BrokenExporter()
-    )
+    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[], telemetry=BrokenExporter())
     client.published.clear()
     assert svc.report_progress(1000, force=True)
     assert len(client.published) == 1

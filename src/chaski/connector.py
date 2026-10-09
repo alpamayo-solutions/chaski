@@ -455,6 +455,8 @@ class ConnectorService(Service):
     ``report_by_exception=False`` to publish every reading.
     """
 
+    telemetry: Telemetry
+
     def __init__(
         self,
         name: str,
