@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/alpamayo-solutions/chaski/compare/v0.25.0...v0.25.1) (2026-10-09)
+
+
+### Fixes
+
+* keep service discovery separate from runtime telemetry ([c1bde93](https://github.com/alpamayo-solutions/chaski/commit/c1bde93c0a7c205b4b6637834afc2603e932121a))
+
 ## [0.25.0](https://github.com/alpamayo-solutions/chaski/compare/v0.24.0...v0.25.0) (2026-10-06)
 
 
