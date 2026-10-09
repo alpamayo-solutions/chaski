@@ -139,7 +139,9 @@ def test_records_of_other_contracts_walk_the_cursor_and_let_the_stream_be_pruned
         _wait(lambda: any(e.path.split("/")[-1] == "temperature" for e in view.read()))
 
         def pruned_to():
-            page = door.fetch("entities", "c/worker/probe", max=1)
+            # A new cursor starts at the LWM without a historical gap. Supply
+            # the explicit old position to observe the prefix retention cut.
+            page = door.fetch("entities", "c/worker/probe", max=1, from_offset=1)
             return page.gap.to_offset if page.gap is not None else 0
 
         # The pruner removed everything below the view's cursor and stops
