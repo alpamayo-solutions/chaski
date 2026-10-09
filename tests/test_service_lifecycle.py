@@ -80,32 +80,32 @@ def _local_service(
     return svc, client
 
 
-def test_clock_progress_survives_loss_of_sync_and_broker(tmp_path, monkeypatch):
+def test_clock_progress_is_telemetry_without_coordination(tmp_path, monkeypatch):
+    from chaski import ServiceTelemetry
     from chaski.clock import Clock
 
-    svc, client = _local_service(tmp_path, monkeypatch, clock=Clock(source="mqtt"))
+    class Capture(ServiceTelemetry):
+        def __init__(self):
+            self.progress = []
+
+        def clock_progress(self, status):
+            self.progress.append(status)
+
+    telemetry = Capture()
+    svc, client = _local_service(tmp_path, monkeypatch, clock=Clock(source="mqtt"), telemetry=telemetry)
+    client.published.clear()
     assert svc.report_progress(1000)
-    details = client.published[-1][1]
-    progress = details.metadata["application_clock"]
-    assert progress["processed_at"] == 1000
-    assert progress["ready"] is False
-    assert progress["observed_at"] is None
-    assert progress["lag_s"] is None
-
-    def disconnected(*args, **kwargs):
-        raise ConnectionError("broker unavailable")
-
-    monkeypatch.setattr(client, "publish", disconnected)
-    svc._last_clock_report = 0
-    assert svc.report_progress(1000) is False
-    assert svc.metadata["application_clock"]["processed_at"] == 1000
-    with pytest.raises(ValueError, match="finite"):
-        svc.report_progress(float("nan"))
-    monkeypatch.undo()
+    assert telemetry.progress[-1]["processed_at"] == 1000
+    assert telemetry.progress[-1]["ready"] is False
+    assert telemetry.progress[-1]["observed_at"] is None
+    assert telemetry.progress[-1]["lag_s"] is None
+    assert not client.published
+    assert svc._progress_thread is None
+    assert "application_clock" not in svc.metadata
     svc.close()
 
 
-def test_progress_liveness_continues_while_factory_time_is_paused(tmp_path, monkeypatch):
+def test_progress_readiness_continues_while_factory_time_is_paused(tmp_path, monkeypatch):
     from colca_data_contracts.payload import ClockDefinition
 
     from chaski.clock import Clock
@@ -113,16 +113,43 @@ def test_progress_liveness_continues_while_factory_time_is_paused(tmp_path, monk
     real = [10000.0]
     clock = Clock(wall=lambda: real[0])
     clock.apply_definition(ClockDefinition("factory", "run", 1, real[0], 1000, 0))
-    svc, client = _local_service(tmp_path, monkeypatch, clock=clock)
+    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
+    client.published.clear()
     assert svc.report_progress(1000)
     real[0] += 6
     svc._last_clock_report = float("-inf")
     assert svc._publish_progress()
-    progress = client.published[-1][1].metadata["application_clock"]
-    assert progress["processed_at"] == progress["factory_now"] == 1000
+    import json
+
+    progress = json.loads(client.published[-1][1])
+    assert progress["processed_at"] == 1000
     assert progress["observed_at"] == 10006
+    assert progress["ready"] is True
+    assert all("/_ClockProgress/" in topic for topic, _ in client.published)
     svc.close()
     assert not svc._progress_thread.is_alive()
+
+
+def test_exporter_failure_cannot_suppress_ordered_completion(tmp_path, monkeypatch):
+    from colca_data_contracts.payload import ClockDefinition
+
+    from chaski import ServiceTelemetry
+    from chaski.clock import Clock
+
+    class BrokenExporter(ServiceTelemetry):
+        def clock_progress(self, status):
+            raise RuntimeError("exporter unavailable")
+
+    clock = Clock(wall=lambda: 10000)
+    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 0))
+    svc, client = _local_service(
+        tmp_path, monkeypatch, clock=clock, step_dependencies=[], telemetry=BrokenExporter()
+    )
+    client.published.clear()
+    assert svc.report_progress(1000, force=True)
+    assert len(client.published) == 1
+    assert "/_ClockProgress/" in client.published[0][0]
+    svc.close()
 
 
 def _external_service(
@@ -159,7 +186,7 @@ def test_start_publishes_one_active_healthy_service_details(tmp_path, monkeypatc
     assert len(details) == 1
     d = details[0]
     assert d.is_active is True
-    assert d.architecture_metadata == {"status": "healthy"}
+    assert d.architecture_metadata == {}
     assert d.display_name == "ERP Bridge"
     assert d.description == "pushes ERP orders"
     assert d.metadata["version"] == "1.2.3"
@@ -184,17 +211,27 @@ def test_close_is_idempotent(tmp_path, monkeypatch):
     assert len(client.published) == published_after_first_close
 
 
-def test_status_transitions_health_without_deactivating(tmp_path, monkeypatch):
-    svc, client = _local_service(tmp_path, monkeypatch)
-    svc.status(False, "source unreachable")
-    latest = _details(client)[-1]
-    assert latest.is_active is True
-    assert latest.architecture_metadata == {"status": "unhealthy", "detail": "source unreachable"}
+def test_status_exports_telemetry_without_registration_writes(tmp_path, monkeypatch):
+    from chaski import ServiceTelemetry
 
+    class Capture(ServiceTelemetry):
+        def __init__(self):
+            self.health = []
+
+        def service_health(self, healthy):
+            self.health.append(healthy)
+
+    telemetry = Capture()
+    svc, client = _local_service(tmp_path, monkeypatch, telemetry=telemetry)
+    before = len(client.published)
+    svc.status(False, "source unreachable")
+    assert telemetry.health[-1] is False
+    assert svc._last_detail == "source unreachable"
     svc.status(True)
-    latest = _details(client)[-1]
-    assert latest.is_active is True
-    assert latest.architecture_metadata == {"status": "healthy"}
+    assert telemetry.health[-1] is True
+    assert len(client.published) == before
+    assert _details(client)[-1].is_active is True
+    svc.close()
 
 
 def test_local_start_sets_a_last_will_before_connect(tmp_path, monkeypatch):
@@ -237,7 +274,7 @@ class _Message:
 
 
 def _read_back(svc: Service, client: _FakeClient, *, is_active: bool, status: str = "healthy") -> None:
-    record = svc._build_service_details(is_active=is_active, status=status)
+    record = svc._build_service_details(is_active=is_active)
     client.subscriptions[_DETAILS_TOPIC](_Message(record))
 
 
@@ -257,7 +294,7 @@ def test_a_late_will_is_corrected_with_the_current_record_once(tmp_path, monkeyp
     topic, latest = client.published[-1]
     assert topic == _DETAILS_TOPIC
     assert latest.is_active is True
-    assert latest.architecture_metadata == {"status": "unhealthy", "detail": "source unreachable"}
+    assert latest.architecture_metadata == {}
     # the correction's own echo settles it
     client.subscriptions[_DETAILS_TOPIC](_Message(latest))
     assert len(client.published) == before + 1
@@ -489,7 +526,7 @@ def test_coordinated_progress_does_not_republish_details_for_every_window(tmp_pa
     assert svc.report_progress(1020, force=True)
     topics = [str(row[0]) for row in client.published]
     assert sum("/_ClockProgress/" in topic for topic in topics) == 2
-    assert sum("/_ServiceDetails/" in topic for topic in topics) == 1
+    assert sum("/_ServiceDetails/" in topic for topic in topics) == 0
     svc.close()
 
 
@@ -526,7 +563,7 @@ def test_clock_health_coalesces_while_every_completion_marker_is_delivered(tmp_p
         svc.report_progress(1000 + i * 10, force=True)
     topics = [str(row[0]) for row in client.published]
     assert sum("/_ClockProgress/" in topic for topic in topics) == 60
-    assert sum("/_ServiceDetails/" in topic for topic in topics) == 2
+    assert sum("/_ServiceDetails/" in topic for topic in topics) == 0
     svc.close()
 
 
@@ -592,12 +629,13 @@ def test_a_session_takeover_is_an_error_and_makes_the_service_unhealthy(tmp_path
     svc._on_connect(client, None, None, _FakeReasonCode())
     latest = _details(client)[-1]
     assert latest.is_active is True
-    assert latest.architecture_metadata["status"] == "unhealthy"
-    assert "another process" in latest.architecture_metadata["detail"]
+    assert svc._last_status == "unhealthy"
+    assert latest.architecture_metadata == {}
+    assert "another process" in svc._last_detail
 
     # status() cannot report healthy over it.
     svc.status(True)
-    assert _details(client)[-1].architecture_metadata["status"] == "unhealthy"
+    assert svc._last_status == "unhealthy"
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="chaski.service"):
@@ -619,7 +657,7 @@ def test_an_ordinary_disconnect_is_not_an_identity_conflict(tmp_path, monkeypatc
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert svc.identity_conflict == ""
     svc.status(True)
-    assert _details(client)[-1].architecture_metadata == {"status": "healthy"}
+    assert _details(client)[-1].architecture_metadata == {}
     svc.close()
 
 
@@ -633,10 +671,10 @@ def test_the_identity_conflict_clears_once_no_takeover_follows(tmp_path, monkeyp
     client.is_connected = lambda: True
     svc._on_disconnect(client, None, None, _taken_over(), None)
     svc._on_connect(client, None, None, _FakeReasonCode())
-    assert _details(client)[-1].architecture_metadata["status"] == "unhealthy"
+    assert svc._last_status == "unhealthy"
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _details(client)[-1].architecture_metadata["status"] != "healthy":
+    while time.monotonic() < deadline and svc._last_status != "healthy":
         time.sleep(0.02)
     assert svc.identity_conflict == ""
-    assert _details(client)[-1].architecture_metadata == {"status": "healthy"}
+    assert _details(client)[-1].architecture_metadata == {}
     svc.close()

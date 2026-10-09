@@ -2,7 +2,8 @@
 
 The authority grants a window by setting ClockDefinition.stop_at. A worker
 processes that boundary only after its declared upstream workers committed it.
-Progress uses the existing service metadata; no second clock or OS adjustment.
+Ordered ClockProgress records own completion and functional readiness.
+ServiceDetails supplies registration and discovery only.
 """
 
 from __future__ import annotations
@@ -111,12 +112,25 @@ class StepGate:
                     or not details_topic.startswith(f"{topic_prefix()}_ServiceDetails/{self.service.node_id}/")
                 ):
                     return
+                previous = self._health_received.get(details_topic)
+                observed = data.get("observed_at") if isinstance(data, dict) else None
+                if (
+                    not getattr(message, "retain", False)
+                    and isinstance(observed, (int, float))
+                    and not isinstance(observed, bool)
+                    and math.isfinite(observed)
+                    and (previous is None or observed != previous[1])
+                ):
+                    self._health_received[details_topic] = (self._monotonic(), observed)
                 if self._barriers.get(details_topic) == data:
+                    if relevant and self._health_received.get(details_topic) != previous:
+                        self.changes.notify()
                     return
                 if isinstance(data, dict):
-                    self._barriers[details_topic] = data
+                    self._barriers[details_topic] = dict(data)
                 else:
                     self._barriers.pop(details_topic, None)
+                    self._health_received.pop(details_topic, None)
                 if relevant:
                     self.changes.notify()
             return
@@ -138,51 +152,30 @@ class StepGate:
             if isinstance(data, dict):
                 self._records[key] = data
                 self._record_topics[key] = topic
-                observed = ((data.get("metadata") or {}).get("application_clock") or {}).get("observed_at")
-                previous = self._health_received.get(key)
-                if (
-                    not getattr(message, "retain", False)
-                    and isinstance(observed, (int, float))
-                    and (previous is None or observed != previous[1])
-                ):
-                    self._health_received[key] = (self._monotonic(), observed)
             else:
                 self._records.pop(key, None)
-                self._health_received.pop(key, None)
+                self._health_received.pop(topic, None)
                 self._record_topics.pop(key, None)
                 self._barriers.pop(topic, None)
             self.changes.notify()
 
     def records(self, *, progress_only=False) -> dict[str, dict]:
-        """Copy progress without catalogues on high-frequency controller paths."""
+        """Return discovery with its separately received control progress."""
         with self._lock:
-            if progress_only:
-                records = {
-                    key: {
-                        "id": row.get("id"),
-                        "name": row.get("name"),
-                        "is_active": row.get("is_active"),
-                        "metadata": {
-                            "application_clock": copy.deepcopy((row.get("metadata") or {}).get("application_clock"))
-                        },
-                    }
+            records = (
+                {
+                    key: {field: row.get(field) for field in ("id", "name", "is_active")}
                     for key, row in self._records.items()
                 }
-            else:
-                records = copy.deepcopy(self._records)
+                if progress_only
+                else copy.deepcopy(self._records)
+            )
             for key, row in records.items():
-                progress = (row.get("metadata") or {}).get("application_clock")
-                if not isinstance(progress, dict):
-                    continue
-                received = self._health_received.get(key)
+                topic = self._record_topics.get(key, "")
+                progress = copy.deepcopy(self._barriers.get(topic, {}))
+                received = self._health_received.get(topic)
                 progress["age_s"] = self._monotonic() - received[0] if received else None
-                barrier = self._barriers.get(self._record_topics.get(key, ""), {})
-                done = barrier.get("processed_at")
-                if barrier.get("run_id") != progress.get("run_id") or not isinstance(done, (int, float)):
-                    progress["processed_at"] = None
-                else:
-                    # The ordered marker owns completion; details are liveness.
-                    progress["processed_at"] = done
+                row["clock_progress"] = progress
             return records
 
     def boundary(self) -> float | None:
@@ -205,18 +198,15 @@ class StepGate:
         with self._lock:
             result = {}
             for key, row in self._records.items():
-                progress = (row.get("metadata") or {}).get("application_clock") or {}
-                barrier = self._barriers.get(self._record_topics.get(key, ""), {})
+                topic = self._record_topics.get(key, "")
+                barrier = self._barriers.get(topic, {})
+                received = self._health_received.get(topic)
                 result[key] = {
                     "active": row.get("is_active"),
-                    "ready": progress.get("ready"),
-                    "run_id": progress.get("run_id"),
-                    "age_s": self._monotonic() - self._health_received[key][0]
-                    if key in self._health_received
-                    else None,
-                    "processed_at": barrier.get("processed_at")
-                    if barrier.get("run_id") == progress.get("run_id")
-                    else None,
+                    "ready": barrier.get("ready"),
+                    "run_id": barrier.get("run_id"),
+                    "age_s": self._monotonic() - received[0] if received else None,
+                    "processed_at": barrier.get("processed_at"),
                 }
             return result
 

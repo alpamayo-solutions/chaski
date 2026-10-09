@@ -112,6 +112,7 @@ from .startup import (
     colca_unreachable,
 )
 from .subscriptions import Subscriptions
+from .telemetry import ServiceTelemetry
 from .topic_wakeup import TopicFanout, TopicWakeup
 
 if TYPE_CHECKING:
@@ -503,6 +504,7 @@ class Service:
         clock: Clock | None = None,
         step_dependencies: list[str] | None = None,
         commands: Iterable[tuple[str, str]] | None = None,
+        telemetry: ServiceTelemetry | None = None,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -535,6 +537,7 @@ class Service:
         identity on disk. See :meth:`start`.
         """
         self.name = name
+        self.telemetry = telemetry or ServiceTelemetry()
         self.clock = clock or Clock()
         self._clock_subscriptions: set[str] = set()
         self._subscriptions: Subscriptions | None = None
@@ -615,8 +618,7 @@ class Service:
         self._declared: dict[str, dict[str, Any]] = {}
         self._last_status = "healthy"
         self._last_detail = ""
-        # What status() was last told, combined with handler_health into what
-        # _ServiceDetails says (see _publish_status).
+        # Runtime health is local state exported through telemetry.
         self._user_ok = True
         self._user_detail = ""
         self.handler_health = HandlerHealth(on_change=self._handler_health_changed)
@@ -793,7 +795,7 @@ class Service:
         self._catalogue = Catalogue(connector=identity.service_id, mount=self._resolved_mount)
         self._http = Door(f"http://{door.host}:{door.http_port}", service=self.name)
 
-        will_payload = self._build_service_details(is_active=False, status="unhealthy")
+        will_payload = self._build_service_details(is_active=False)
         try:
             client, _ = connect_local_mqtt(
                 self.name,
@@ -831,7 +833,7 @@ class Service:
         # The API door checks the same pinned key, as a client certificate.
         self._http = Door(base, service=ulid, cert=(self._cert_path, self._key_path))
 
-        will_payload = self._build_service_details(is_active=False, status="unhealthy")
+        will_payload = self._build_service_details(is_active=False)
         port = self._mqtt_port_override or _DEFAULT_EXTERNAL_MQTT_PORT
         self._client = _connect_external_mqtt(
             host,
@@ -999,6 +1001,7 @@ class Service:
             timer.daemon = True
             self._conflict_timer = timer
             timer.start()
+        self._publish_status()
 
     def _identity_conflict_expired(self) -> None:
         """No takeover for IDENTITY_CONFLICT_HOLD_S: report healthy again."""
@@ -1056,7 +1059,7 @@ class Service:
             client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         self._subscribe_clock()
         with self._lock:
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+            details = self._build_service_details(is_active=True)
         client.publish(self._details_topic, details, qos=1, retain=True, wait=False)
         if str(old_details) != str(self._details_topic):
             client.unsubscribe(old_details)
@@ -1085,7 +1088,7 @@ class Service:
             if self._closed:
                 return
             logger.warning("chaski.Service: %s read its own record as inactive; re-announcing", self.name)
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+            details = self._build_service_details(is_active=True)
             # Under the lock, which close() takes after setting _closed: its
             # inactive record then always queues behind this one. No wait, so
             # no PUBACK is awaited under the lock.
@@ -1166,7 +1169,8 @@ class Service:
             self._started_catalogue.load_previous(self._previous_catalogue())
         self._started_client.subscribe(self._signal_filter, qos=1, callback=self._on_signal)
         self._subscribe_clock()
-        self._publish_details(self._build_service_details(is_active=True, status="healthy"))
+        self._publish_details(self._build_service_details(is_active=True))
+        self._publish_status()
         # after the announce, so the retained record it reads back is its own
         self._started_client.subscribe(self._details_topic, qos=1, callback=self._on_own_details)
         self._subscribe_cursor_lag()
@@ -1780,9 +1784,10 @@ class Service:
     # -- health --------------------------------------------------------
 
     def report_progress(self, processed_at: float, *, force: bool = False) -> bool:
-        """Report application progress immediately when forced; health every five seconds.
+        """Export committed progress and publish ordered coordination control.
 
-        This is control/health state, not a business or historian fact. A
+        Coordinated workers refresh readiness every five real seconds.
+        This is control state, not a business or historian fact. A
         simulation must report what it processed, not just its target clock.
         Reporting is best effort: a broker outage must not abort completed work.
         Returns whether the status was published. Business progress must already
@@ -1800,7 +1805,7 @@ class Service:
             if self._client is None:
                 raise RuntimeError("chaski.Service: call start() before report_progress()")
             self._processed_at = processed_at
-            if self._progress_thread is None:
+            if self.step is not None and self._progress_thread is None:
                 self._progress_thread = threading.Thread(
                     target=self._progress_heartbeat, daemon=True, name=f"{self.name}-clock-health"
                 )
@@ -1819,9 +1824,7 @@ class Service:
             if self._closed or self._processed_at is None or (not force and now - self._last_clock_report < 5):
                 return False
             processed_at = self._processed_at
-            publish_details = now - self._last_clock_report >= 5
-            if publish_details:
-                self._last_clock_report = now
+            self._last_clock_report = now
         status = asdict(self.clock.status())
         status["processed_at"] = processed_at
         try:
@@ -1829,33 +1832,24 @@ class Service:
         except ClockNotReady:
             status["observed_at"] = None
         status["lag_s"] = max(0, status["factory_now"] - processed_at) if status["factory_now"] is not None else None
-        with self._lock:
-            self.metadata["application_clock"] = status
-            details = (
-                self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
-                if publish_details or self.step is None
-                else None
-            )
+        try:
+            self.telemetry.clock_progress(status)
+        except Exception as exc:
+            warn_failure(logger, exc, "Could not export application clock telemetry")
         try:
             if self.step is not None and status.get("run_id"):
-                # This marker travels in-order behind samples. Colca drains
-                # priority events before forwarding it to an upstream node.
+                # Functional completion and live readiness travel behind samples.
+                # Runtime observations never republish the registration record.
                 marker_topic = str(self._details_topic).replace("/_ServiceDetails/", "/_ClockProgress/", 1)
-                self.send(
-                    marker_topic, json.dumps({"run_id": status["run_id"], "processed_at": processed_at}), retain=True
-                )
-            # Ordered progress is frequent; the full service projection only
-            # needs a real-time heartbeat, even during accelerated simulation.
-            if details is not None:
-                self._publish_details(details)
+                marker = {key: status[key] for key in ("run_id", "processed_at", "ready", "observed_at")}
+                self.send(marker_topic, json.dumps(marker), retain=True)
         except Exception as exc:
             warn_failure(logger, exc, "Could not publish application clock progress")
             return False
         return True
 
     def status(self, ok: bool, detail: str = "") -> None:
-        """Republish ``_ServiceDetails`` with ``architecture_metadata.status``
-        healthy/unhealthy (+``detail``) — what a health view reads.
+        """Report runtime health through the deployment's telemetry exporter.
 
         Combined with :attr:`handler_health`: a service whose handlers are
         failing reports that too, and is unhealthy once one failed
@@ -1870,12 +1864,14 @@ class Service:
     def _publish_status(self) -> None:
         with self._lock:
             self._compose_status()
-            details = self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
-        self._publish_details(details)
+            healthy = self._last_status == "healthy"
+        try:
+            self.telemetry.service_health(healthy)
+        except Exception as exc:
+            warn_failure(logger, exc, "Could not export service health telemetry")
 
     def _compose_status(self) -> None:
-        """What ``_ServiceDetails`` says: status() combined with
-        :attr:`handler_health` and :attr:`identity_conflict`."""
+        """Combine application, handler and identity-conflict runtime health."""
         handlers = self.handler_health.status
         summary = self.handler_health.summary()
         conflict = self.identity_conflict
@@ -1887,8 +1883,7 @@ class Service:
         self._last_detail = detail[:500]
 
     def _handler_health_changed(self, _status: str, _summary: str) -> None:
-        """A consumer started or stopped failing: republish the status, off
-        the reporting thread (it may be an event loop or an MQTT callback)."""
+        """Export handler health off the event loop or MQTT callback."""
         if self._client is None or self._closed:
             return
 
@@ -2063,22 +2058,20 @@ class Service:
             changed = routes != self._announced_commands
             self._announced_commands = routes
             details = (
-                self._build_service_details(is_active=True, status=self._last_status, detail=self._last_detail)
+                self._build_service_details(is_active=True)
                 if changed and self._client is not None and self._node_id is not None
                 else None
             )
         if details is not None:
             self._publish_details(details)
 
-    def _build_service_details(self, *, is_active: bool, status: str, detail: str = "") -> ServiceDetails:
+    def _build_service_details(self, *, is_active: bool) -> ServiceDetails:
         metadata: dict[str, Any] = dict(self.metadata)
         if self.version:
             metadata["version"] = self.version
-        architecture_metadata: dict[str, Any] = {**self.architecture_metadata, "status": status}
-        if detail:
-            architecture_metadata["detail"] = detail
-        else:
-            architecture_metadata.pop("detail", None)
+        architecture_metadata: dict[str, Any] = dict(self.architecture_metadata)
+        architecture_metadata.pop("status", None)
+        architecture_metadata.pop("detail", None)
         if self._service_id is None or self._node_id is None:
             raise RuntimeError("chaski.Service: call start() first")
         details = ServiceDetails(
@@ -2123,9 +2116,7 @@ class Service:
             if client is not None:
                 self._seal_catalogue()
                 catalogue = self._catalogue_to_publish()
-            details = (
-                self._build_service_details(is_active=False, status=self._last_status) if client is not None else None
-            )
+            details = self._build_service_details(is_active=False) if client is not None else None
         # Outside the lock — see _publish_outside_the_lock.
         if catalogue is not None:
             self._publish_catalogue(catalogue)

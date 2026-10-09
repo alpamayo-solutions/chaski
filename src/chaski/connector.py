@@ -115,6 +115,7 @@ from .executor import Command, CommandExecutor, CommandRejected, CommandResult, 
 from .failures import Reject
 from .outage import Outage, expected_failure
 from .service import Service
+from .telemetry import ServiceTelemetry
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
 # ids like any other tag's.
@@ -287,7 +288,7 @@ class SignalWrite:
         return await self.connector._apply_write(self, value)
 
 
-class Telemetry:
+class Telemetry(ServiceTelemetry):
     """Where the loop reports what it does; a no-op by default. Methods are
     called from the poll loop or the MQTT network thread and must not block."""
 
@@ -475,7 +476,14 @@ class ConnectorService(Service):
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
         if max_pending < 1:
             raise ValueError("max_pending must be positive")
-        super().__init__(name, mount, metadata=metadata, max_queued_messages=int(max_pending), **service_kwargs)
+        super().__init__(
+            name,
+            mount,
+            metadata=metadata,
+            max_queued_messages=int(max_pending),
+            telemetry=telemetry or Telemetry(),
+            **service_kwargs,
+        )
         self.driver = driver
         if timestamp_source not in ("acquisition", "source"):
             raise ValueError("timestamp_source must be acquisition or source")
@@ -490,7 +498,6 @@ class ConnectorService(Service):
         self.reconnect_retries = int(reconnect_retries)
         self.outage_reminder = float(outage_reminder)
         self.summary_interval = float(summary_interval)
-        self.telemetry = telemetry or Telemetry()
         self._log = logging.getLogger(name)
         # The loop's clocks, as attributes so a test can drive time and skip
         # backoffs without patching the interpreter's own modules.

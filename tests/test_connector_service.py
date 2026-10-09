@@ -1005,9 +1005,7 @@ def test_registration_carries_the_drivers_protocol_and_the_given_presentation(no
     details = node.details()[-1]
     assert details.id == "01J00000000000000000000000" and details.name == NAME and details.colca_node_id == NODE
     assert details.metadata == {"protocol": "FAKE", "demo": "line1"}
-    assert details.architecture_metadata == {"icon": "svc-opcua.webp", "status": "healthy"}, (
-        "the live status wins over anything the presentation carried"
-    )
+    assert details.architecture_metadata == {"icon": "svc-opcua.webp"}, "registration does not carry runtime status"
     assert details.health_metrics == health and details.is_active is True
     svc.close()
     assert node.details()[-1].is_active is False
