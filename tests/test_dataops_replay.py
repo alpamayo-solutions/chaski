@@ -216,28 +216,6 @@ async def test_failed_replay_is_not_marked_complete_and_retries(buffer, runtime)
         assert instance.calls == attempt + 1
 
 
-@run_async
-async def test_coordinated_replay_stops_before_pending_inputs(buffer, runtime):
-    from types import SimpleNamespace
-
-    from chaski.dataops.service import synthetic_record
-
-    runtime.step = SimpleNamespace()
-    for ts, value in [(100, "committed"), (200, "pending"), (300, "later pending")]:
-        buffer.append("sig-event", ts, value)
-    from dataclasses import replace
-
-    records = [
-        replace(synthetic_record("sig-event", ts, value), offset=i)
-        for i, ts, value in [(1, 200, "pending"), (2, 300, "later pending")]
-    ]
-    buffer.queue_inputs(records, 2)
-    instance = RecordingProducer().attach(runtime)
-    await replay_changed_producers(runtime, [instance])
-    assert instance.received == [(100, "committed")]
-    assert len(buffer.input_batch(300)) == 2
-
-
 class CheckpointProducer(RecordingProducer):
     name = "checkpointed"
     state_version = 1

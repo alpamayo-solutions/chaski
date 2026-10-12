@@ -44,7 +44,7 @@ from franzmq import Topic
 
 from ..catalogue import tag_meta
 from . import resolve
-from .base import runtime_now
+from .base import current_time
 from .inputs import _PerInstance
 
 if TYPE_CHECKING:
@@ -155,7 +155,7 @@ class SignalOutput(_PerInstance):
         bounded capacity; definition updates flush them without another sample.
         """
         runtime = self._runtime()
-        timestamp = runtime_now(runtime) if timestamp is None else _epoch(timestamp)
+        timestamp = current_time() if timestamp is None else _epoch(timestamp)
         door = runtime.door
         # A found binding is kept until the next pass calls forget(). A miss is
         # not kept: binding happens elsewhere and nothing notifies us.
@@ -178,7 +178,7 @@ class SignalOutput(_PerInstance):
 
         metric = Metric(
             value=value,
-            timestamp=runtime_now(self._runtime()) if timestamp is None else _epoch(timestamp),
+            timestamp=current_time() if timestamp is None else _epoch(timestamp),
             signal_id=signal_id,
         )
         self._runtime().send(topic, metric.encode())

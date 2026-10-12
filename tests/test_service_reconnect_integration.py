@@ -3,7 +3,6 @@
 import os
 import socket
 import threading
-import time
 
 import pytest
 
@@ -18,17 +17,16 @@ def _contracts_bundle_env():
     """The integration caller supplies the bundle matching its binary."""
 
 
-def test_registration_retry_restores_clock_after_broker_reconnect(tmp_path, monkeypatch):
+def test_registration_is_retried_after_broker_reconnect(tmp_path, monkeypatch):
     if not os.environ.get("COLCAD_BINARY"):
         pytest.skip("requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE")
     import chaski.service as module
     from chaski import Node
-    from chaski.clock import Clock
 
     disconnected, recovered = threading.Event(), threading.Event()
     with (
         Node("registration-recovery", data_dir=tmp_path / "node") as node,
-        node.service("worker", clock=Clock(source="mqtt")) as service,
+        node.service("worker") as service,
     ):
         service._broker_state_changed = lambda connected: None if connected else disconnected.set()
         original_resolve = module.resolve_local_identity
@@ -53,12 +51,3 @@ def test_registration_retry_restores_clock_after_broker_reconnect(tmp_path, monk
         assert disconnected.wait(5)
         assert recovered.wait(10), "MQTT recovered but registration was never retried"
         assert len(attempts) >= 2
-        deadline = time.monotonic() + 10
-        while True:
-            version = service.clock.changes.version
-            if service.clock.status().ready:
-                break
-            remaining = deadline - time.monotonic()
-            assert remaining > 0, "registration recovered but clock subscription did not"
-            service.clock.changes.wait(version, remaining)
-        assert abs(service.clock.real_now() - time.time()) < 2

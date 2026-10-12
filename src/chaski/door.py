@@ -523,7 +523,7 @@ class Stream:
     def head(self) -> int:
         """Capture the last admitted offset without moving/changing this cursor.
 
-        A coordinated drain must stop at a fixed boundary: a live producer may
+        A drain that must end stops at this fixed boundary: a live producer may
         never leave the stream empty. Tail reads do not replace cursor filters.
         """
         return self._door.fetch(self.name, self.cursor, max=1, tail=True).next - 1

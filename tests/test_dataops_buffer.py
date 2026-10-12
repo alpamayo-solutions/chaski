@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from chaski.dataops.buffer import Buffer
@@ -269,3 +271,53 @@ def test_change_only_plan_survives_many_retention_intervals(buffer):
     buffer.append("plan", 10100, {"planned_work_order": "WO-2"})
     buffer.trim({"plan": 900}, now=12000)
     assert buffer.points("plan", 0, 12001) == [(10100, {"planned_work_order": "WO-2"})]
+
+
+# ------------------------------------------------------------------ upgrade
+
+
+def test_a_buffer_from_the_application_time_releases_loses_its_clock_state(db_path):
+    """chaski 0.25 kept factory-callback progress (``timers``, ``__clock__:``
+    watermarks) and a coordinated inbox (``pending_inputs``, ``input_intake``).
+    Opening such a buffer drops them once; everything else stays."""
+    old = sqlite3.connect(db_path)
+    old.executescript(
+        """
+        CREATE TABLE timers (timer TEXT PRIMARY KEY, run_id TEXT NOT NULL, position REAL NOT NULL);
+        INSERT INTO timers VALUES ('__clock__:p:tick:x', 'run', 1060);
+        CREATE TABLE pending_inputs (offset INTEGER PRIMARY KEY, ts REAL NOT NULL, record TEXT NOT NULL);
+        INSERT INTO pending_inputs VALUES (7, 1010, '{}');
+        CREATE TABLE watermarks (producer TEXT PRIMARY KEY, position REAL, code_hash TEXT);
+        INSERT INTO watermarks VALUES ('__clock__:p:tick:x', 1060, NULL);
+        INSERT INTO watermarks VALUES ('kept', 42, 'hash');
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('input_intake', '7');
+        INSERT INTO meta VALUES ('generation', 'gen-1');
+        CREATE TABLE points (signal_id TEXT NOT NULL, ts REAL NOT NULL, value TEXT NOT NULL,
+                             PRIMARY KEY (signal_id, ts));
+        INSERT INTO points VALUES ('sig-1', 10, '1');
+        """
+    )
+    old.commit()
+    old.close()
+
+    buffer = Buffer(db_path)
+    try:
+        tables = {row[0] for row in buffer._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "timers" not in tables
+        assert "pending_inputs" not in tables
+        assert buffer.watermark("__clock__:p:tick:x") is None
+        assert buffer.watermark("kept") == 42
+        assert buffer.generation == "gen-1"
+        assert buffer._conn.execute("SELECT value FROM meta WHERE key='input_intake'").fetchone() is None
+        assert buffer.latest("sig-1") == 10
+    finally:
+        buffer.close()
+
+    # The second open finds nothing to drop and changes nothing.
+    again = Buffer(db_path)
+    try:
+        assert again.watermark("kept") == 42
+        assert again.generation == "gen-1"
+    finally:
+        again.close()

@@ -59,7 +59,6 @@ pages it walks hold none of its signals and are acked past.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
 import time
@@ -221,56 +220,6 @@ class Ingest:
         retry; any other exception ends the task.
         """
         return await asyncio.to_thread(self.drain_once, asyncio.get_running_loop())
-
-    async def run_window(self, target, before_sample, finish_window, *, real_signals=(), clock=None):
-        """Durable intake followed by event-time dispatch through a watermark.
-
-        Intake and effects have separate progress. Future samples remain in the
-        inbox, so upstream generation need not wait for this consumer. A crash
-        after a callback replays that callback; outputs must remain idempotent.
-        """
-        head = await asyncio.to_thread(self._stream.head)
-        while True:
-            page = await asyncio.to_thread(self._stream.fetch)
-            if page.gap is not None:
-                raise StreamGapError(f"input stream has a retention gap: {page.gap}")
-            if page.ack_offset is None:
-                if page.next <= head:
-                    raise RuntimeError("input stream stopped before its captured head")
-                break
-            await asyncio.to_thread(self._buffer.queue_inputs, page.records, page.ack_offset)
-            await asyncio.to_thread(self._stream.ack, page.ack_offset)
-            if page.next > head:
-                break
-        # Infrastructure readings retain real UTC timestamps. Make them
-        # available to freshness checks, but dispatch their callbacks at the
-        # processed boundary after historical machine records, never in future
-        # generation time.
-        after = 0
-        while records := await asyncio.to_thread(
-            self._buffer.input_batch, target, real_signals=real_signals, real=True, after=after
-        ):
-            for record in records:
-                await asyncio.to_thread(self._append, record)
-            after = records[-1].offset
-        while records := await asyncio.to_thread(self._buffer.input_batch, target, real_signals=real_signals):
-            with self._buffer.one_commit():
-                for record in records:
-                    await before_sample(self._timestamp_of(record))
-                    signal_id = await asyncio.to_thread(self._append, record)
-                    if signal_id is not None:
-                        await self._handle(signal_id, record)
-                    await asyncio.to_thread(self._buffer.finish_input, record.offset)
-        while records := await asyncio.to_thread(
-            self._buffer.input_batch, target, real_signals=real_signals, real=True
-        ):
-            for record in records:
-                signal_id = self._signal_id_of(record)
-                if signal_id is not None:
-                    with clock.at(target) if clock is not None else contextlib.nullcontext():
-                        await self._handle(signal_id, record)
-                await asyncio.to_thread(self._buffer.finish_input, record.offset)
-        await finish_window(target)
 
     def drain_once(self, loop: asyncio.AbstractEventLoop) -> int:
         """The thread body of :meth:`run_once`: one page, start to ack. Each

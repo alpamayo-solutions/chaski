@@ -23,7 +23,6 @@ import pytest
 from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry, run_async, signal_entry
 from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 
-from chaski.clock import Clock
 from chaski.dataops import AnnotationOutput, Backfill, NodeHistorian, Producer, SignalRangeInput, every, on_metric
 from chaski.dataops.backfill import INITIAL, BackfillRunner, tick_instants
 from chaski.dataops.buffer import Buffer
@@ -518,7 +517,6 @@ async def test_ticks_fire_at_their_instants_between_the_records(tmp_path):
     history = [(start + 1800.0 + i * 3600, 1) for i in range(3)]
     buffer = Buffer(tmp_path / "buffer.sqlite3")
     service = FakeService(_door(), buffer, FakeHistorian({SIGNAL: history}))
-    service.clock = Clock()
     service._ingest = _Ingest()
     instance = Hourly().attach(service)
     runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)

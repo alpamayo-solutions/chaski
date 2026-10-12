@@ -80,76 +80,6 @@ def _local_service(
     return svc, client
 
 
-def test_clock_progress_is_telemetry_without_coordination(tmp_path, monkeypatch):
-    from chaski import ServiceTelemetry
-    from chaski.clock import Clock
-
-    class Capture(ServiceTelemetry):
-        def __init__(self):
-            self.progress = []
-
-        def clock_progress(self, status):
-            self.progress.append(status)
-
-    telemetry = Capture()
-    svc, client = _local_service(tmp_path, monkeypatch, clock=Clock(source="mqtt"), telemetry=telemetry)
-    client.published.clear()
-    assert svc.report_progress(1000)
-    assert telemetry.progress[-1]["processed_at"] == 1000
-    assert telemetry.progress[-1]["ready"] is False
-    assert telemetry.progress[-1]["observed_at"] is None
-    assert telemetry.progress[-1]["lag_s"] is None
-    assert not client.published
-    assert svc._progress_thread is None
-    assert "application_clock" not in svc.metadata
-    svc.close()
-
-
-def test_progress_readiness_continues_while_factory_time_is_paused(tmp_path, monkeypatch):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski.clock import Clock
-
-    real = [10000.0]
-    clock = Clock(wall=lambda: real[0])
-    clock.apply_definition(ClockDefinition("factory", "run", 1, real[0], 1000, 0))
-    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
-    client.published.clear()
-    assert svc.report_progress(1000)
-    real[0] += 6
-    svc._last_clock_report = float("-inf")
-    assert svc._publish_progress()
-    import json
-
-    progress = json.loads(client.published[-1][1])
-    assert progress["processed_at"] == 1000
-    assert progress["observed_at"] == 10006
-    assert progress["ready"] is True
-    assert all("/_ClockProgress/" in topic for topic, _ in client.published)
-    svc.close()
-    assert not svc._progress_thread.is_alive()
-
-
-def test_exporter_failure_cannot_suppress_ordered_completion(tmp_path, monkeypatch):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski import ServiceTelemetry
-    from chaski.clock import Clock
-
-    class BrokenExporter(ServiceTelemetry):
-        def clock_progress(self, status):
-            raise RuntimeError("exporter unavailable")
-
-    clock = Clock(wall=lambda: 10000)
-    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 0))
-    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[], telemetry=BrokenExporter())
-    client.published.clear()
-    assert svc.report_progress(1000, force=True)
-    assert len(client.published) == 1
-    assert "/_ClockProgress/" in client.published[0][0]
-    svc.close()
-
-
 def _external_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -511,23 +441,6 @@ def test_the_client_tolerates_undecodable_messages_before_its_loop_starts(tmp_pa
     assert guarded == [True]
 
 
-def test_coordinated_progress_does_not_republish_details_for_every_window(tmp_path, monkeypatch):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski.clock import Clock
-
-    clock = Clock(wall=lambda: 10001.0)
-    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 1020))
-    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
-    client.published.clear()
-    assert svc.report_progress(1010, force=True)
-    assert svc.report_progress(1020, force=True)
-    topics = [str(row[0]) for row in client.published]
-    assert sum("/_ClockProgress/" in topic for topic in topics) == 2
-    assert sum("/_ServiceDetails/" in topic for topic in topics) == 0
-    svc.close()
-
-
 def test_mqtt_disables_nagle_on_initial_connection_and_reconnect(tmp_path, monkeypatch):
     import socket
     from types import SimpleNamespace
@@ -540,28 +453,6 @@ def test_mqtt_disables_nagle_on_initial_connection_and_reconnect(tmp_path, monke
     svc._on_connect(client, None, None, 0)
     svc._on_connect(client, None, None, 0)
     assert options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)] * 2
-    svc.close()
-
-
-def test_clock_health_coalesces_while_every_completion_marker_is_delivered(tmp_path, monkeypatch):
-    from colca_data_contracts.payload import ClockDefinition
-
-    import chaski.service as module
-    from chaski.clock import Clock
-
-    clock = Clock(wall=lambda: 10001.0)
-    clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 100, 2000))
-    svc, client = _local_service(tmp_path, monkeypatch, clock=clock, step_dependencies=[])
-    tick = [100.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: tick[0])
-    svc._last_clock_report = float("-inf")
-    client.published.clear()
-    for i in range(60):
-        tick[0] = 100 + i / 10
-        svc.report_progress(1000 + i * 10, force=True)
-    topics = [str(row[0]) for row in client.published]
-    assert sum("/_ClockProgress/" in topic for topic in topics) == 60
-    assert sum("/_ServiceDetails/" in topic for topic in topics) == 0
     svc.close()
 
 

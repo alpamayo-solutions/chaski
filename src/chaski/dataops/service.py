@@ -103,12 +103,12 @@ from chaski.service import Service
 from . import codehash, commands, health, resolve, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import Producer, Runtime, restore_checkpoint, runtime_now, save_checkpoint, state_copy
+from .base import Producer, Runtime, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, consumer_name, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
-from .scheduling import first_position, record_rejection, run_due, run_periodic, timer_key
+from .scheduling import record_rejection
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops")
@@ -414,8 +414,7 @@ def _resolve_dispatch(
 
             signal_id = resolved[spec.input_name]
             method = getattr(instance, method_name)
-            domain = getattr(instance, spec.input_name).time_domain
-            dispatch.setdefault(signal_id, []).append(make_handler(method, time_domain=domain))
+            dispatch.setdefault(signal_id, []).append(make_handler(method))
             # One line per handler is DEBUG: a node with many producers re-resolves
             # on every definition change, and the per-handler lines then dominate
             # its log. The INFO summary below states the outcome once per pass.
@@ -552,9 +551,7 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             await cache.changes.wait_async(version, delay, stop=stop)
 
 
-def compute_trim_horizons(
-    instances: list[Producer], retention_s: float, *, time_domain: str | None = None
-) -> dict[str, float]:
+def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict[str, float]:
     """Per-signal trim horizon: the larger of the signal's widest declared
     window and the broker's metrics retention.
 
@@ -565,8 +562,6 @@ def compute_trim_horizons(
     horizons: dict[str, float] = {}
     for instance in instances:
         for attr_name, input_attr in declared_inputs(instance):
-            if time_domain is not None and input_attr.time_domain != time_domain:
-                continue
             try:
                 signal_id = input_attr.signal_id
             except Exception as exc:
@@ -585,41 +580,21 @@ def compute_trim_horizons(
     return horizons
 
 
-def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float, clock=None) -> None:
+def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -> None:
     """Periodic job: drop buffered points older than each signal's horizon.
 
     Horizons are recomputed from the currently resolved inputs on every run,
     so a signal that resolves late is trimmed too; resolved ids are held in
     memory, so this needs no KV scan. A plain function, so APScheduler runs
     the sqlite work off the loop."""
-    if clock is None:
-        deleted = buffer.trim(compute_trim_horizons(instances, retention_s))
-    else:
-        application_now = clock.now()
-        definition = getattr(clock, "definition", None)
-        if definition is not None:
-            # Keep the input window needed by the slowest timer, including a
-            # newly started timer. Requested speed must never prune its backlog.
-            now = application_now
-            for instance in instances:
-                for method, spec in type(instance)._triggers:
-                    if isinstance(spec, CronSpec | IntervalSpec):
-                        progress = buffer.timer_position(timer_key(instance, method, spec), definition.run_id)
-                        if progress is None:
-                            progress = first_position(spec, definition, now)
-                        application_now = min(application_now, progress)
-        deleted = buffer.trim(
-            compute_trim_horizons(instances, retention_s, time_domain="application"), now=application_now
-        )
-        real_now = clock.real_now() if hasattr(clock, "real_now") else time.time()
-        deleted += buffer.trim(compute_trim_horizons(instances, retention_s, time_domain="real"), now=real_now)
+    deleted = buffer.trim(compute_trim_horizons(instances, retention_s))
     if deleted:
         log.info("Buffer trim: deleted %d point(s) past their per-signal horizon", deleted)
     else:
         log.debug("Buffer trim: nothing past its per-signal horizon")
 
 
-def make_handler(method, *, time_domain="application"):
+def make_handler(method):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
     into a ``Metric``. Holds the producer's lock, like :func:`off_loop`."""
@@ -628,14 +603,8 @@ def make_handler(method, *, time_domain="application"):
         if record.offset >= 0 and _held(method.__self__):
             return  # buffered; its backfill handles it before live dispatch resumes
         metric = decode_metric(record)
-        clock = getattr(method.__self__.runtime, "clock", None)
-        instant = (
-            clock.at(float(metric.timestamp))
-            if clock is not None and time_domain == "application"
-            else contextlib.nullcontext()
-        )
         instance = method.__self__
-        with instance._lock, instant:
+        with instance._lock, event_time(float(metric.timestamp)):
             checkpointed = instance.state_version is not None and record.offset >= 0
             key = method.__name__
             if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
@@ -738,20 +707,7 @@ async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
 
         mini_dispatch, mini_signal_ids, _ = build_dispatch(runtime, [instance])
         earliest = _earliest_across(buffer, mini_signal_ids)
-        now = runtime_now(runtime)
-        if getattr(runtime, "step", None) is not None:
-            application_inputs = set()
-            for _, input_attr in declared_inputs(instance):
-                if input_attr.time_domain != "real":
-                    # Unresolved inputs have no buffered records.
-                    with contextlib.suppress(LookupError):
-                        application_inputs.add(input_attr.signal_id)
-            pending_start = buffer.pending_input_start(application_inputs)
-            if pending_start is not None:
-                # Reconstruct only the prefix before pending work. Otherwise a
-                # crash/code reload can recreate future producer state and then
-                # replay older inbox records against it (backwards intervals).
-                now = min(now, pending_start)
+        now = time.time()
         start = earliest if earliest is not None else now
 
         log.info(
@@ -907,8 +863,6 @@ class DataOpsService(Service):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
-        self._step_loop_last = time.monotonic()
-        self._step_waiting = False
         self._definition_cache: resolve.LiveIndex | None = None
 
     def _after_connect(self) -> None:
@@ -920,7 +874,6 @@ class DataOpsService(Service):
                 cursor="dataops-definitions",
                 # Resolution reaches any path a producer names.
                 scope=ViewScope.whole_node(),
-                on_change=self.clock.changes.notify,
             )
         )
         cast(Any, self.door)._dataops_definitions = self._definition_cache
@@ -1280,12 +1233,9 @@ class DataOpsService(Service):
         loop = asyncio.get_running_loop()
         self._loop = loop
 
-        # The infrastructure stays live while a fresh deployment waits for its
-        # first timeline/beacon. Producer setup may read application time, so it
-        # must not run in a different clock domain or be skipped at startup.
         # The health door answers before anything else, and says what startup
-        # waits for: the node (reason from readiness), then its clock, then
-        # the definition index.
+        # waits for: the node (reason from readiness), then the definition
+        # index.
         waiting_for = ["Colca"]
 
         def not_ready() -> str:
@@ -1309,14 +1259,6 @@ class DataOpsService(Service):
             if not await self.start_when_reachable_async(stop):
                 return
             health_state.generation = self.buffer.generation
-            waiting_for[0] = "the node's clock"
-            while not stop.is_set():
-                version = self.clock.changes.version
-                if self.clock.status().ready:
-                    break
-                await self.clock.changes.wait_async(version, stop=stop)
-            if stop.is_set():
-                return
             if self._definition_cache is None:
                 raise RuntimeError("DataOps definition subscription was not initialized")
             waiting_for[0] = "the node's signal and element definitions"
@@ -1366,13 +1308,6 @@ class DataOpsService(Service):
             # 6) Record and hold the first backfill of every producer that
             #    declares one, then the on_metric dispatch table and the
             #    declared input signal ids.
-            if any(type(instance).backfill is not None for instance in instances) and (
-                self.step is not None or self.clock.definition_topic
-            ):
-                raise ValueError(
-                    "A producer declares a backfill, which runs on the node's own clock; "
-                    "this service runs on a factory clock or in coordinated steps"
-                )
             backfill = BackfillRunner(
                 self,
                 instances,
@@ -1408,11 +1343,9 @@ class DataOpsService(Service):
 
             # 9) Start ingest in the background and keep retrying unresolved inputs.
             health_state.producers = len(instances)
-            health_state.last_drain_at = (
-                (lambda: self._step_loop_last) if self.step is not None else (lambda: ingest.last_drain_at)
-            )
+            health_state.last_drain_at = lambda: ingest.last_drain_at
             health_state.stall_after_s = health.STALL_AFTER_MIN_S
-            health_state.waiting = (lambda: self._step_waiting) if self.step is not None else (lambda: ingest.waiting)
+            health_state.waiting = lambda: ingest.waiting
             health_state.connected = self.is_broker_connected
             ingest_task: asyncio.Task | None = None
             tasks_health = self.handler_health
@@ -1420,10 +1353,7 @@ class DataOpsService(Service):
             def supervised(name: str, start: Callable[[], Awaitable[Any]]) -> asyncio.Task:
                 return asyncio.ensure_future(supervise(name, start, stop, tasks_health))
 
-            if self.step is not None:
-                ingest_task = supervised("step loop", lambda: self._run_steps(instances, ingest, stop))
-                health_state.ingest_task = ingest_task
-            elif signal_ids:
+            if signal_ids:
                 ingest_task = supervised("ingest", lambda: ingest.run_forever(stop))
                 health_state.ingest_task = ingest_task
                 log.info("Ingest loop started: cursor=%s signal_ids=%d", ingest.cursor, len(signal_ids))
@@ -1439,7 +1369,7 @@ class DataOpsService(Service):
                     log.info("Ingest loop started after a late resolve: cursor=%s", ingest.cursor)
 
             reresolve_task: asyncio.Task | None = None
-            if self.step is None and (unresolved or self._definition_cache is not None):
+            if unresolved or self._definition_cache is not None:
                 log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
                 reresolve_task = supervised(
                     "re-resolve", lambda: reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
@@ -1451,9 +1381,7 @@ class DataOpsService(Service):
 
             # Backfills run beside live intake, throttled; a producer whose first
             # backfill runs has its live triggers held until it hands over.
-            backfill_task: asyncio.Task | None = None
-            if self.step is None:
-                backfill_task = supervised("backfill", lambda: backfill.run(stop))
+            backfill_task = supervised("backfill", lambda: backfill.run(stop))
 
             # 10) Every @on_constant/@on_signal subscription, and the @on_command
             #     executor.
@@ -1467,24 +1395,11 @@ class DataOpsService(Service):
             # 11) Schedule cron/interval triggers (everything except @on_metric),
             #     plus the service's own periodic buffer trim.
             scheduler = AsyncIOScheduler()
-            factory_tasks = []
             for instance in instances:
-                if self.step is not None:
-                    continue
-                if self.clock.definition_topic:
-                    for method_name, spec in instance.__class__._triggers:
-                        if isinstance(spec, CronSpec | IntervalSpec):
-                            factory_tasks.append(
-                                supervised(
-                                    f"{instance.name}.{method_name}",
-                                    functools.partial(run_periodic, instance, method_name, spec, self.clock),
-                                )
-                            )
-                else:
-                    schedule_periodic(scheduler, instance)
+                schedule_periodic(scheduler, instance)
             scheduler.add_job(
                 trim_buffer,
-                args=(self.buffer, instances, self.retention_s, self.clock),
+                args=(self.buffer, instances, self.retention_s),
                 trigger=IntervalTrigger(seconds=self._trim_interval_s),
                 id=f"{self.name}.buffer-trim",
                 name=f"{self.name}.buffer-trim",
@@ -1501,16 +1416,12 @@ class DataOpsService(Service):
             finally:
                 log.info("Shutting down...")
                 scheduler.shutdown(wait=False)
-                for task in factory_tasks:
-                    task.cancel()
-                await asyncio.gather(*factory_tasks, return_exceptions=True)
                 if reresolve_task is not None:
                     # `stop` is already set, so the loop returns on its next wait;
                     # cancel covers the case where it is mid-KV-read.
                     reresolve_task.cancel()
-                if backfill_task is not None:
-                    backfill_task.cancel()
-                    await asyncio.gather(backfill_task, return_exceptions=True)
+                backfill_task.cancel()
+                await asyncio.gather(backfill_task, return_exceptions=True)
                 if commands_task is not None:
                     try:
                         await asyncio.wait_for(commands_task, timeout=10.0)
@@ -1518,8 +1429,6 @@ class DataOpsService(Service):
                         log.exception("Command executor did not shut down cleanly")
                     self._commands = None
                 if ingest_task is not None:
-                    if self.step is not None:
-                        ingest_task.cancel()
                     ingest.wake()
                     try:
                         await asyncio.wait_for(ingest_task, timeout=10.0)
@@ -1544,67 +1453,6 @@ class DataOpsService(Service):
                 health_server.close()
                 await health_server.wait_closed()
             self.close()
-
-    async def _run_steps(self, instances, ingest, stop):
-        if self.step is None:
-            return
-        from ..retry import Backoff
-
-        backoff = Backoff()
-        outage = Outage(log, "Coordinated window", recovered_as="succeeded again")
-        active_dispatch = None
-        while not stop.is_set():
-            version = self.clock.changes.version
-            self._step_waiting = False
-            try:
-                target = await asyncio.to_thread(self.step.ready)
-                if target is not None:
-                    dispatch, signal_ids, unresolved = await asyncio.to_thread(build_dispatch, self, instances)
-                    if not unresolved:
-                        if dispatch is not active_dispatch:
-                            ingest.rebind(dispatch, signal_ids or None)
-                            active_dispatch = dispatch
-                        real_signals = {
-                            input_attr.signal_id
-                            for instance in instances
-                            for _, input_attr in declared_inputs(instance)
-                            if input_attr.time_domain == "real"
-                        }
-
-                        async def before_sample(at):
-                            await run_due(instances, self.clock, at, inclusive=False)
-
-                        async def finish_window(at):
-                            await run_due(instances, self.clock, at, inclusive=True)
-
-                        if signal_ids:
-                            await ingest.run_window(
-                                target, before_sample, finish_window, real_signals=real_signals, clock=self.clock
-                            )
-                        else:
-                            await finish_window(target)
-                        await asyncio.to_thread(self.step.complete, target)
-            except Exception as exc:
-                failed = ingest.take_failure()
-                name = failed[0] if failed is not None else "coordinated window"
-                count = self.handler_health.failed(name, exc)
-                delay = backoff.delay(exc)
-                if not outage.failed(exc, delay=delay):
-                    log.error(
-                        "Coordinated window failed in %s (%d in a row); progress not acknowledged, retrying in %.1fs",
-                        name,
-                        count,
-                        delay,
-                        exc_info=exc,
-                    )
-                await ingest._sleep_or_stop(delay, stop)
-                continue
-            self.handler_health.succeeded("coordinated window")
-            backoff.reset()
-            outage.recovered()
-            self._step_loop_last = time.monotonic()
-            self._step_waiting = True
-            await self.clock.changes.wait_async(version, self.step.wait_delay())
 
     def run(self) -> None:
         """Block: :meth:`serve` on a fresh event loop until SIGINT/SIGTERM."""
