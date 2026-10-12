@@ -116,7 +116,7 @@ from chaski.failures import Reject
 from chaski.outage import warn_failure
 
 from . import codehash
-from .base import Producer, restore_checkpoint, runtime_now, save_checkpoint, state_copy
+from .base import Producer, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .ingest import consumer_name
 from .inputs import SignalRangeInput, declared_inputs
 from .outputs import AnnotationOutput, SignalOutput, resolved_outputs
@@ -302,7 +302,7 @@ class BackfillRunner:
         A first job recorded as holding live and not yet done, whose producer
         now declares ``independent``, gets its end here and goes on beside
         live dispatch."""
-        now = runtime_now(self._service)
+        now = time.time()
         for name, instance in self._instances.items():
             spec = type(instance).backfill
             if spec is None:
@@ -493,7 +493,7 @@ class BackfillRunner:
         # Reported from the start, so a job that waits before its first
         # window shows, and a stall there too. Holding live, the edge is
         # about now until the plan says where the buffer ends.
-        self._report(job, position, windows, job["end"] if job["end"] is not None else runtime_now(self._service))
+        self._report(job, position, windows, job["end"] if job["end"] is not None else time.time())
         self._moved()
         try:
             while not stop.is_set():
@@ -574,7 +574,7 @@ class BackfillRunner:
         """The newest buffered point of the producer's inputs: what live
         intake has reached. ``now`` while nothing is buffered."""
         latest = [ts for ts in (self._buffer.latest(sid) for sid in plan.signal_ids) if ts is not None]
-        return max(latest) if latest else runtime_now(self._service)
+        return max(latest) if latest else time.time()
 
     async def _step(
         self,
@@ -703,8 +703,7 @@ class BackfillRunner:
 
     def _tick(self, instance: Producer, method_name: str, due: float, job: dict[str, Any]) -> None:
         """One tick at its instant, off the loop like a live tick."""
-        clock = getattr(self._service, "clock", None)
-        with instance._lock, clock.at(due) if clock is not None else contextlib.nullcontext():
+        with instance._lock, event_time(due):
             try:
                 asyncio.run(getattr(instance, method_name)())
             except Reject as rejected:

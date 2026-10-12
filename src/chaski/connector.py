@@ -110,7 +110,7 @@ from colca_data_contracts.payload import Signal as SignalRecord
 from franzmq import Topic
 from franzmq.errors import PublishRejected, PublishTimeout
 
-from .clock import CLOCK_BEHIND
+from ._wakeup import Wakeup
 from .executor import Command, CommandExecutor, CommandRejected, CommandResult, SqliteLedger, parse_topic
 from .failures import Reject
 from .outage import Outage, expected_failure
@@ -532,6 +532,9 @@ class ConnectorService(Service):
         self._metric_queue = None
         self._http_backoff = Backoff()
         self._stopping = asyncio.Event()
+        # Rung when the bound Signals change or the connector stops, so an
+        # idle loop wakes for them without polling.
+        self._changes = Wakeup()
         self._loop_for_writes: asyncio.AbstractEventLoop | None = None
         # Signal writes: one handler per bound signal, keyed by (contract,
         # node-local path) and changed in place under the lock when bindings
@@ -568,7 +571,7 @@ class ConnectorService(Service):
     def _bindings_changed(self) -> None:
         self._update_targets()
         self._update_writes()
-        self.clock.changes.notify()
+        self._changes.notify()
 
     def _broker_state_changed_writes(self, connected: bool) -> None:
         executor, loop = self._write_executor, self._loop_for_writes
@@ -745,7 +748,7 @@ class ConnectorService(Service):
 
     async def stop(self) -> None:
         self._stopping.set()
-        self.clock.changes.notify()
+        self._changes.notify()
 
     async def serve(self) -> None:
         """Register, discover, poll. Returns when :meth:`stop` is called.
@@ -893,11 +896,10 @@ class ConnectorService(Service):
     async def _poll_iteration(self) -> None:
         """One iteration of the loop, including the wait that paces the
         next one — see the module docstring's "Timing"."""
-        change_version = self.clock.changes.version
+        change_version = self._changes.version
         loop_start_perf = time.perf_counter()
-        clock_status = self.clock.status()
-        step_target = await asyncio.to_thread(self.step.ready) if self.step is not None else None
-        sampling = step_target is not None if self.step is not None else clock_status.ready and clock_status.rate > 0
+        # One wall-clock time for every sample of this acquisition cycle.
+        cycle_timestamp = time.time()
         try:
             if not self._discovered and self._now() >= self._next_discovery_retry:
                 await self._retry_discovery()
@@ -909,7 +911,7 @@ class ConnectorService(Service):
                 targets = list(self._targets)
             if not targets:
                 delay = max(0.0, self._next_discovery_retry - self._now()) if not self._discovered else None
-                await self.clock.changes.wait_async(change_version, delay, stop=self._stopping)
+                await self._changes.wait_async(change_version, delay, stop=self._stopping)
                 return
 
             synthetic = self._synthetic_tag_ids()
@@ -918,7 +920,7 @@ class ConnectorService(Service):
             raw_batch: list[tuple[Topic, Any, SignalRecord] | Reading] = []
             # Re-raised after publishing what was read, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
-            if protocol_targets and sampling:
+            if protocol_targets:
                 if len(protocol_targets) > self.max_pending:
                     raise BufferError("max_pending cannot hold one complete acquisition cycle")
                 # Retry durable output before taking another PLC observation.
@@ -956,7 +958,7 @@ class ConnectorService(Service):
                 if precision is not None and isinstance(value, (int, float)):
                     value = round_to_precision(value, precision)
                 key = str(topic)
-                timestamp = step_target if self.step is not None else clock_status.factory_now
+                timestamp = cycle_timestamp
                 if self.timestamp_source == "source" and source_timestamp is not None:
                     if not isfinite(source_timestamp):
                         self._set_aside(
@@ -997,11 +999,6 @@ class ConnectorService(Service):
                 batch.append((topic, metric))
 
             self._publish_batch(batch)
-            if self.step is not None and step_target is not None and source_lost is None:
-                # Partial protocol reads cannot acknowledge an entire window.
-                received = {str(reading[0]) for reading in raw_batch}
-                if protocol_targets and all(str(target.topic) in received for target in protocol_targets):
-                    await asyncio.to_thread(self.step.complete, step_target)
             self._summary_polls += 1
             self._log_summary(len(targets))
 
@@ -1050,36 +1047,7 @@ class ConnectorService(Service):
             raise
 
         elapsed = time.perf_counter() - loop_start_perf
-        if self.step is not None or not sampling:
-            self.telemetry.poll_completed(elapsed, overrun=False)
-            # Wake for commits or the discovery deadline. An incomplete PLC
-            # read retries on its acquisition cadence.
-            delay = None
-            if not self._discovered:
-                discovery = max(0.0, self._next_discovery_retry - self._now())
-                delay = discovery if delay is None else min(delay, discovery)
-            if step_target is not None and self.step is not None and self.step.completed_at != step_target:
-                delay = self.interval if delay is None else min(delay, self.interval)
-            if self.step is None and clock_status.ready and clock_status.factory_now is not None:
-                # A future definition can start without another message. Wake
-                # at that transition. A paused/completed clock without
-                # a scheduled transition returns None, so it stays event-driven.
-                clock_delay = self.clock.delay_until(clock_status.factory_now + max(self.interval, 1e-6))
-                if clock_delay is not None:
-                    delay = clock_delay if delay is None else min(delay, clock_delay)
-            elif self.step is None and clock_status.reason == CLOCK_BEHIND:
-                # The host clock was stepped back behind the last sample (an
-                # operator corrected a clock that ran fast). Nothing notifies the
-                # moment real time catches up, so wake then instead of waiting
-                # for a clock change that never comes.
-                clock_delay = self.clock.delay_until(self.clock.real_now())
-                delay_behind = self.interval if clock_delay is None else max(clock_delay, 0.0)
-                delay = delay_behind if delay is None else min(delay, delay_behind)
-            deadline = self.step.wait_delay(delay) if self.step is not None else delay
-            await self.clock.changes.wait_async(change_version, deadline, stop=self._stopping)
-            return
-        cadence = self.interval / clock_status.rate
-        wait = cadence - elapsed
+        wait = self.interval - elapsed
         self.telemetry.poll_completed(elapsed, overrun=wait <= 0)
         if wait > 0:
             await self._sleep(wait)

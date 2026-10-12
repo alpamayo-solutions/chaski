@@ -287,8 +287,8 @@ for 60 s. chaski does not pick which process stops.
 - Publish state/configuration when it changes; batch high-rate measurements.
   Command acceptance, execution and projected visibility are different events.
   An MQTT acknowledgement does not establish execution completion.
-- Use real monotonic time for transport deadlines, retries and pacing; use
-  factory/event time for simulated behavior. PLC acquisition, scheduled work,
+- Use monotonic time for transport deadlines, retries and pacing; use the
+  event's time (a sample's timestamp) for what a record says happened. PLC acquisition, scheduled work,
   alarm deadlines, batching, health checks and display clocks are legitimate
   timers. Periodic reads to discover new Colca business records are not.
 - Test reconnect, lost acknowledgements, duplicate delivery, continuous input,
@@ -574,7 +574,7 @@ unchanged, a command that was started but not answered is answered `504`, and a
 command whose `_Ack` is already in the `commands` stream is skipped.
 
 Every background task of a `DataOpsService` (ingest, command executor,
-re-resolution, clock-driven ticks) runs supervised: an exception is logged at
+re-resolution, backfill) runs supervised: an exception is logged at
 once, reported in `handler_health` (degraded, then unhealthy) and the task is
 restarted with backoff. The MQTT client reconnects at most 1 s (jittered) after
 the node on its local door is back, at most 5 s after a node across the
@@ -677,9 +677,8 @@ async def repair(self, command) -> str:
     return f"backfill {job} queued"
 ```
 
-A backfill runs on the node's own clock: a service on a factory clock or in
-coordinated steps refuses a producer that declares one. Handlers must not read
-past their record's timestamp; live, that data does not exist yet.
+Handlers must not read past their record's timestamp; live, that data does not
+exist yet.
 
 ### Read history through the node's API
 
@@ -751,73 +750,28 @@ License](LICENSE.md): use it for anything except a product or service that
 competes with it; every release becomes Apache 2.0 two years after it is
 published.
 
-### Optional application time
+### Time
 
-`Clock()` uses host time without requiring NTP. `Clock(source="mqtt")` uses
-Colca's existing live `_TimeSync` beacon. Host/NTP and MQTT corrections are
-alternatives, never added together. `Clock.from_env()` reads
-`APPLICATION_TIME_SOURCE` (`local` by default), `FACTORY_CLOCK_TOPIC` (an exact
-`_ClockDefinition` topic), and `TIME_SYNC_MAX_AGE_S` (120 real seconds).
+chaski stamps samples with the host's wall clock (`time.time()`); keep the host
+on NTP. A `Reading` can carry the source's own timestamp instead
+(`timestamp_source="source"`). Every sample of one connector poll shares the
+time taken at the top of the poll.
 
-Pass the clock to `Service`, `ConnectorService` or `DataOpsService`. A selected
-factory definition supplies the epoch, rate, pause and stop boundary. Missing
-or stale authority suspends application work; health, reconnects, credentials
-and network deadlines continue in real time. No OS clock is changed. Source
-readings can provide an optional timestamp with `Reading`; acquisition time
-remains the connector default.
+In DataOps, `self.now` (and an input's `now`) is the event's time while a
+callback handles it: the sample's timestamp in an `@on_metric` handler, the due
+time of a tick a backfill replays. An output written without a timestamp gets
+that time, so a replayed or backfilled result lands where its input was.
+Anywhere else `now` is the wall clock. `@every`/`@cron` callbacks run on the
+wall clock.
 
-Periodic DataOps callbacks execute every due factory tick in order and persist
-their progress. Inputs normally use application time; declare
-`SignalRangeInput(..., time_domain="real")` for infrastructure heartbeat inputs.
-Output timestamps stay in application time when a real-time heartbeat triggers
-computation.
+Runtime observations go to a deployment's exporter through
+`ServiceTelemetry.service_health()`; connector `Telemetry` includes it.
+`_ServiceDetails` contains registration and discovery and is published on
+registration changes and reconnect, rather than on a runtime timer.
 
-For coordinated simulation, pass `step_dependencies=[...]` to each service.
-An empty list identifies a source worker; omitting the argument keeps normal
-continuous operation. Dependencies are exact `_ServiceDetails` topics or local
-service names such as `./temperature-source` (resolved from service records,
-independent of placement). The deployment helper `dependencies_from_env()` in
-`chaski.coordination` reads the optional JSON `FACTORY_STEP_DEPENDENCIES` list.
-
-The controller grants a bounded window with `ClockDefinition.stop_at`. A worker
-awaits `service.step.wait_ready()`, completes the work, commits its effects, then
-calls `service.step.complete(boundary)`. Connectors wait for their sources,
-acquire and publish the boundary sample, then acknowledge it; DataOps drains
-upstream samples and due callbacks before acknowledging. Failed reads, publishes
-or processing cannot acknowledge a completed window. The controller must wait
-for **all explicitly required workers** before extending the boundary. This
-makes the requested rate a ceiling, with sample resolution determined by the
-window length. It does not make slow hardware run faster.
-
-Completion positions survive restarts. Callbacks must be idempotent because a
-crash between committing an effect and recording completion can replay it.
-DataOps keeps each `@every`/`@cron` callback's last tick per clock run. A
-restart within the run continues after that tick; a tick from another run is
-never continued. Without progress in the run, a callback starts at the run's
-start when it meets the run at its first revision, otherwise at the window it
-enters (the anchor of the definition in force, interval ticks kept on the run's
-grid). Ticks before a worker first takes part in a run are skipped, not caught
-up.
-Missing, inactive, stale or wrong-run dependency progress holds the window.
-`service.report_progress(processed_at)` is available for continuous workers;
-report committed work, never the target clock. Its liveness heartbeat uses real
-time and continues while a run is paused. Completion and live readiness use
-ordered `_ClockProgress` control records. Retained replay and duplicate control
-records do not renew readiness. `_ServiceDetails` contains registration and
-discovery and is published on registration changes and reconnect, rather than
-on a runtime timer. Runtime observations go to a deployment's exporter through
-`ServiceTelemetry.service_health()` and `ServiceTelemetry.clock_progress()`;
-connector `Telemetry` includes these hooks.
-
-The execution gate and clock waits wake on MQTT changes rather than checking on
-an interval. `clock.sleep_until()` schedules a real timer for the factory deadline
-and reschedules it when time or configuration changes. Synchronous workers can
-capture `step.changes.version`, check `step.ready()`, then call
-`step.changes.wait(version, step.wait_delay(1.0))`. Capturing the version first
-prevents a completion arriving between the check and wait from being lost. The
-optional maximum timeout is for shutdown/health/retry housekeeping; it does not
-pace normal work. After setting a thread's stop event, notify `clock.changes` to
-wake it immediately. Async waits support normal task cancellation.
+A buffer written by chaski 0.25 or older loses the application-time state it
+kept (the `timers` and `pending_inputs` tables, `__clock__:` watermarks) when it
+is opened; nothing else in it changes.
 
 
 ### Durable publication and build compatibility
@@ -844,14 +798,14 @@ consumed page remains unacknowledged. With an external doorbell, ring it after
 setting stop to wake an idle follower.
 
 A failed handler is never acknowledged. This holds for `@on_metric`,
-`@on_constant`, `@on_signal`, factory-time `@every`/`@cron` callbacks,
+`@on_constant`, `@on_signal`, `@every`/`@cron` callbacks,
 the replay after a producer's code changed, and `Service.consume()`:
 
 - The cursor moves only past the records before the failed one, so a restart
   resumes at it. No replay watermark is recorded for failed processing.
 - The same input is retried with bounded, jittered backoff (1 s doubling to
   30 s). An `@on_constant`/`@on_signal` retry ends early when a newer record at
-  the same topic replaces the failed one. A wall-clock `@every`/`@cron` tick has
+  the same topic replaces the failed one. An `@every`/`@cron` tick has
   no input; its next tick is the retry.
 - Each failure is logged with its traceback (a failure because Colca is away
   only once, as described under the connector's startup) and counted per handler in

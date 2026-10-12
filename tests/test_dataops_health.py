@@ -84,9 +84,9 @@ async def test_a_dead_ingest_loop_turns_the_probe_503():
 
 
 @run_async
-async def test_a_coordinated_step_loop_that_stopped_turns_the_probe_503():
-    """In coordinated step mode alive is not enough: a step loop stuck on a
-    door that never answers has stopped finishing steps."""
+async def test_an_ingest_that_stopped_draining_turns_the_probe_503():
+    """Alive is not enough: an ingest stuck on a door that never answers has
+    stopped finishing drains."""
     last_drain = [time.monotonic() - 301.0]
     state = HealthState(last_drain_at=lambda: last_drain[0], stall_after_s=300.0)
     state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))

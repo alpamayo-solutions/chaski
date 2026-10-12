@@ -617,6 +617,44 @@ def test_schedule_periodic_ignores_on_constant_and_on_signal_specs_without_warni
     assert "Unknown trigger spec" not in caplog.text
 
 
+def test_an_every_tick_fires_on_the_wall_clock_without_any_clock_configuration():
+    """``@every`` runs on APScheduler's wall-clock trigger: nothing to configure,
+    nothing to wait for, and ``now`` in the tick is the wall clock."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from chaski.failures import HandlerHealth
+
+    ticks: list[tuple[float, float, float]] = []
+
+    class _Ticking(Producer):
+        name = "wall_clock_tick_test"
+        system_element_name = "SE-Tick"
+
+        @every("50ms")
+        async def tick(self) -> None:
+            before = time.time()
+            ticks.append((before, self.now, time.time()))
+
+    instance = _Ticking()
+    instance._runtime = SimpleNamespace(handler_health=HandlerHealth())
+
+    async def main() -> None:
+        scheduler = AsyncIOScheduler()
+        assert schedule_periodic(scheduler, instance) == 1
+        scheduler.start()
+        try:
+            deadline = time.monotonic() + 5
+            while len(ticks) < 2:
+                assert time.monotonic() < deadline, "@every never fired"
+                await asyncio.sleep(0.01)
+        finally:
+            scheduler.shutdown(wait=False)
+
+    asyncio.run(main())
+    assert all(before <= now <= after for before, now, after in ticks)
+    assert ticks[1][1] - ticks[0][1] == pytest.approx(0.05, abs=0.04)
+
+
 # ─── timestamp fallback: colca's record.ts is milliseconds ───────────────
 
 
@@ -750,88 +788,28 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
     assert inst.max_active == 1, "handler and tick ran concurrently — the producer's lock did not serialize them"
 
 
-def test_real_time_health_input_does_not_stamp_outputs_in_real_time(runtime):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski.clock import Clock
-
-    runtime.clock = Clock(wall=lambda: 10000)
-    runtime.clock.apply_definition(ClockDefinition("factory", "run", 1, 10000, 1000, 1000))
+def test_an_on_metric_handler_sees_its_sample_time_as_now(runtime):
+    """``self.now`` in an ``@on_metric`` handler is the sample's timestamp, so
+    an output written without one is stamped at the event, live or replayed;
+    outside the handler it is the wall clock again."""
     seen = []
 
-    class Health(Producer):
-        name = "real_health"
+    class EventTime(Producer):
+        name = "event_time"
         system_element_name = "SE-Event"
-        alive = SignalRangeInput("on_metric_signal", time_domain="real")
+        values = SignalRangeInput("on_metric_signal")
 
-        @on_metric("alive")
-        async def on_health(self, metric):
+        @on_metric("values")
+        async def on_value(self, metric):
             seen.append(self.now)
+            seen.append(self.values.now)
 
-    dispatch, _, _ = build_dispatch(runtime, [Health().attach(runtime)])
-    record = _metric_record({"signal_id": "sig-event", "timestamp": 10000, "value": True}, ts=10000000)
+    instance = EventTime().attach(runtime)
+    dispatch, _, _ = build_dispatch(runtime, [instance])
+    record = _metric_record({"signal_id": "sig-event", "timestamp": 1000, "value": 1}, ts=10000000)
     asyncio.run(dispatch["sig-event"][0](record))
-    assert seen == [1000]
-
-
-def test_buffer_trim_preserves_a_slow_factory_timer_and_uses_real_health_time(runtime):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski.clock import Clock
-    from chaski.dataops.scheduling import timer_key
-
-    clock = Clock(wall=lambda: 10000)
-    clock.apply_definition(ClockDefinition("factory", "run", 1, 9990, 1000, 1000))
-
-    class Mixed(Producer):
-        name = "slow_timer"
-        system_element_name = "SE-Event"
-        values = SignalRangeInput("tick_only_signal", window=10)
-        health = SignalRangeInput("on_metric_signal", window=10, time_domain="real")
-
-        @every("10s")
-        async def tick(self):
-            pass
-
-    instance = Mixed().attach(runtime)
-    runtime.buffer.append("sig-tick", 1030, 0)
-    runtime.buffer.append("sig-tick", 1040, 1)
-    runtime.buffer.append("sig-tick", 1050, 2)
-    runtime.buffer.append("sig-event", 9970, -1)
-    runtime.buffer.append("sig-event", 9980, 0)
-    runtime.buffer.append("sig-event", 9999, 1)
-    runtime.buffer.set_timer_position(timer_key(instance, "tick", type(instance)._triggers[0][1]), "run", 1060)
-    trim_buffer(runtime.buffer, [instance], 10, clock)
-    assert runtime.buffer.earliest("sig-tick") == 1040
-    assert runtime.buffer.earliest("sig-event") == 9980
-
-
-def test_buffer_trim_ignores_timer_progress_of_another_clock_run(runtime):
-    from colca_data_contracts.payload import ClockDefinition
-
-    from chaski.clock import Clock
-    from chaski.dataops.scheduling import timer_key
-
-    clock = Clock(wall=lambda: 10000)
-    clock.apply_definition(ClockDefinition("factory", "run", 1, 9990, 1000, 1000))
-
-    class Timed(Producer):
-        name = "slow_timer"
-        system_element_name = "SE-Event"
-        values = SignalRangeInput("tick_only_signal", window=10)
-
-        @every("10s")
-        async def tick(self):
-            pass
-
-    instance = Timed().attach(runtime)
-    runtime.buffer.append("sig-tick", 1030, 0)
-    runtime.buffer.append("sig-tick", 1040, 1)
-    runtime.buffer.append("sig-tick", 1050, 2)
-    runtime.buffer.set_timer_position(timer_key(instance, "tick", type(instance)._triggers[0][1]), "old-run", 1060)
-    trim_buffer(runtime.buffer, [instance], 10, clock)
-    # This run's timer has not fired yet; it still needs the window from the run's start.
-    assert runtime.buffer.earliest("sig-tick") == 1030
+    assert seen == [1000, 1000]
+    assert abs(instance.now - time.time()) < 60
 
 
 # ─── ingest cursors of earlier buffer generations ──────────────────────────

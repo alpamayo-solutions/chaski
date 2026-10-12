@@ -2,8 +2,7 @@
 
 One file under the service's data directory. ``points`` (the
 retained window per input signal), ``watermarks`` (replay progress per
-producer), ``timers`` (each factory-time callback's last tick, per clock run),
-``meta`` (the store's ``generation``), and ``emitted_annotations``
+producer), ``meta`` (the store's ``generation``), and ``emitted_annotations``
 (the ids each ``AnnotationOutput`` published, so ``clear_window`` only deletes
 its own), ``backfill_jobs`` (each backfill's range and committed position, see
 :mod:`chaski.dataops.backfill`), and ``pending_outputs`` (computed samples waiting for a signal binding
@@ -41,11 +40,6 @@ CREATE TABLE IF NOT EXISTS producer_checkpoints (
     version INTEGER NOT NULL, state TEXT NOT NULL, positions TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS pending_inputs (
-    offset INTEGER PRIMARY KEY, ts REAL NOT NULL, record TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_pending_inputs_time ON pending_inputs(ts, offset);
-
 CREATE TABLE IF NOT EXISTS pending_outputs (
     source TEXT NOT NULL, ts REAL NOT NULL, value TEXT NOT NULL,
     PRIMARY KEY (source, ts)
@@ -63,12 +57,6 @@ CREATE TABLE IF NOT EXISTS watermarks (
     producer  TEXT PRIMARY KEY,
     position  REAL,
     code_hash TEXT
-);
-
-CREATE TABLE IF NOT EXISTS timers (
-    timer    TEXT PRIMARY KEY,
-    run_id   TEXT NOT NULL,
-    position REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS command_ledger (
@@ -141,9 +129,13 @@ class Buffer:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(backfill_jobs)")}
         if "window_s" not in columns:
             self._conn.execute("ALTER TABLE backfill_jobs ADD COLUMN window_s REAL")
-        # Older releases kept factory-callback progress in ``watermarks`` without
-        # the clock run it belongs to; no run can continue it.
+        # Application time (chaski 0.25 and older) kept factory-callback
+        # progress in ``timers`` and ``__clock__:`` watermarks, and a
+        # coordinated input inbox in ``pending_inputs``; nothing reads them now.
+        self._conn.execute("DROP TABLE IF EXISTS timers")
+        self._conn.execute("DROP TABLE IF EXISTS pending_inputs")
         self._conn.execute("DELETE FROM watermarks WHERE substr(producer, 1, 10) = '__clock__:'")
+        self._conn.execute("DELETE FROM meta WHERE key = 'input_intake'")
 
     def checkpoint(self, producer: str):
         """Return a producer's versioned JSON state and handled input offsets."""
@@ -163,73 +155,6 @@ class Buffer:
                 "INSERT OR REPLACE INTO producer_checkpoints VALUES (?,?,?,?,?)",
                 (producer, code_hash, version, encoded, offsets),
             )
-            if not self._deferred:
-                self._conn.commit()
-
-    def queue_inputs(self, records, scanned_to, *, limit=100000):
-        """Commit the coordinated inbox and intake offset before broker ack.
-
-        An acknowledgement retry cannot reinsert already dispatched records.
-        The separate processing watermark advances only after callbacks finish.
-        """
-        from dataclasses import asdict
-
-        from .ingest import Ingest
-
-        with self._lock, self._conn:
-            row = self._conn.execute("SELECT value FROM meta WHERE key='input_intake'").fetchone()
-            previous = int(row[0]) if row else 0
-            fresh = [r for r in records if r.offset > previous]
-            count = self._conn.execute("SELECT COUNT(*) FROM pending_inputs").fetchone()[0]
-            if count + len(fresh) > limit:
-                raise BufferError("coordinated input inbox reached its durable queue limit")
-            self._conn.executemany(
-                "INSERT OR IGNORE INTO pending_inputs VALUES (?,?,?)",
-                [(r.offset, Ingest._timestamp_of(r), json.dumps(asdict(r), allow_nan=False)) for r in fresh],
-            )
-            self._conn.execute(
-                "INSERT INTO meta VALUES ('input_intake',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(max(previous, scanned_to)),),
-            )
-
-    def input_batch(self, through, *, real_signals=(), real=False, after=0, limit=1000):
-        """Read one bounded inbox batch in its declared clock domain."""
-        from chaski.door import Record
-
-        if real and not real_signals:
-            return []
-        query = (
-            "SELECT record FROM pending_inputs WHERE offset>? "
-            "AND json_extract(record,'$.payload.signal_id') IN (SELECT value FROM json_each(?)) "
-            "ORDER BY offset LIMIT ?"
-            if real
-            else "SELECT record FROM pending_inputs WHERE ts<=? "
-            "AND json_extract(record,'$.payload.signal_id') NOT IN (SELECT value FROM json_each(?)) "
-            "ORDER BY ts,offset LIMIT ?"
-        )
-        with self._lock:
-            rows = self._conn.execute(
-                query,
-                (after if real else through, json.dumps(list(real_signals)), limit),
-            ).fetchall()
-            return [Record(**json.loads(row[0])) for row in rows]
-
-    def pending_input_start(self, signal_ids):
-        """Earliest queued event for these inputs, excluded from state replay."""
-        if not signal_ids:
-            return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT MIN(ts) FROM pending_inputs WHERE "
-                "json_extract(record,'$.payload.signal_id') IN (SELECT value FROM json_each(?))",
-                (json.dumps(list(signal_ids)),),
-            ).fetchone()
-            return row[0]
-
-    def finish_input(self, offset):
-        """Delete only after the callback's effects have completed durably."""
-        with self._lock:
-            self._conn.execute("DELETE FROM pending_inputs WHERE offset=?", (offset,))
             if not self._deferred:
                 self._conn.commit()
 
@@ -456,31 +381,6 @@ class Buffer:
             self._conn.commit()
 
     # ------------------------------------------------------------------ timers
-
-    def timer_position(self, timer: str, run_id: str) -> float | None:
-        """The last tick ``timer`` committed in clock run ``run_id``.
-
-        ``None`` if it has not fired in that run yet; a position written in
-        another run is never continued.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT position FROM timers WHERE timer = ? AND run_id = ?", (timer, run_id)
-            ).fetchone()
-        return row[0] if row is not None else None
-
-    def set_timer_position(self, timer: str, run_id: str, position: float) -> None:
-        """Commit ``timer``'s tick at ``position`` in clock run ``run_id``,
-        replacing whatever an earlier run left."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO timers (timer, run_id, position) VALUES (?, ?, ?) "
-                "ON CONFLICT(timer) DO UPDATE SET run_id = excluded.run_id, position = excluded.position",
-                (timer, run_id, position),
-            )
-            self._conn.commit()
-
-    # ------------------------------------------------------------------ emitted annotations
 
     def record_emitted_annotation(self, source: str, annotation_id: str, time_start: float) -> None:
         """Record that ``source`` (one ``AnnotationOutput``) published

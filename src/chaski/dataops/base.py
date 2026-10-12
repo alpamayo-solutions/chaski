@@ -13,11 +13,16 @@ Nothing here is process-global except the discovery record.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import threading
 import time
 from abc import ABC
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -28,6 +33,43 @@ if TYPE_CHECKING:
     from .inputs import Historian
 
 log = logging.getLogger("chaski.dataops")
+
+# The instant an @on_metric handler or a backfilled tick is evaluated at, and
+# the task it was set in (None: set outside a loop).
+_event_time: ContextVar[tuple[float, asyncio.Task | None] | None] = ContextVar("chaski_event_time", default=None)
+
+
+def _current_task() -> asyncio.Task | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+@contextmanager
+def event_time(timestamp: float) -> Iterator[None]:
+    """Evaluate one callback at its event's time: an ``@on_metric`` handler at
+    its sample's timestamp, a backfilled tick at its due time.
+
+    Context-local: other threads and tasks keep the wall clock. Entered in a
+    task, it holds for that task only; a task it starts (a trailing run, a
+    retry) runs later, on the wall clock.
+    """
+    if not math.isfinite(timestamp):
+        raise ValueError("event time must be finite")
+    token = _event_time.set((timestamp, _current_task()))
+    try:
+        yield
+    finally:
+        _event_time.reset(token)
+
+
+def current_time() -> float:
+    """The event time of the callback being evaluated, else the wall clock."""
+    instant = _event_time.get()
+    if instant is not None and (instant[1] is None or instant[1] is _current_task()):
+        return instant[0]
+    return time.time()
 
 
 @runtime_checkable
@@ -64,12 +106,6 @@ class Runtime(Protocol):
 
     @property
     def historian(self) -> Historian | None: ...
-
-
-def runtime_now(runtime: Runtime) -> float:
-    """Application time; older/custom runtimes default to the host clock."""
-    clock = getattr(runtime, "clock", None)
-    return clock.now() if clock is not None else time.time()
 
 
 class Producer(ABC):
@@ -127,8 +163,10 @@ class Producer(ABC):
 
     @property
     def now(self) -> float:
-        """Current application time, or the scheduled instant inside a timed callback."""
-        return runtime_now(self.runtime)
+        """The time of the event being handled (a sample's timestamp in an
+        ``@on_metric`` handler, the due time of a backfilled tick), otherwise
+        the host's wall clock."""
+        return current_time()
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)

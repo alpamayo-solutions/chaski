@@ -23,7 +23,7 @@ from chaski.failures import UNHEALTHY, HandlerHealth
 log = logging.getLogger("chaski.dataops.health")
 
 PORT_DEFAULT = 8888
-#: In coordinated step mode, no finished step for this long is a stall.
+#: An ingest busy (not waiting) without finishing a drain for this long is a stall.
 STALL_AFTER_MIN_S = 300.0
 #: How long the broker may be away before the probe fails: paho reconnects
 #: within seconds of a node restart, so this is a reconnect that never comes.
@@ -44,8 +44,8 @@ class HealthState:
     ingest that never started (nothing resolved yet) is healthy: a fresh node
     waiting to be commissioned. A broker link that stays down for
     ``broker_grace_s`` fails the probe too: without it no command, wake-up or
-    watched record arrives. In coordinated step mode ``last_drain_at`` is the
-    step loop's, and ``stall_after_s`` without a step is a stall. So does
+    watched record arrives. An ingest that is busy, not waiting, and has not
+    finished a drain for ``stall_after_s`` is stalled. So does
     another process running as this service (``identity_conflict``): the
     broker hands their one session back and forth and wake-ups get lost.
 
@@ -55,7 +55,7 @@ class HealthState:
 
     Until startup is done (``ready``) the answer is a 503 with ``ingest``
     ``starting`` and ``not_ready`` naming what startup waits for: a node that
-    cannot be reached (``cannot reach Colca at ...``), its clock, its
+    cannot be reached (``cannot reach Colca at ...``), its
     definitions. The door answers from the first moment, before the node does.
 
     ``backfill`` reports a running backfill (:mod:`chaski.dataops.backfill`):

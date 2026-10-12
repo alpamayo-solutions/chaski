@@ -19,7 +19,6 @@ from typing import Any
 
 from colca_data_contracts.payload import DataTag
 
-from .clock import Clock, ClockNotReady, ClockStatus
 from .command import Actor, CommandSender, SentCommand, is_progress
 from .connector import (
     ConnectorService,
@@ -48,9 +47,6 @@ from .topic_wakeup import TopicWakeup
 __all__ = [
     "Actor",
     "Backoff",
-    "Clock",
-    "ClockNotReady",
-    "ClockStatus",
     "ColcaUnavailable",
     "Command",
     "CommandRejected",

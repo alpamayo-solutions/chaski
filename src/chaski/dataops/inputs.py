@@ -33,12 +33,11 @@ from __future__ import annotations
 
 import copy
 import logging
-import time
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from . import resolve
-from .base import runtime_now
+from .base import current_time
 from .triggers import parse_duration
 
 if TYPE_CHECKING:
@@ -129,10 +128,7 @@ class SignalRangeInput(_PerInstance):
         window: str | float = DEFAULT_WINDOW,
         *,
         path: str | None = None,
-        time_domain: Literal["application", "real"] = "application",
     ) -> None:
-        if time_domain not in ("application", "real"):
-            raise ValueError("time_domain must be application or real")
         if path is not None:
             if signal_name is not None or system_element_name is not None:
                 raise ValueError("SignalRangeInput takes a path, or a signal name with an optional element, not both")
@@ -141,7 +137,6 @@ class SignalRangeInput(_PerInstance):
                 raise ValueError("SignalRangeInput: path must not be empty")
         elif not signal_name:
             raise ValueError("SignalRangeInput needs a signal name or a path")
-        self.time_domain = time_domain
         self.path = path
         self.signal_name = path if path is not None else signal_name
         self.system_element_name = system_element_name
@@ -250,12 +245,9 @@ class SignalRangeInput(_PerInstance):
 
     @property
     def now(self) -> float:
-        """Time for this input: infrastructure health can opt into real time."""
-        runtime = self._runtime()
-        if self.time_domain == "real":
-            clock = getattr(runtime, "clock", None)
-            return clock.real_now() if clock is not None else time.time()
-        return runtime_now(runtime)
+        """The time of the event being handled, otherwise the host's wall clock
+        (see :attr:`chaski.dataops.Producer.now`)."""
+        return current_time()
 
     @property
     def latest_value(self) -> Any:

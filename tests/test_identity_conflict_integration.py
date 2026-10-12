@@ -63,7 +63,7 @@ def test_a_second_process_on_one_identity_is_an_error_and_unhealthy(tmp_path, ca
             ]
             assert len(registrations) == 1
             metadata = registrations[0].payload.get("architecture_metadata") or {}
-            assert not {"status", "detail", "metrics", "application_clock"} & metadata.keys()
+            assert not {"status", "detail", "metrics"} & metadata.keys()
         finally:
             if second is not None:
                 second.close()
