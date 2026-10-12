@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.1](https://github.com/alpamayo-solutions/chaski/compare/v0.26.0...v0.26.1) (2026-10-12)
+
+
+### Fixes
+
+* **deps:** accept colca 0.35 ([#167](https://github.com/alpamayo-solutions/chaski/issues/167)) ([2740dff](https://github.com/alpamayo-solutions/chaski/commit/2740dff9a805bae5c13a52301b3ccb2ec50dc935))
+
 ## [0.26.0](https://github.com/alpamayo-solutions/chaski/compare/v0.25.2...v0.26.0) (2026-10-12)
 
 
