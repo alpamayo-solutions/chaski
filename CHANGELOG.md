@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.26.0](https://github.com/alpamayo-solutions/chaski/compare/v0.25.2...v0.26.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* the Clock, ClockNotReady and ClockStatus exports, the clock= and step_dependencies= arguments, Service.report_progress, ServiceTelemetry.clock_progress and SignalRangeInput(time_domain=...) are removed.
+
+### Changes
+
+* remove application time ([#165](https://github.com/alpamayo-solutions/chaski/issues/165)) ([fea594a](https://github.com/alpamayo-solutions/chaski/commit/fea594a99c7b0435023bedf6c84eb3afb3f70578))
+
 ## [0.25.2](https://github.com/alpamayo-solutions/chaski/compare/v0.25.1...v0.25.2) (2026-10-10)
 
 
