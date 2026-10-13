@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.3](https://github.com/alpamayo-solutions/chaski/compare/v0.26.2...v0.26.3) (2026-10-13)
+
+
+### Fixes
+
+* **stream-changes:** bound the wait on a ring and say why it ended ([#171](https://github.com/alpamayo-solutions/chaski/issues/171)) ([8592d6d](https://github.com/alpamayo-solutions/chaski/commit/8592d6dc02076601516722ce82d82180d7df14e1))
+
 ## [0.26.2](https://github.com/alpamayo-solutions/chaski/compare/v0.26.1...v0.26.2) (2026-10-12)
 
 
