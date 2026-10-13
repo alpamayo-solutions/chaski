@@ -13,8 +13,8 @@ class Wakeup(Doorbell):
     def notify(self):
         self.ring()
 
-    def wait(self, version, timeout=None):
-        return self.wait_after(version, timeout)
+    def wait(self, version, timeout=None, *, stop=None):
+        return self.wait_after(version, timeout, stop=stop)
 
     async def wait_async(self, version, timeout=None, *, stop=None):
         waiting = asyncio.create_task(self.after(version))

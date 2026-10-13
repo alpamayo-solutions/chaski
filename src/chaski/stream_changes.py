@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import threading
 import time
@@ -9,6 +10,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from ._wakeup import Wakeup
+from .doorbell import IDLE_DRAIN_S
 from .outage import Outage
 from .retry import Backoff
 
@@ -176,6 +178,27 @@ class StreamChanges:
         self.thread.join(timeout=16)
 
 
+class Woke(enum.Enum):
+    """Why :meth:`BatchWait.wait` returned.
+
+    Only :attr:`RESUMED` is true in a condition: ``wait`` returned a bool
+    that said just that, and callers reset their backoff on it.
+    """
+
+    #: The signal rang after the version the caller took.
+    RANG = "rang"
+    #: Nothing rang within the bound, or the retry backoff passed. Read from
+    #: the cursor anyway: the ring may have been missed.
+    TIMED_OUT = "timed_out"
+    #: ``resume`` rang during a retry wait: the subscription is back.
+    RESUMED = "resumed"
+    #: ``stop`` was set.
+    STOPPED = "stopped"
+
+    def __bool__(self) -> bool:
+        return self is Woke.RESUMED
+
+
 class BatchWait:
     """Minimum spacing between drains; pages within a drain run immediately."""
 
@@ -190,19 +213,34 @@ class BatchWait:
     def version(self):
         return self.signal.version
 
-    def wait(self, version, *, retry=None, resume=None, resume_since=0):
-        """Wait for the next drain. After a failure (``retry`` seconds) only
-        the backoff or ``resume`` ringing after ``resume_since`` (the
-        subscription re-established after an outage) ends the wait: busy hints
-        cannot bypass server backpressure. True when ``resume`` ended it."""
-        resumed = False
+    def wait(self, version, *, timeout: float | None = IDLE_DRAIN_S, retry=None, resume=None, resume_since=0) -> Woke:
+        """Wait for the next drain and say why it is due (:class:`Woke`).
+
+        The wait ends when the signal rings after ``version``, when ``stop``
+        is set, or after ``timeout`` seconds without a ring. A ring is a
+        wake-up, not a delivery: one that is never sent, or sent by something
+        that no longer exists, must not stall the consumer. So the wait is
+        bounded by default (:data:`chaski.doorbell.IDLE_DRAIN_S`, 5 minutes),
+        and on :attr:`Woke.TIMED_OUT` the consumer reads from its cursor as
+        it does after a ring. The bound is a recovery read after a long
+        silence, not a polling interval: keep it long. ``timeout=None``
+        waits for the ring alone; pass it only when a missed ring cannot
+        leave work unread.
+
+        After a failure (``retry`` seconds) only the backoff or ``resume``
+        ringing after ``resume_since`` (the subscription re-established after
+        an outage) ends the wait: busy hints cannot bypass server
+        backpressure. :attr:`Woke.RESUMED` when ``resume`` ended it.
+        """
         if retry is not None:
             if resume is None:
                 self.stop.wait(retry)
+                woke = Woke.TIMED_OUT
             else:
                 resumed = resume.wait_after(resume_since, retry, stop=self.stop)
+                woke = Woke.RESUMED if resumed else Woke.TIMED_OUT
         else:
-            self.signal.wait(version)
+            woke = Woke.RANG if self.signal.wait(version, timeout, stop=self.stop) else Woke.TIMED_OUT
         self.stop.wait(max(0, self.started + self.interval - time.monotonic()))
         self.started = time.monotonic()
-        return resumed
+        return Woke.STOPPED if self.stop.is_set() else woke

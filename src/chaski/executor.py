@@ -46,6 +46,7 @@ from franzmq.errors import PublishTimeout
 
 from chaski.command import Actor, EnvelopeError, check_operation_id, is_progress
 from chaski.door import Page, Record, Stream, StreamGapError
+from chaski.doorbell import IDLE_DRAIN_S
 from chaski.service import NotSent, writes_until
 
 log = logging.getLogger("chaski.executor")
@@ -334,7 +335,9 @@ class CommandExecutor:
             wake_task = asyncio.ensure_future(self._wake.wait())
             stop_task = asyncio.ensure_future(stop.wait())
             try:
-                await asyncio.wait({wake_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                # A timeout drains too: the stream is the truth, the wake only
+                # a hint, and one that never came must not leave a command unread.
+                await asyncio.wait({wake_task, stop_task}, timeout=IDLE_DRAIN_S, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 for task in (wake_task, stop_task):
                     if not task.done():

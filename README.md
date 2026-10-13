@@ -155,7 +155,14 @@ on every reconnect, and `stream.follow(bell)` drains after each ring. Pass the
 same topics as `svc.stream(..., topics=[...])`. A filtered stream whose topics
 stay silent also drains every `chaski.doorbell.IDLE_DRAIN_S` (5 minutes), so
 its cursor moves past the records it skips instead of holding the node's
-retention (`follow(bell, idle_drain_s=...)`). A consumer that stops
+retention (`follow(bell, idle_drain_s=...)`). The same bound makes up for a
+ring that never came: a ring is a wake-up, not a delivery, so every wait on one
+ends after that silence and the consumer reads from its cursor.
+`chaski.stream_changes.BatchWait.wait(version)` is bounded by it too and
+returns why it ended (`Woke.RANG`, `Woke.TIMED_OUT`, `Woke.RESUMED`,
+`Woke.STOPPED`); on `TIMED_OUT` read from the cursor as after a ring. It is a
+recovery after a long silence, not a polling interval; `timeout=None` waits
+for the ring alone. A consumer that stops
 reading anyway shows as the node's `cursor_lag` finding (colca 0.19+), which
 `svc.cursor_lag` follows and a `DataOpsService` health door fails on. A
 `DataOpsService` reads `metrics` on one cursor per buffer generation; a new

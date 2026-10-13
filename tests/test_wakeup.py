@@ -36,14 +36,18 @@ def test_async_wait_cancellation_does_not_leave_a_closed_loop_subscriber():
 
 
 def test_batch_retry_is_not_shortened_by_continuous_hints():
-    from types import SimpleNamespace
-
-    from chaski.stream_changes import BatchWait
+    from chaski.stream_changes import BatchWait, Woke
 
     calls = []
+
+    class Stop(threading.Event):
+        def wait(self, timeout=None):
+            calls.append(timeout)
+            return False
+
     wake = Wakeup()
     before = wake.version
     wake.notify()
-    batch = BatchWait(wake, interval=0, stop=SimpleNamespace(wait=calls.append))
-    batch.wait(before, retry=90)
+    batch = BatchWait(wake, interval=0, stop=Stop())
+    assert batch.wait(before, retry=90) is Woke.TIMED_OUT
     assert calls[0] == 90

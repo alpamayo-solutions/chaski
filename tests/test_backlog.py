@@ -69,6 +69,24 @@ def test_push_only_reads_and_causal_final_fence():
         assert not monitor.subscription.is_alive()
 
 
+def test_a_lost_backlog_hint_is_made_up_for_after_the_bound(monkeypatch):
+    monkeypatch.setattr("chaski.backlog.IDLE_DRAIN_S", 0.05)
+    door = Door()
+    door.release.set()
+    changes = Wakeup()
+    monitor = BacklogView(door, ["c/projector/"], changes, interval=0.01).start()
+    try:
+        assert door.entered.wait(1)
+        time.sleep(0.2)  # the first read is done and nothing rings any more
+        reads = door.reads
+        deadline = time.monotonic() + 5
+        while door.reads == reads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert door.reads > reads
+    finally:
+        monitor.close()
+
+
 def test_backlog_hints_cannot_bypass_retry_after(monkeypatch):
     import httpx
 
