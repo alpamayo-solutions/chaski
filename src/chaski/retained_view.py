@@ -31,10 +31,10 @@ from colca_data_contracts.root import topic_prefix
 
 from ._wakeup import Wakeup
 from .door import KvEntry
-from .doorbell import Doorbell
+from .doorbell import IDLE_DRAIN_S, Doorbell
 from .outage import ColcaUnavailable, Outage
 from .retry import Backoff
-from .stream_changes import BatchWait, StreamChanges
+from .stream_changes import BatchWait, StreamChanges, Woke
 
 log = logging.getLogger(__name__)
 
@@ -410,8 +410,14 @@ class RetainedView:
                     return (self.revision, copy.deepcopy(list(self.entries.values()))) if copy_result else None
             raise ColcaUnavailable("Retained view could not catch up; refusing stale state")
 
-    def _refresh_changed(self):
+    def _refresh_changed(self, *, unhinted=False):
+        """Drain the streams a hint named since their last drain. ``unhinted``
+        drains every stream from its cursor to the tail instead, whatever the
+        hints say: the read that makes up for a hint that never came."""
         with self.lock:
+            if unhinted:
+                self._snapshot(copy_result=False)
+                return
             streams = [
                 s for s in self.streams if not self.available or self.watch[s].version != self._stream_versions.get(s)
             ]
@@ -421,12 +427,13 @@ class RetainedView:
     def _run(self):
         backoff = Backoff()
         batch = BatchWait(self.watch.changes, interval=DRAIN_INTERVAL_S, stop=self.stop)
+        silent = False
         while not self.stop.is_set():
             version = self.watch.changes.version
             resumed_seen = self.watch.reconnected.version
             revision = self.revision
             try:
-                self._refresh_changed()
+                self._refresh_changed(unhinted=silent)
                 backoff.reset()
                 retry = None
                 batch.interval = DRAIN_INTERVAL_S if self.revision != revision else WALK_INTERVAL_S
@@ -437,8 +444,13 @@ class RetainedView:
                 retry = backoff.delay(exc)
                 if not self._outage.failed(exc, delay=retry):
                     log.error("Retained view %s unavailable; retrying in %.1fs", self.cursor, retry, exc_info=exc)
-            if batch.wait(version, retry=retry, resume=self.watch.reconnected, resume_since=resumed_seen):
+            woke = batch.wait(
+                version, timeout=IDLE_DRAIN_S, retry=retry, resume=self.watch.reconnected, resume_since=resumed_seen
+            )
+            if woke is Woke.RESUMED:
                 backoff.reset()  # the subscription is back: refresh now, back off afresh
+            # No hint for IDLE_DRAIN_S: read from the cursors, in case one was missed.
+            silent = retry is None and woke is Woke.TIMED_OUT
 
     def close(self):
         self.stop.set()

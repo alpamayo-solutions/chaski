@@ -29,8 +29,11 @@ import asyncio
 import threading
 from collections.abc import Callable
 
-#: How long a consumer waits on a silent bell before it drains anyway, to walk
-#: its cursor past records its filter skips (see the module docstring).
+#: How long a consumer waits on a silent bell before it reads from its cursor
+#: anyway: to walk the cursor past records its filter skips (see the module
+#: docstring), and because a ring is a wake-up, not a delivery: one that was
+#: never sent must not stall the consumer. Long on purpose: this is the
+#: recovery after a silence, not a polling interval.
 IDLE_DRAIN_S = 300.0
 
 
@@ -60,7 +63,11 @@ class Doorbell:
 
     def wait_after(self, since: int, timeout: float | None = None, *, stop: threading.Event | None = None) -> bool:
         """Block until the bell rang after ``since`` was taken (at once when it
-        already has). False when ``timeout`` passed or ``stop`` was set first."""
+        already has). False when ``timeout`` passed or ``stop`` was set first.
+
+        Without a ``timeout`` only a ring or ``stop`` ends the wait. A
+        consumer that drains a stream passes one (:data:`IDLE_DRAIN_S`) and
+        reads from its cursor when it passes."""
         if stop is None:
             with self._cond:
                 return self._cond.wait_for(lambda: self._generation != since, timeout)
@@ -77,7 +84,9 @@ class Doorbell:
             self._cond.notify_all()
 
     async def after(self, since: int) -> None:
-        """Wait on the running loop until the bell rang after ``since``."""
+        """Wait on the running loop until the bell rang after ``since``. It has
+        no bound of its own: a consumer that drains a stream waits on it with
+        a timeout (:data:`IDLE_DRAIN_S`) and reads from its cursor then."""
         loop = asyncio.get_running_loop()
         with self._cond:
             if self._generation != since:

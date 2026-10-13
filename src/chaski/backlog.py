@@ -5,6 +5,7 @@ import threading
 import time
 
 from ._wakeup import Wakeup
+from .doorbell import IDLE_DRAIN_S
 from .outage import ColcaUnavailable, Outage
 from .retry import Backoff
 
@@ -93,7 +94,9 @@ class BacklogView:
                 # Backlog hints cannot bypass server backpressure.
                 self.stop.wait(retry)
             else:
-                self.wake.wait(version)
+                # A hint that never came must not leave the rows stale for
+                # good: read again after a long silence.
+                self.wake.wait(version, IDLE_DRAIN_S, stop=self.stop)
             self.stop.wait(max(0, started + self.interval - time.monotonic()))
 
     def close(self):

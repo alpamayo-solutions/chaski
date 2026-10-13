@@ -1448,7 +1448,9 @@ class Service:
                 self._pending_stop.wait(delay)
                 continue
             if not progressed:
-                self._pending_wake.wait(version)
+                # The buffered rows are the truth, the ring only a wake-up:
+                # look again after a long silence, in case one was missed.
+                self._pending_wake.wait(version, IDLE_DRAIN_S, stop=self._pending_stop)
 
     # -- records and commands ------------------------------------------------
 

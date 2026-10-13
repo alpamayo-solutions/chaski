@@ -113,6 +113,26 @@ def test_a_single_segment_path_binds_at_the_connectors_mount_not_at_the_source(t
     assert metrics[0].value == 42.0
 
 
+def test_a_buffered_sample_is_published_although_the_ring_for_its_binding_is_lost(tmp_path, monkeypatch):
+    """The buffered rows are the truth, the ring only a wake-up: the drain
+    looks again after the bound."""
+    import time
+
+    monkeypatch.setattr("chaski.service.IDLE_DRAIN_S", 0.05)
+    svc, client = _service(tmp_path, monkeypatch)
+
+    svc.publish("temp", 42.0)
+    tag_id = _minted_tag_id(client)
+    time.sleep(0.2)  # the drain found no binding and waits
+    monkeypatch.setattr(svc._pending_wake, "ring", lambda: None)
+
+    signal_topic = Topic(payload_type=Signal, node_id="n-edge1", context=("line1", "temp"))
+    client.deliver(signal_topic, Signal(id="sig-1", name="temp", data_tag=tag_id, is_published=True))
+
+    drained(svc)
+    assert [p.value for _t, p in client.published if isinstance(p, Metric)] == [42.0]
+
+
 def test_a_multi_segment_path_binds_under_the_subscribed_mount_and_still_matches(tmp_path, monkeypatch):
     """A source with its own child element matches too; here the bound path and
     the source happen to be the same string."""

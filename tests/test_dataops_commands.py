@@ -298,6 +298,29 @@ async def test_the_stream_growing_wakes_a_drain():
 
 
 @run_async
+async def test_a_command_whose_hint_is_lost_is_handled_after_the_bound(monkeypatch):
+    """No hint and no MQTT message announces the second command; the executor
+    reads from its cursor again once the bound has passed."""
+    monkeypatch.setattr(command_executor, "IDLE_DRAIN_S", 0.05)
+    ex, producer, door = executor(record(offset=1))
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(ex.run_forever(stop))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if producer.seen:
+            break
+    await asyncio.sleep(0.2)  # the first drain is done and the executor waits
+    door.queue(Page(records=[record(offset=2, correlation_id="corr-2")], next=3))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if len(producer.seen) == 2:
+            break
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert [c.correlation_id for c in producer.seen] == ["corr-1", "corr-2"]
+
+
+@run_async
 async def test_a_command_without_correlation_id_runs_but_is_not_answered():
     ex, producer, door = executor(record(correlation_id=""))
     await ex.drain()

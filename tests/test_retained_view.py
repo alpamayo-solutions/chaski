@@ -411,3 +411,39 @@ def test_the_view_is_woken_by_records_of_every_contract():
     node's pruner."""
     current = view(Door())
     assert current.watch.contracts == ()
+
+
+def test_a_lost_hint_does_not_stall_the_view(monkeypatch):
+    """The view's own cursor is the truth, the hint only a wake-up: when a
+    change brings no hint, the view reads from its cursor after the bound."""
+    import time
+
+    from chaski.door import Hint
+
+    monkeypatch.setattr("chaski.retained_view.IDLE_DRAIN_S", 0.05)
+
+    class SilentDoor(Door):
+        def watch(self, streams, *, stop, contracts=(), interval_ms=None):
+            # One hint when the subscription starts, then nothing, although
+            # the stream grows: the subscription stays up and silent.
+            yield Hint(streams=list(streams), next={"metrics": len(self.records) + 1})
+            while not stop():
+                time.sleep(0.01)
+
+    door = SilentDoor()
+    door.put({"value": 1})
+    current = view(door).start()
+    try:
+        deadline = time.monotonic() + 5
+        while not current.available and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert current.read()[0].payload == {"value": 1}
+        time.sleep(0.2)  # the hinted drain is done and the view waits
+        door.put({"value": 2})
+        deadline = time.monotonic() + 5
+        while current.read()[0].payload != {"value": 2} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert current.read()[0].payload == {"value": 2}
+        assert door.position == 2
+    finally:
+        current.close()
