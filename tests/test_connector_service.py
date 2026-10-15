@@ -40,6 +40,7 @@ from chaski.connector import (
     SourceDisconnectedError,
     Telemetry,
     has_non_finite,
+    is_equal,
     refusal_is_final,
 )
 from chaski.door import KvEntry
@@ -595,6 +596,29 @@ def test_precision_rounds_values_and_decides_what_is_a_change(node, driver, monk
     driver.values["Axis1/Temperature"] = 42.14  # still 42.1: not a change
     poll(svc)
     assert [m.value for _t, m in node.metrics()] == [42.0, 42.1]
+
+
+def test_a_one_step_change_at_precision_zero_is_reported_both_ways(node, driver, monkeypatch):
+    svc = started(node, driver, monkeypatch)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s", precision=0)
+    driver.values["Axis1/Temperature"] = 330.0
+    poll(svc)
+    driver.values["Axis1/Temperature"] = 331.0
+    poll(svc)
+    driver.values["Axis1/Temperature"] = 330.0  # a setpoint put back: one step is a change
+    poll(svc)
+    assert [m.value for _t, m in node.metrics()] == [330.0, 331.0, 330.0]
+
+
+def test_float_noise_within_half_a_step_is_not_a_change():
+    assert is_equal(330.0, 330.0000001, 0)
+    assert is_equal(42.1, 42.1 + 1e-12, 1)
+    assert not is_equal(331.0, 330.0, 0)
+    assert not is_equal(42.1, 42.0, 1)
+    assert is_equal(float("inf"), float("inf"), 0)
+    assert is_equal(float("nan"), float("nan"), 2)
+    assert not is_equal(1.0, 1.0000001, None), "without a precision only exact floats are equal"
+    assert is_equal(3, 3, 0) and not is_equal(3, 4, 0) and is_equal("a", "a", 0) and is_equal(None, None, 0)
 
 
 def test_every_metric_of_one_poll_carries_the_same_timestamp(node, driver, monkeypatch):

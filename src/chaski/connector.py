@@ -100,7 +100,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import isclose, isfinite, isnan
+from math import isfinite, isnan
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
@@ -309,16 +309,18 @@ class Telemetry(ServiceTelemetry):
 
 
 def is_equal(a: Any, b: Any, precision: int | None) -> bool:
-    """Value equality for change detection: two floats are equal within the
-    Signal's precision (absolute tolerance ``10**-precision``); NaN equals
-    NaN; everything else is ``==``."""
+    """Value equality for change detection: two floats are equal when they
+    differ by less than half a step of the Signal's precision
+    (``0.5 * 10**-precision``), so one full step is always a change and
+    float noise below it is not; NaN equals NaN; everything else is ``==``."""
     if a is b:
         return True
     if isinstance(a, float) and isinstance(b, float):
         if isnan(a) and isnan(b):
             return True
-        tol = 10 ** (-precision) if precision is not None else 0.0
-        return isclose(a, b, rel_tol=0.0, abs_tol=tol)
+        if a == b or precision is None:
+            return a == b
+        return abs(a - b) < 0.5 * 10 ** (-precision)
     return a == b
 
 

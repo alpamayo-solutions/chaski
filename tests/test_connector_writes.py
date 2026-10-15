@@ -106,6 +106,27 @@ def test_a_value_the_source_did_not_keep_is_answered_failed_with_the_value_read(
     assert result == {"outcome": "failed", "requested": 99.0, "value": 20.0}
 
 
+def test_a_read_back_one_step_off_is_not_applied(node, writable, monkeypatch):
+    svc = started(node, writable, monkeypatch)
+    bind(node, svc, SETPOINT, path=PATH, signal_id="01JSIG1", precision=0)
+    writable.applies = lambda value: value - 1.0  # the PLC keeps one step less
+
+    code, _message, result = write(svc, PATH, 331.0)
+
+    assert code == 409
+    assert result == {"outcome": "failed", "requested": 331.0, "value": 330.0}
+
+
+def test_a_read_back_within_half_a_step_is_applied(node, writable, monkeypatch):
+    svc = started(node, writable, monkeypatch)
+    bind(node, svc, SETPOINT, path=PATH, signal_id="01JSIG1", precision=1)
+    writable.applies = lambda value: value + 0.02  # float noise from the source
+
+    code, _message, result = write(svc, PATH, 12.5)
+
+    assert code == 200 and result["outcome"] == "applied"
+
+
 def test_a_refused_write_is_failed_and_a_lost_read_back_is_unknown(node, writable, monkeypatch):
     svc = started(node, writable, monkeypatch)
     bind(node, svc, SETPOINT, path=PATH, signal_id="01JSIG1")
