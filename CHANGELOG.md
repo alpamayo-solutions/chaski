@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.26.5](https://github.com/alpamayo-solutions/chaski/compare/v0.26.4...v0.26.5) (2026-10-16)
+
+
+### Fixes
+
+* **connector:** treat one precision step as a change in is_equal ([1a54dc2](https://github.com/alpamayo-solutions/chaski/commit/1a54dc25e446e3d02e276722616b17d417c3fc97))
+* **deps:** accept colca 0.38 ([199e6da](https://github.com/alpamayo-solutions/chaski/commit/199e6da717273d09c30475c65ba0edef6298f1de))
+
 ## [0.26.4](https://github.com/alpamayo-solutions/chaski/compare/v0.26.3...v0.26.4) (2026-10-14)
 
 
