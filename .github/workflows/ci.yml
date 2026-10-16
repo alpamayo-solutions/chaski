@@ -11,8 +11,8 @@ permissions:
 
 env:
   # The colca chaski is developed against: its data contracts and the broker of
-  # the integration tests. colca 0.37.0: signal access and relationships (colca #224).
-  COLCA_REF: 5f5d289ac34c3cf611783466490a30a55eada6bf
+  # the integration tests. colca 0.38.0: signal process tolerance (colca #232).
+  COLCA_REF: 8ce92ca217bcbea4ad5f50dd6ae105e3b498337d
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
