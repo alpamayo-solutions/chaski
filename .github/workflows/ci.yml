@@ -11,8 +11,8 @@ permissions:
 
 env:
   # The colca chaski is developed against: its data contracts and the broker of
-  # the integration tests. colca 0.39.0: the node's api hands over app notifications (colca #233).
-  COLCA_REF: 91bf1abaf5b757187b7e71110a4e8c623110dc22
+  # the integration tests. colca 0.40.0: value definitions on signals, FaultCodes (colca #235).
+  COLCA_REF: 60ecbf4ad103f5517de98fb01da8ffe9bb1c23e9
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
