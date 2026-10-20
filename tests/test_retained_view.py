@@ -447,3 +447,105 @@ def test_a_lost_hint_does_not_stall_the_view(monkeypatch):
         assert door.position == 2
     finally:
         current.close()
+
+
+def _run_view(door):
+    """A view hydrated once, with its subscription loop running (no real watch door)."""
+    current = view(door)
+    current.synchronize()
+    current.thread.start()
+    return current
+
+
+def _stop_view(current):
+    current.stop.set()
+    current.watch.changes.notify()
+    current.thread.join(timeout=5)
+
+
+def _hint(current):
+    """What a stream-change hint does: ring the stream and the view's loop."""
+    current.watch["metrics"].notify()
+    current.watch.changes.notify()
+
+
+def _wait(condition, timeout=5.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_a_short_refusal_of_a_background_drain_keeps_the_view_readable(monkeypatch):
+    """A drain Colca refuses for a moment (a 429 under its rate limit, a restart) leaves
+    the view as it was: one drain behind, as during any batch wait. Readers keep the
+    last applied state instead of an error while the drain retries with its backoff."""
+    import httpx
+
+    monkeypatch.setattr("chaski.retained_view.STALE_GRACE_S", 30.0)
+    door = Door()
+    door.put({"value": 1})
+    refusals = []
+
+    def refuse(stream, cursor, **kwargs):
+        refusals.append(stream)
+        request = httpx.Request("GET", "http://colca/fetch")
+        raise httpx.HTTPStatusError(
+            "429", request=request, response=httpx.Response(429, headers={"Retry-After": "1"}, request=request)
+        )
+
+    current = _run_view(door)
+    try:
+        door.fetch = refuse
+        _hint(current)  # the loop drains and is refused
+        assert _wait(lambda: refusals)
+        assert current.available
+        assert current.read()[0].payload == {"value": 1}
+    finally:
+        _stop_view(current)
+
+
+def test_a_refusal_that_outlasts_the_grace_makes_the_view_unavailable(monkeypatch):
+    monkeypatch.setattr("chaski.retained_view.STALE_GRACE_S", 0.2)
+    door = Door()
+    door.put({"value": 1})
+    current = _run_view(door)
+    try:
+        door.fail = True  # ConnectionError: Colca is away
+        _hint(current)
+        assert _wait(lambda: current._failing_since is not None)
+        assert _wait(lambda: not current.available or _raises(current.read), timeout=2)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            current.read()
+        door.fail = False  # Colca is back: the loop's retry recovers the view
+        assert _wait(lambda: current.available, timeout=10)
+        assert current.read()[0].payload == {"value": 1}
+    finally:
+        _stop_view(current)
+
+
+def test_a_defect_in_a_drain_makes_the_view_unavailable_at_once(monkeypatch):
+    monkeypatch.setattr("chaski.retained_view.STALE_GRACE_S", 30.0)
+    door = Door()
+    door.put({"value": 1})
+
+    def broken(stream, cursor, **kwargs):
+        raise ValueError("a bug, not an outage")
+
+    current = _run_view(door)
+    try:
+        door.fetch = broken
+        _hint(current)
+        assert _wait(lambda: not current.available)
+    finally:
+        _stop_view(current)
+
+
+def _raises(read):
+    try:
+        read()
+    except RuntimeError:
+        return True
+    return False

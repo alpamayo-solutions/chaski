@@ -16,6 +16,14 @@ stood still between relevant changes: the node's pruner, which never cuts
 below the lowest cursor, kept everything after it, and the cursor read as lag.
 Drains that found nothing of the view's start at most :data:`WALK_INTERVAL_S`
 apart, so a stream busy with other contracts costs a bounded request rate.
+
+A background drain that Colca refuses for a moment (a ``429`` under its rate
+limit, a ``503``, a restart: :func:`chaski.outage.expected_failure`) leaves
+the view readable with the state it last applied for up to
+:data:`STALE_GRACE_S`, while the drain retries with its backoff: the view is
+one drain behind, as during any batch wait. Past that, or on any other
+failure, the view refuses reads (:class:`chaski.outage.ColcaUnavailable`)
+until a drain succeeds.
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from colca_data_contracts.root import topic_prefix
 from ._wakeup import Wakeup
 from .door import KvEntry
 from .doorbell import IDLE_DRAIN_S, Doorbell
-from .outage import ColcaUnavailable, Outage
+from .outage import ColcaUnavailable, Outage, expected_failure
 from .retry import Backoff
 from .stream_changes import BatchWait, StreamChanges, Woke
 
@@ -47,6 +55,9 @@ DRAIN_INTERVAL_S = 0.1
 #: past records of other contracts or paths. A change of the view's own waits
 #: at most this long, and only while the stream is busy with others.
 WALK_INTERVAL_S = 1.0
+#: How long an available view keeps serving its last applied state while its
+#: background drain fails for a reason Colca causes and retries (see the module).
+STALE_GRACE_S = 30.0
 
 
 @dataclass(frozen=True, init=False)
@@ -160,6 +171,9 @@ class RetainedView:
         self._drained_on: dict[str, int] = {}
         self.initialized = False
         self.available = False
+        #: Monotonic time the background drain started failing while the view
+        #: stayed readable; None while it succeeds.
+        self._failing_since: float | None = None
         self.revision = 0
         self.changes = Wakeup()
         # Rung whenever a stream position moves, also without a state change
@@ -275,6 +289,8 @@ class RetainedView:
         with self.lock:
             if not self.initialized:
                 return self.synchronize()
+            if self._failing_since is not None and time.monotonic() - self._failing_since >= STALE_GRACE_S:
+                self._unavailable()
             if not self.available:
                 raise ColcaUnavailable("Retained view unavailable; waiting for subscription recovery")
             return self.revision, copy.deepcopy(list(self.entries.values()))
@@ -294,6 +310,7 @@ class RetainedView:
 
     def _unavailable(self):
         with self.lock:
+            self._failing_since = None
             if self.available:
                 self.available = False
                 self.revision += 1
@@ -401,6 +418,7 @@ class RetainedView:
                     if not self.available:
                         self.revision += 1
                     self.available = True
+                    self._failing_since = None
                     self._outage.recovered()
                     if self.revision != previous_revision:
                         self.changes.notify()
@@ -438,9 +456,10 @@ class RetainedView:
                 retry = None
                 batch.interval = DRAIN_INTERVAL_S if self.revision != revision else WALK_INTERVAL_S
             except Exception as exc:
-                self._unavailable()
                 if self.stop.is_set():
                     break  # closing: a drain cut short is not an outage
+                if not self._tolerate(exc):
+                    self._unavailable()
                 retry = backoff.delay(exc)
                 if not self._outage.failed(exc, delay=retry):
                     log.error("Retained view %s unavailable; retrying in %.1fs", self.cursor, retry, exc_info=exc)
@@ -451,6 +470,18 @@ class RetainedView:
                 backoff.reset()  # the subscription is back: refresh now, back off afresh
             # No hint for IDLE_DRAIN_S: read from the cursors, in case one was missed.
             silent = retry is None and woke is Woke.TIMED_OUT
+
+    def _tolerate(self, exc: BaseException) -> bool:
+        """Whether a failed background drain leaves the view readable: it was
+        available, Colca refused for a reason it retries, and not for longer
+        than :data:`STALE_GRACE_S` in a row."""
+        with self.lock:
+            if not self.available or expected_failure(exc) is None:
+                return False
+            now = time.monotonic()
+            if self._failing_since is None:
+                self._failing_since = now
+            return now - self._failing_since < STALE_GRACE_S
 
     def close(self):
         self.stop.set()
