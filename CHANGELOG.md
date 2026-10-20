@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.8](https://github.com/alpamayo-solutions/chaski/compare/v0.26.7...v0.26.8) (2026-10-20)
+
+
+### Fixes
+
+* **retained-view:** a short Colca refusal of a background drain keeps the view readable ([#179](https://github.com/alpamayo-solutions/chaski/issues/179)) ([de807d1](https://github.com/alpamayo-solutions/chaski/commit/de807d1566907c4c3bb5dffd9b08ecadebf0e445))
+
 ## [0.26.7](https://github.com/alpamayo-solutions/chaski/compare/v0.26.6...v0.26.7) (2026-10-20)
 
 
