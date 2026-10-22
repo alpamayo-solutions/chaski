@@ -271,8 +271,8 @@ lint = [
 requires-dist = [
     { name = "apscheduler", marker = "extra == 'dataops'", specifier = ">=3.10,<4" },
     { name = "chaski", extras = ["dataops"], marker = "extra == 'test'" },
-    { name = "colca-data-contracts", editable = "../colca/contracts" },
-    { name = "colcad", marker = "extra == 'node'", directory = "../colca/pywheel" },
+    { name = "colca-data-contracts", specifier = ">=0.32.1,<0.42" },
+    { name = "colcad", marker = "extra == 'node'", specifier = ">=0.32.1,<0.42" },
     { name = "cryptography", specifier = ">=42" },
     { name = "franzmq", specifier = "==0.6.5" },
     { name = "httpx", specifier = ">=0.27" },
@@ -297,38 +297,28 @@ lint = [
 
 [[package]]
 name = "colca-data-contracts"
-version = "0.0.0"
-source = { editable = "../colca/contracts" }
+version = "0.41.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "franzmq" },
     { name = "python-decouple" },
     { name = "ulid-py" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "franzmq", specifier = ">=0.4.1,<0.7" },
-    { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.26,<5" },
-    { name = "paho-mqtt", marker = "extra == 'test'", specifier = ">=2.1,<3" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4,<10" },
-    { name = "python-decouple", specifier = ">=3.8" },
-    { name = "pyyaml", marker = "extra == 'test'", specifier = ">=6.0" },
-    { name = "ulid-py", specifier = ">=1.1" },
-]
-provides-extras = ["test"]
-
-[package.metadata.requires-dev]
-lint = [
-    { name = "bandit", specifier = "==1.9.4" },
-    { name = "mypy", specifier = "==2.3.1" },
-    { name = "ruff", specifier = "==0.16.9" },
-    { name = "types-pyyaml", specifier = "==6.0.12.20260906" },
+sdist = { url = "https://files.pythonhosted.org/packages/5a/0a/7635b13eeac2955630dee5138f215efecef359144be1be5c258f224e497e/colca_data_contracts-0.41.0.tar.gz", hash = "sha256:2ae803070a7c75d5c2d08ef612475f9ec20a3fdbe4f03fb13f6500d3f37478ca", size = 115756, upload-time = "2026-10-22T05:22:08.695Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/63/fbf07807c4bd30874c826a64e7701d6360fdbc8f963f09da35f1691d5a2d/colca_data_contracts-0.41.0-py3-none-any.whl", hash = "sha256:e759c9e284585880f4105ebb02b8dfc8cb23c383e7d6fb58c281d10b5732e535", size = 87238, upload-time = "2026-10-22T05:21:59.277Z" },
 ]
 
 [[package]]
 name = "colcad"
-version = "0.0.0"
-source = { directory = "../colca/pywheel" }
+version = "0.41.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/90/ace224569201bd0e4db54d9db50d11f863a3b54dfedfc09c43b7dce3cdcc/colcad-0.41.0-py3-none-macosx_12_0_arm64.whl", hash = "sha256:056095aed5e648bf066ff2c4aac94e31b8ea28df478df7f73eec9c6cd54e3f26", size = 7390482, upload-time = "2026-10-22T05:22:00.692Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/b0/3ec3c4cdeae8638682b6733e8173cd62f0c69968be04b2df9ee8c298b281/colcad-0.41.0-py3-none-macosx_12_0_x86_64.whl", hash = "sha256:4a993295ca29d0831231bc32f72e01740f9fc1781cd0c0efb9a2817a8f2f7cea", size = 8052484, upload-time = "2026-10-22T05:22:02.715Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/94/f7d96a90eb31513b06c1d12d666c2c2f3aa6ecd3347042648596d18e9f6e/colcad-0.41.0-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:4d915c4801e52bad2ef9d6a423f62316b830b809e1dd7c94382d8bef3038a75e", size = 7142064, upload-time = "2026-10-22T05:22:04.618Z" },
+    { url = "https://files.pythonhosted.org/packages/df/20/cc0a5851127a139fce0fa416291c9dbecbe3afd05e58fdac324dd4c0fc4e/colcad-0.41.0-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:ef2ae5be069e76927bc1cff3fc8cb75dc6e9e2a02c331ded5ae9c713e256511b", size = 7958797, upload-time = "2026-10-22T05:22:06.42Z" },
+]
 
 [[package]]
 name = "colorama"
