@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.10](https://github.com/alpamayo-solutions/chaski/compare/v0.26.9...v0.26.10) (2026-10-22)
+
+
+### Fixes
+
+* **connector:** clear broker_healthy after an HTTP publish recovers ([#183](https://github.com/alpamayo-solutions/chaski/issues/183)) ([ead5afc](https://github.com/alpamayo-solutions/chaski/commit/ead5afcab11c8ddf77515d1ac066059ec0b72aeb))
+
 ## [0.26.9](https://github.com/alpamayo-solutions/chaski/compare/v0.26.8...v0.26.9) (2026-10-22)
 
 
