@@ -856,6 +856,27 @@ def test_a_refusal_with_nothing_admitted_remains_durable_and_fails_visibly(node,
     assert svc.refused_samples_total == 0 and node.findings() == []
 
 
+def test_a_publish_after_an_http_failure_reports_the_broker_healthy_again(node, driver, monkeypatch):
+    import httpx
+
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    publish = node.publish_batch
+
+    def unreachable(rows):
+        raise httpx.ConnectError("connection refused")
+
+    node.publish_batch = unreachable
+    poll(svc)
+    assert [e for e in telemetry.events if e[0] == "broker"][-1] == ("broker", False)
+    node.publish_batch = publish
+    poll(svc)
+    assert [e for e in telemetry.events if e[0] == "broker"][-1] == ("broker", True), (
+        "a publish that reached Colca clears the HTTP failure; the gauge must not latch"
+    )
+
+
 # ── an outage is a state ────────────────────────────────────────────────
 
 
