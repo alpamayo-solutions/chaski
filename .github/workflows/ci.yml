@@ -12,7 +12,7 @@ permissions:
 env:
   # The colca chaski is developed against: its data contracts and the broker of
   # the integration tests. colca 0.40.0: value definitions on signals, FaultCodes (colca #235).
-  COLCA_REF: 60ecbf4ad103f5517de98fb01da8ffe9bb1c23e9
+  COLCA_REF: 64d9280ab7de6b4687910bacb16c2e4e0c934f46
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
