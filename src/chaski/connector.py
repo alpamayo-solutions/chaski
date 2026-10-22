@@ -1293,6 +1293,9 @@ class ConnectorService(Service):
                 raise undecided[0]
         self._deferral_reported = False
         self._http_backoff.reset()
+        # An HTTP failure marked the broker unhealthy; a publish that got
+        # through clears it, or the gauge stays latched until a restart.
+        self.telemetry.broker_healthy(self.is_broker_connected())
         self._http_outage.recovered()
         self._report_mqtt_recovered()
 
