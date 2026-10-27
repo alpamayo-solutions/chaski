@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("chaski.dataops.buffer")
 
+#: Rows :meth:`Buffer.trim` deletes per statement, and per hold of the lock.
+TRIM_CHUNK = 5000
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS producer_checkpoints (
     producer TEXT PRIMARY KEY, code_hash TEXT NOT NULL,
@@ -277,12 +280,15 @@ class Buffer:
                     self._conn.commit()
 
     def append_many(self, points: list[tuple[str, float, Any]]) -> None:
-        """Commit adjacent input-only records together, before any handler runs."""
+        """:meth:`append` for several points in one statement: committed at
+        once, or at the end of the enclosing :meth:`one_commit`."""
         values = [(signal, ts, json.dumps(value)) for signal, ts, value in points]
         if not values:
             return
-        with self._lock, self._conn:
+        with self._lock:
             self._conn.executemany("INSERT OR REPLACE INTO points (signal_id, ts, value) VALUES (?, ?, ?)", values)
+            if not self._deferred:
+                self._conn.commit()
 
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
         """Points for ``signal_id`` with ``start <= ts < end``, ordered by ts.
@@ -332,7 +338,7 @@ class Buffer:
             row = self._conn.execute("SELECT MAX(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
-    def trim(self, horizons: dict[str, float], *, now: float | None = None) -> int:
+    def trim(self, horizons: dict[str, float], *, now: float | None = None, chunk: int = TRIM_CHUNK) -> int:
         """Trim history while retaining the value in force at each window start.
 
         Keep the newest point before the cutoff as an anchor for latest-value
@@ -340,19 +346,34 @@ class Buffer:
         Only signals present as keys in ``horizons`` are touched — a
         signal absent from the dict keeps every point it has. Never
         touches ``watermarks`` or ``meta``. Returns the total rows deleted.
+
+        Deletes at most ``chunk`` rows per statement and takes the buffer's
+        lock per statement, so the ingest appending a page meanwhile waits for
+        one chunk at most, not for the whole trim.
         """
         now = time.time() if now is None else now
         deleted = 0
-        with self._lock:
-            for signal_id, horizon in horizons.items():
-                cutoff = now - horizon
-                cur = self._conn.execute(
-                    "DELETE FROM points WHERE signal_id = ? AND ts < "
-                    "(SELECT MAX(ts) FROM points WHERE signal_id = ? AND ts < ?)",
-                    (signal_id, signal_id, cutoff),
-                )
+        for signal_id, horizon in horizons.items():
+            cutoff = now - horizon
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MAX(ts) FROM points WHERE signal_id = ? AND ts < ?", (signal_id, cutoff)
+                ).fetchone()
+            anchor = row[0] if row is not None else None
+            if anchor is None:
+                continue
+            while True:
+                with self._lock:
+                    cur = self._conn.execute(
+                        "DELETE FROM points WHERE rowid IN "
+                        "(SELECT rowid FROM points WHERE signal_id = ? AND ts < ? LIMIT ?)",
+                        (signal_id, anchor, chunk),
+                    )
+                    if not self._deferred:
+                        self._conn.commit()
                 deleted += cur.rowcount
-            self._conn.commit()
+                if cur.rowcount < chunk:
+                    break
         return deleted
 
     # ------------------------------------------------------------------ watermarks

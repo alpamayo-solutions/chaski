@@ -256,8 +256,7 @@ class Ingest:
                 # One hop to the loop per page, not per record.
                 asyncio.run_coroutine_threadsafe(self._dispatch_page(records), loop).result()
             else:
-                for record in records:
-                    self._append(record)
+                self._append_many(records)
         return len(records)
 
     async def _dispatch_page(self, records: list[Record]) -> None:
@@ -271,10 +270,19 @@ class Ingest:
         page = PageCheckpoints()
         try:
             with page.active():
+                # Records nobody handles are appended together, right before
+                # the next record that is handled (or the page's end).
+                quiet: list[Record] = []
                 for record in records:
-                    signal_id = self._append(record)
-                    if signal_id is not None and self._dispatch.get(signal_id):
-                        await self._handle(signal_id, record)
+                    signal_id = self._signal_id_of(record)
+                    if signal_id is None or not self._dispatch.get(signal_id):
+                        quiet.append(record)
+                        continue
+                    self._append_many(quiet)
+                    quiet.clear()
+                    self._append(record)
+                    await self._handle(signal_id, record)
+                self._append_many(quiet)
         finally:
             # A checkpoint that could not be saved puts its producer back to
             # its first record of the page; the page is acked only before it.
@@ -386,13 +394,28 @@ class Ingest:
         self._ack_failed = False
         self._ack_error = None
 
+    def _append_many(self, records: list[Record]) -> None:
+        """Buffer ``records`` in one statement; one without a ``signal_id`` is logged and left out."""
+        points = []
+        for record in records:
+            signal_id = self._signal_id_of(record)
+            if signal_id is None:
+                self._no_signal_id(record)
+                continue
+            points.append((signal_id, self._timestamp_of(record), self._value_of(record)))
+        self._buffer.append_many(points)
+
+    @staticmethod
+    def _no_signal_id(record: Record) -> None:
+        log.warning(
+            "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
+        )
+
     def _append(self, record: Record) -> str | None:
         """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
         signal_id = self._signal_id_of(record)
         if signal_id is None:
-            log.warning(
-                "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
-            )
+            self._no_signal_id(record)
             return None
         self._buffer.append(signal_id, self._timestamp_of(record), self._value_of(record))
         return signal_id
