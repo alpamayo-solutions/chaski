@@ -15,7 +15,8 @@ The driver protocol is four ``async`` methods (:class:`Driver`):
   register descriptor, a JSON pointer).
 * ``read(targets)`` — one poll of the bound targets: ``(topic, raw_value,
   signal)`` per reading. Raise :class:`SourceDisconnectedError` when the
-  source is gone; the loop flips ``is_connected`` and reconnects. The
+  source is gone; the loop flips ``is_connected`` and reconnects. A read that
+  takes longer than ``read_timeout`` counts as a lost source too. The
   heartbeat keeps its own schedule meanwhile: it never waits for a read.
 * ``close()`` — release the source.
 
@@ -135,6 +136,10 @@ WRITE_CURSOR = "signal-writes"
 #: is a full connect + discover, not just a reconnect: a browse-based driver
 #: that started while its source was still booting has no catalogue at all.
 DISCOVERY_RETRY_SECONDS = 15.0
+
+#: Journal pages (of up to 1,000 samples) one publish call sends at most;
+#: a longer backlog drains over the following iterations.
+PUBLISH_PAGES = 10
 
 #: The consumer name a refused sample is recorded under in the service's
 #: ``rejected_input`` finding.
@@ -424,7 +429,9 @@ def run(build: Callable[[], ConnectorService], *, health_port: int | None = 8888
 
     The endpoint answers from the start, before the node is reached: 503
     with the reason (:meth:`ConnectorService.health_problem`) until the
-    connector is started and its broker link is up."""
+    connector is started and its broker link is up, and while one poll has
+    run longer than ``max(3 x interval, 30 s)`` (a source call that does not
+    return)."""
 
     async def main() -> None:
         svc = build()
@@ -475,6 +482,7 @@ class ConnectorService(Service):
         timestamp_source: Literal["acquisition", "source"] = "acquisition",
         report_by_exception: bool = True,
         integrity_interval: float = 60.0,
+        read_timeout: float | None = None,
         **service_kwargs: Any,
     ) -> None:
         metadata = {**driver.metadata, **(service_kwargs.pop("metadata", None) or {})}
@@ -502,6 +510,14 @@ class ConnectorService(Service):
         self.reconnect_retries = int(reconnect_retries)
         self.outage_reminder = float(outage_reminder)
         self.summary_interval = float(summary_interval)
+        #: How long a driver read may take before the source counts as lost.
+        self.read_timeout = float(read_timeout) if read_timeout is not None else max(2 * self.interval, 20.0)
+        if self.read_timeout <= 0:
+            raise ValueError("read_timeout must be positive")
+        #: How long one poll may run before the health door reports it stuck.
+        self.stuck_after = max(3 * self.interval, 30.0)
+        #: Loop clock when the running poll began, None while the loop waits.
+        self._polling_since: float | None = None
         self._log = logging.getLogger(name)
         # The loop's clocks, as attributes so a test can drive time and skip
         # backoffs without patching the interpreter's own modules.
@@ -548,6 +564,8 @@ class ConnectorService(Service):
         self._write_executor: CommandExecutor | None = None
         # The driver sees one call at a time: a poll, or a write and its read-back.
         self._source_lock = asyncio.Lock()
+        # The journal is published from worker threads: one at a time.
+        self._journal_lock = threading.Lock()
 
         self._source_reconnects_total = 0
         self._mqtt_reconnects_total = 0
@@ -746,6 +764,12 @@ class ConnectorService(Service):
             return self.identity_conflict
         if not self.is_broker_connected():
             return "the MQTT link to Colca is down; samples are journaled until it returns"
+        since = self._polling_since
+        if since is not None and (age := self._now() - since) > self.stuck_after:
+            return (
+                f"the poll loop has not finished a poll for {age:.0f} s (more than {self.stuck_after:g} s); "
+                "a source call does not return"
+            )
         return ""
 
     async def stop(self) -> None:
@@ -894,12 +918,31 @@ class ConnectorService(Service):
     async def _poll_forever(self) -> None:
         while not self._stopping.is_set():
             await self._poll_iteration()
+        self._polling_since = None
+
+    async def _rest(self, seconds: float) -> None:
+        """A pause of the poll loop: waiting, not stuck (:meth:`health_problem`)."""
+        self._polling_since = None
+        try:
+            await self._sleep(seconds)
+        finally:
+            self._polling_since = self._now()
+
+    async def _read(self, targets: list[Target]) -> Iterable[Any]:
+        """One driver read, bounded by ``read_timeout``: a read that hangs is
+        a lost source, and reconnecting is what helps."""
+        try:
+            return await asyncio.wait_for(self.driver.read(targets), self.read_timeout)
+        except TimeoutError as exc:
+            raise SourceDisconnectedError(f"no answer to a read within {self.read_timeout:g} s") from exc
 
     async def _poll_iteration(self) -> None:
         """One iteration of the loop, including the wait that paces the
         next one — see the module docstring's "Timing"."""
         change_version = self._changes.version
         loop_start_perf = time.perf_counter()
+        self._polling_since = self._now()
+        backlog = False
         # One wall-clock time for every sample of this acquisition cycle.
         cycle_timestamp = time.time()
         try:
@@ -913,6 +956,7 @@ class ConnectorService(Service):
                 targets = list(self._targets)
             if not targets:
                 delay = max(0.0, self._next_discovery_retry - self._now()) if not self._discovered else None
+                self._polling_since = None  # idle, not stuck
                 await self._changes.wait_async(change_version, delay, stop=self._stopping)
                 return
 
@@ -925,10 +969,11 @@ class ConnectorService(Service):
             if protocol_targets:
                 if len(protocol_targets) > self.max_pending:
                     raise BufferError("max_pending cannot hold one complete acquisition cycle")
-                # Retry durable output before taking another PLC observation.
-                # This is backpressure; an outage never evicts older samples.
+                # Retry durable output before taking another PLC observation,
+                # a bounded part of it per iteration, off the loop. This is
+                # backpressure; an outage never evicts older samples.
                 try:
-                    self._publish_batch([])
+                    backlog = await asyncio.to_thread(self._publish_batch, [])
                 except PublishRejected:
                     # The node answered and refused every sample it was sent,
                     # which is either its verdict or a failed write. The
@@ -936,9 +981,14 @@ class ConnectorService(Service):
                     # so acquire while the journal holds one more cycle.
                     if not self._journal_has_room(len(protocol_targets)):
                         raise
+                    backlog = True
+                if backlog and not self._journal_has_room(len(protocol_targets)):
+                    # Draining a long backlog: no room for another cycle yet.
+                    await self._rest(0.001)
+                    return
                 try:
                     async with self._source_lock:
-                        raw_batch = list(await self.driver.read(protocol_targets))
+                        raw_batch = list(await self._read(protocol_targets))
                     # The authoritative health signal: the protocol
                     # channel demonstrably answered. connect() succeeding
                     # is not — some clients background the TCP setup.
@@ -1000,7 +1050,7 @@ class ConnectorService(Service):
                 self._published_at[key] = self._now()
                 batch.append((topic, metric))
 
-            self._publish_batch(batch)
+            backlog = await asyncio.to_thread(self._publish_batch, batch)
             self._summary_polls += 1
             self._log_summary(len(targets))
 
@@ -1017,7 +1067,7 @@ class ConnectorService(Service):
             delay = self._http_backoff.delay(exc)
             if not self._http_outage.failed(exc, delay=delay):
                 self._log.error("Metric batch deferred; retrying in %.1fs", delay, exc_info=exc)
-            await self._sleep(delay)
+            await self._rest(delay)
             return
 
         except PublishRejected as exc:
@@ -1026,7 +1076,7 @@ class ConnectorService(Service):
             if not self._deferral_reported:
                 self._deferral_reported = True
                 self._log.warning("Metric batch deferred, the node refused every sample it was sent: %s", exc)
-            await self._sleep(self._http_backoff.delay(exc))
+            await self._rest(self._http_backoff.delay(exc))
             return
 
         except MqttDisconnectedError as exc:
@@ -1040,8 +1090,8 @@ class ConnectorService(Service):
                     self._mqtt_backoff.reset()
                     break
                 except Exception as error:
-                    await self._sleep(self._mqtt_backoff.delay(error))
-            await self._sleep(0.001)
+                    await self._rest(self._mqtt_backoff.delay(error))
+            await self._rest(0.001)
             return
 
         except Exception:
@@ -1051,10 +1101,10 @@ class ConnectorService(Service):
         elapsed = time.perf_counter() - loop_start_perf
         wait = self.interval - elapsed
         self.telemetry.poll_completed(elapsed, overrun=wait <= 0)
-        if wait > 0:
-            await self._sleep(wait)
+        if wait > 0 and not backlog:
+            await self._rest(wait)
         else:
-            await self._sleep(0.001)
+            await self._rest(0.001)
 
     async def _reconnect_source(self) -> None:
         """Reconnect the source up to ``reconnect_retries`` times with jittered
@@ -1075,7 +1125,7 @@ class ConnectorService(Service):
                 self._source_backoff.reset()
                 return
             except Exception as exc:
-                await self._sleep(self._source_backoff.delay(exc))
+                await self._rest(self._source_backoff.delay(exc))
         self._log.warning("Reconnect retries exhausted; staying alive with source_healthy=0")
 
     def _log_summary(self, target_count: int) -> None:
@@ -1136,7 +1186,8 @@ class ConnectorService(Service):
         so it must not wait for a read: a slow or unreachable source holds the
         poll loop for as long as its timeouts and reconnects take."""
         while not self._stopping.is_set():
-            self._publish_heartbeat()
+            # Off the loop: the journal it goes through is SQLite and HTTP.
+            await asyncio.to_thread(self._publish_heartbeat)
             age = self._now() - self._heartbeat_start
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stopping.wait(), self.heartbeat_interval - (age % self.heartbeat_interval))
@@ -1235,8 +1286,12 @@ class ConnectorService(Service):
         queue = self._open_metric_queue()
         return queue.count() + samples <= self.max_pending
 
-    def _publish_batch(self, batch: list[tuple[Topic, Metric]]) -> None:
-        """One durable acquisition cycle, one broker append per stream.
+    def _publish_batch(self, batch: list[tuple[Topic, Metric]], *, pages: int = PUBLISH_PAGES) -> bool:
+        """Journal ``batch``, then publish at most ``pages`` pages of the
+        journal. Whether samples are left in it. Runs off the event loop; one
+        call at a time.
+
+        One durable acquisition cycle, one broker append per stream.
 
         The HTTP door uses the same admission and MQTT fanout as individual
         publishes. Per-record results decide which journal entries may retire:
@@ -1245,15 +1300,21 @@ class ConnectorService(Service):
         raises :class:`PublishRejected`. A transport failure or a lost reply
         leaves every entry for replay.
         """
+        with self._journal_lock:
+            return self._publish_pages(batch, pages)
+
+    def _publish_pages(self, batch: list[tuple[Topic, Metric]], pages: int) -> bool:
         if not batch and self._metric_queue is None and not (self._state_dir / "connector-samples.sqlite3").exists():
-            return
+            return False
         queue = self._open_metric_queue()
         if batch:
             queue.append_batch(
                 [(str(topic), json.loads(metric.encode()), metric.timestamp, None) for topic, metric in batch],
                 self.max_pending,
             )
-        while rows := queue.page_all(min(self.max_pending, 1000)):
+        left = pages
+        while left > 0 and (rows := queue.page_all(min(self.max_pending, 1000))):
+            left -= 1
             results = self._require_http("publish metrics").publish_batch(
                 [(topic, json.dumps(payload)) for _, topic, payload, _, _ in rows]
             )
@@ -1298,6 +1359,7 @@ class ConnectorService(Service):
         self.telemetry.broker_healthy(self.is_broker_connected())
         self._http_outage.recovered()
         self._report_mqtt_recovered()
+        return left == 0 and bool(queue.page_all(1))
 
     def _set_aside(
         self, signal_id: str, key: str, reason: str, summary: str, subject: dict[str, Any], *, must_record: bool

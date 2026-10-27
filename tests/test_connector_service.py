@@ -1311,3 +1311,96 @@ def test_batch_throttling_preserves_samples_and_server_retry_deadline(node, driv
     node.publish_batch = publish
     svc._publish_batch([])
     assert svc._pending == []
+
+
+# ── a poll that does not return ────────────────────────────────────────
+
+
+def test_a_read_that_hangs_reports_the_poll_stuck_on_the_health_door(node, driver, monkeypatch):
+    """/is_healthy stayed green while driver.read hung: the heartbeat runs on
+    its own schedule, and nothing looked at the poll loop."""
+    clock = Clock()
+    svc = started(node, driver, monkeypatch, clock=clock, read_timeout=3600.0)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+
+    async def scenario() -> tuple[str, str, str]:
+        released = asyncio.Event()
+        read = driver.read
+
+        async def hanging_read(targets):
+            await released.wait()
+            return await read(targets)
+
+        driver.read = hanging_read
+        polling = asyncio.ensure_future(svc._poll_iteration())
+        await asyncio.sleep(0.02)
+        early = svc.health_problem()
+        clock.now += svc.stuck_after + 1
+        stuck = svc.health_problem()
+        released.set()
+        await polling
+        return early, stuck, svc.health_problem()
+
+    early, stuck, after = asyncio.run(scenario())
+    assert early == ""
+    assert "has not finished a poll" in stuck
+    assert after == ""
+    assert svc.stuck_after == 30.0  # max(3 x interval, 30 s)
+
+
+def test_a_read_that_does_not_answer_in_time_counts_as_a_lost_source(node, driver, monkeypatch):
+    telemetry = RecordingTelemetry()
+    svc = started(node, driver, monkeypatch, telemetry=telemetry, read_timeout=0.05)
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+
+    async def never(targets):
+        await asyncio.sleep(3600)
+
+    driver.read = never
+    connects = driver.connects
+    poll(svc)
+    assert ("source", False) in telemetry.events
+    assert driver.connects > connects, "a read that hangs is a lost source: reconnect"
+
+
+def test_an_idle_connector_with_nothing_bound_is_not_stuck(node, driver, monkeypatch):
+    clock = Clock()
+    svc = started(node, driver, monkeypatch, clock=clock)
+
+    async def scenario() -> str:
+        waiting = asyncio.ensure_future(svc._poll_iteration())
+        await asyncio.sleep(0.02)
+        clock.now += 3600
+        problem = svc.health_problem()
+        svc._stopping.set()
+        svc._changes.notify()
+        await waiting
+        return problem
+
+    assert asyncio.run(scenario()) == ""
+
+
+def test_the_journal_is_published_off_the_loop_a_bounded_part_per_call(node, driver, monkeypatch):
+    """A backlog after an outage was drained whole, with SQLite and HTTP on
+    the event loop: the heartbeat and the write executor waited for all of it."""
+    from chaski.connector import PUBLISH_PAGES
+
+    svc = started(node, driver, monkeypatch, max_pending=30_000)
+    node.connected = False
+    for _ in range(5):
+        with pytest.raises(MqttDisconnectedError):
+            svc._publish_batch(_batch(5_000))
+    node.connected = True
+
+    assert svc._publish_batch([]) is True, "more than one call's worth was waiting"
+    assert len(node.metrics()) == PUBLISH_PAGES * 1000
+    assert svc._publish_batch([]) is True
+    assert svc._publish_batch([]) is False
+    assert len(node.metrics()) == 25_000
+
+    bind(node, svc, "Axis1/Temperature", path="line1/temp", signal_id="s-temp")
+    threads: list[int] = []
+    publish = svc._publish_batch
+    svc._publish_batch = lambda *a, **k: (threads.append(threading.get_ident()), publish(*a, **k))[1]
+    poll(svc)
+    assert threads and threading.get_ident() not in threads
