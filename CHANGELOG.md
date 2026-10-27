@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.11](https://github.com/alpamayo-solutions/chaski/compare/v0.26.10...v0.26.11) (2026-10-27)
+
+
+### Performance
+
+* **dataops:** checkpoint once per ingest page; health door off the event loop ([#185](https://github.com/alpamayo-solutions/chaski/issues/185)) ([413fe50](https://github.com/alpamayo-solutions/chaski/commit/413fe5096cbea33c16b471d746617f21a027f667))
+
 ## [0.26.10](https://github.com/alpamayo-solutions/chaski/compare/v0.26.9...v0.26.10) (2026-10-22)
 
 
