@@ -91,7 +91,13 @@ def _rows(frame: Any) -> list[tuple[float, Any]]:
 
 
 def fetch_many(
-    runtime: Runtime, inputs: Iterable[SignalRangeInput], start: float, end: float, *, clamp_to_buffer: bool = False
+    runtime: Runtime,
+    inputs: Iterable[SignalRangeInput],
+    start: float,
+    end: float,
+    *,
+    clamp_to_buffer: bool = False,
+    history: bool = True,
 ) -> dict[str, list[tuple[float, Any]]]:
     """:meth:`SignalRangeInput.fetch` for several signals at once, as
     ``(ts, value)`` rows per signal id: the buffer where it holds the range, the
@@ -100,9 +106,10 @@ def fetch_many(
 
     Without a historian a range reaching before the buffer raises, unless
     ``clamp_to_buffer``: then it starts at the buffer's earliest point, and a
-    signal the buffer holds nothing of has no rows."""
+    signal the buffer holds nothing of has no rows. ``history=False`` reads
+    the buffer alone, as without a historian."""
     buffer = runtime.buffer
-    historian = runtime.historian
+    historian = runtime.historian if history else None
     out: dict[str, list[tuple[float, Any]]] = {}
     from_history: dict[str, float] = {}
     for declared in inputs:

@@ -390,7 +390,8 @@ def test_an_independent_backfill_lets_live_output_flow_and_its_union_with_live_i
         historian = _seed(node, machine, reader, archive, recent)
         producer = cycles(Backfill(horizon="5d", window="1h", mode="independent"))
         with _serving(node, tmp_path / "data", producer, historian=historian, backfill_rate=4.0) as svc:
-            assert not svc.backfill_holds("cycles")
+            # A first start replays the buffer first; only that holds live dispatch.
+            _wait(lambda: not svc.backfill_holds("cycles"))
             job = svc.buffer.backfill_job("cycles", INITIAL)
             assert job is not None and job["end"] is not None and job["end"] >= now
 

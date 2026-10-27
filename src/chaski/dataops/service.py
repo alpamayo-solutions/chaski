@@ -22,8 +22,9 @@ producer runtime.
   declares them into the service's own catalogue, which is published as a
   ``_DataTags`` record like a connector's; annotations are ``_Annotation``
   records.
-* **A code change replays**: :func:`replay_changed_producers`, keyed by
-  :func:`~chaski.dataops.codehash.compute_code_hash`.
+* **A code change replays**: a ``replay`` job of the backfill runner, keyed
+  by :func:`~chaski.dataops.codehash.compute_code_hash`
+  (:mod:`chaski.dataops.backfill`, "Replay").
 * **History older than the stream is backfilled**: a producer that declares
   ``backfill`` is run once over its horizon from the historian, in windows,
   before its live dispatch starts, or beside it in ``independent`` mode
@@ -50,10 +51,11 @@ Startup order inside :meth:`DataOpsService.serve`:
     its live triggers unless it is ``independent``
     (:mod:`chaski.dataops.backfill`), then build the
     ``signal_id -> [handler]`` dispatch table and the set of input signal ids
- 7. replay every producer whose code hash changed, a new one included: reset
-    its watermark to the earliest buffered point of its inputs and feed the
-    buffered records through the live handlers. Unchanged producers are left
-    alone. A failed replay is retried under :func:`supervise`
+ 7. record a replay of every producer whose code hash changed, a new one
+    included, and hold its live triggers: the backfill runner feeds the
+    buffered records through the live handlers in windows, beside startup,
+    and hands over at the live edge. Unchanged producers get their
+    checkpoint back
  8. retire the ingest cursors of earlier buffer generations (a lost or
     deleted buffer starts a new generation; nothing reads its old cursor)
  9. start the ingest task, and resolve again whenever the live index changes
@@ -66,8 +68,8 @@ Startup order inside :meth:`DataOpsService.serve`:
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 
-The replay of step 7 and every background task of steps 9 to 11 run under
-:func:`supervise`: a task
+Every background task of steps 9 to 11, the backfill runner with the
+replays of step 7 included, runs under :func:`supervise`: a task
 that raises is logged at once, counted in ``handler_health`` (degraded, then
 unhealthy) and restarted with jittered backoff. None dies silently.
 """
@@ -101,12 +103,12 @@ from chaski.publishing import PublishBatch
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
-from . import codehash, commands, health, resolve, watch
+from . import commands, health, resolve, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import PageCheckpoints, Producer, Runtime, event_time, restore_checkpoint, save_checkpoint, state_copy
+from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
 from .buffer import Buffer
-from .ingest import Ingest, consumer_name, cursor_name
+from .ingest import Ingest, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import record_rejection
@@ -692,96 +694,6 @@ def synthetic_record(signal_id: str, ts: float, value: Any, *, actor: str = "rep
     )
 
 
-# ─── hash-triggered replay ────────────────────────────────────────────────
-
-
-async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) -> None:
-    """Replay every producer whose code hash changed, a new producer included.
-
-    Its watermark is reset to the earliest buffered point of its inputs, and
-    every buffered record for its ``@on_metric`` signals goes, in timestamp
-    order, through the same handlers live traffic uses. Replayed publishes
-    overwrite like live ones. A producer with an unchanged hash is skipped, so
-    a replay happens once per change; a tick-only producer only gets its
-    watermark reset.
-
-    A handler that raises :class:`chaski.Reject` has the record recorded as
-    rejected (the runtime's ``reject``), as live ingest does, and the replay
-    goes on. Any other failure stops recovery: the producer's watermark and
-    code hash are not marked complete, a checkpointed producer's state is put
-    back, and the exception propagates, so the caller retries the replay.
-    Handlers must make repeated effects idempotent. A producer whose first
-    backfill is still running is skipped; the backfill covers the buffer.
-    """
-    # One KV read for the whole sweep; the per-producer passes below reuse it.
-    with resolve.one_pass(runtime.door):
-        await _replay_each(runtime, instances)
-
-
-async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
-    buffer = runtime.buffer
-    for instance in instances:
-        if _held(instance):
-            continue  # its first backfill covers the buffer too
-        cls = type(instance)
-        new_hash = codehash.compute_code_hash(cls)
-        old_hash = buffer.code_hash(instance.name)
-        restored = restore_checkpoint(instance)
-        if old_hash == new_hash and (instance.state_version is None or restored):
-            continue
-
-        mini_dispatch, mini_signal_ids, _ = build_dispatch(runtime, [instance])
-        earliest = _earliest_across(buffer, mini_signal_ids)
-        now = time.time()
-        start = earliest if earliest is not None else now
-
-        log.info(
-            "%s: code hash changed (%s -> %s) — replaying buffered window [%.3f, %.3f)",
-            instance.name,
-            (old_hash or "none")[:12],
-            new_hash[:12],
-            start,
-            now,
-        )
-
-        rows: list[tuple[float, str, Any]] = []
-        for signal_id in mini_signal_ids:
-            rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
-        rows.sort(key=lambda r: r[0])
-
-        previous = state_copy(instance) if instance.state_version is not None else None
-        try:
-            for ts, signal_id, value in rows:
-                record = synthetic_record(signal_id, ts, value)
-                for handler in mini_dispatch.get(signal_id, []):
-                    try:
-                        await handler(record)
-                    except Reject as rejected:
-                        subject = {"replay": instance.name, "signal_id": signal_id, "ts": ts}
-                        await asyncio.to_thread(record_rejection, runtime, consumer_name(handler), subject, rejected)
-        except BaseException:
-            if previous is not None:
-                instance.restore_state(previous)
-            raise
-
-        final_position = rows[-1][0] if rows else start
-        save_checkpoint(instance)
-        buffer.set_watermark(instance.name, final_position, new_hash)
-        log.info(
-            "%s: replay complete (%d record(s)) — watermark=%.3f",
-            instance.name,
-            len(rows),
-            final_position,
-        )
-
-
-def _earliest_across(buffer: Buffer, signal_ids: Iterable[str]) -> float | None:
-    """``MIN`` of :meth:`Buffer.earliest` across several signals, or
-    ``None`` when none of them holds anything yet."""
-    values = [e for e in (buffer.earliest(sid) for sid in signal_ids) if e is not None]
-    return min(values) if values else None
-
-
 # ─── MQTT dispatch ──────────────────────────────────────────────────────────
 
 
@@ -1331,8 +1243,9 @@ class DataOpsService(Service):
             )
 
             # 6) Record and hold the first backfill of every producer that
-            #    declares one, then the on_metric dispatch table and the
-            #    declared input signal ids.
+            #    declares one, and (7) the replay of every producer whose code
+            #    changed; then the on_metric dispatch table and the declared
+            #    input signal ids.
             backfill = BackfillRunner(
                 self,
                 instances,
@@ -1345,12 +1258,7 @@ class DataOpsService(Service):
             health_state.backfill = backfill.status
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
-            # 7) Replay producers whose code changed. A failure is counted in
-            #    handler_health and the replay retried; the health door stays up.
             health_state.handlers = self.handler_health
-            await supervise("replay", lambda: replay_changed_producers(self, instances), stop, self.handler_health)
-            if stop.is_set():
-                return
 
             # 8) Retire the ingest cursors of earlier generations and build
             #    the ingest loop over this service's own consume lane.

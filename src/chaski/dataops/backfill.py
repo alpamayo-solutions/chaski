@@ -75,6 +75,18 @@ interval, and a ``SignalOutput`` sample is keyed by signal and timestamp, so
 processing a record twice (a window redone after a crash, a repair over a range
 live processing covered) overwrites rather than duplicates.
 
+**Replay.** A producer whose code hash changed since it last ran, a new one
+included (:mod:`chaski.dataops.codehash`), gets a ``replay`` job at start: the
+buffered records of its ``@on_metric`` inputs, from the earliest buffered
+point to the live edge, through its live handlers on the live instance, held
+and handed over like a first backfill, in windows, throttled and resumable
+the same way, and reported on the health door. Its ticks are not run; they
+continue live from the watermark the hand-over sets. A producer without an
+``@on_metric`` handler only has its watermark reset to the earliest buffered
+point. A producer whose held first backfill is still running is left out;
+the backfill covers the buffer. A changed hash while a replay runs restarts
+it.
+
 **Repair.** :meth:`DataOpsService.request_backfill` records a job for an
 explicit range. It runs on a separate instance of the producer, after
 ``setup()``, so the live instance's state and its live dispatch are left
@@ -102,6 +114,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import functools
 import heapq
 import json
 import logging
@@ -140,6 +153,8 @@ INITIAL = "initial"
 HOLD_LIVE = "hold_live"
 #: Live dispatch starts at once; the first backfill covers what lies before.
 INDEPENDENT = "independent"
+#: The job a code change starts: the buffer through the changed handlers.
+REPLAY = "replay"
 MODES = (HOLD_LIVE, INDEPENDENT)
 DEFAULT_WINDOW = "1h"
 #: At most this many windows per second.
@@ -344,8 +359,55 @@ class BackfillRunner:
                     _iso(job["end"]),
                 )
 
+        self._plan_replays(now)
+
+    def _plan_replays(self, now: float) -> None:
+        """Record a replay of every producer whose code changed since it last
+        ran, a new one included, and hold its live triggers until the replay
+        reaches the live edge (module docstring, "Replay"). Every other
+        producer gets its checkpoint back.
+
+        A producer whose first backfill is held is left out: that backfill
+        covers the buffer. One without an ``@on_metric`` handler has nothing
+        to replay: its watermark goes back to the earliest buffered point of
+        its inputs."""
+        for name, instance in self._instances.items():
+            with self._lock:
+                if name in self._held:
+                    continue
+            cls = type(instance)
+            new_hash = codehash.compute_code_hash(cls)
+            old_hash = self._buffer.code_hash(name)
+            restored = restore_checkpoint(instance)
+            job = self._buffer.backfill_job(name, REPLAY)
+            resuming = job is not None and not job["done"] and job["code_hash"] == new_hash
+            if not resuming and old_hash == new_hash and (instance.state_version is None or restored):
+                continue
+            plan = _plan(instance)
+            earliest = self._first(plan)
+            start = earliest if earliest is not None else now
+            if not plan.metrics:
+                save_checkpoint(instance)
+                self._buffer.set_watermark(name, start, new_hash)
+                log.info("%s: code changed; no @on_metric handler to replay, watermark reset to %s", name, _iso(start))
+                continue
+            if not resuming:
+                self._buffer.restart_backfill(name, REPLAY, start, new_hash, created_at=time.time())
+            with self._lock:
+                self._held.add(name)
+            log.info(
+                "%s: code hash changed (%s -> %s); %s the replay of the buffer from %s, live triggers held until "
+                "it reaches the live edge",
+                name,
+                (old_hash or "none")[:12],
+                new_hash[:12],
+                "resuming" if resuming else "starting",
+                _iso(job["position"] if resuming and job is not None else start),
+            )
+
     def holds(self, producer: str) -> bool:
-        """Whether ``producer``'s live triggers are held for its first backfill."""
+        """Whether ``producer``'s live triggers are held for its first backfill
+        or its replay."""
         with self._lock:
             return producer in self._held
 
@@ -448,6 +510,8 @@ class BackfillRunner:
             jobs = [
                 job for job in await asyncio.to_thread(self._buffer.backfill_jobs, pending_only=True) if self._runs(job)
             ]
+            # A job that holds live dispatch goes first: the rest run beside live.
+            jobs.sort(key=lambda job: not _holds_live(job))
             with self._lock:
                 self._pending = max(0, len(jobs) - 1)
             if not jobs:
@@ -471,9 +535,11 @@ class BackfillRunner:
         live = self._instances[name]
         cls = type(live)
         initial = job_id == INITIAL
-        # A first backfill that holds live dispatch runs on the live instance
-        # up to the live edge; every other job on its own instance up to its end.
-        holding = initial and job["end"] is None
+        replay = job_id == REPLAY
+        # A first backfill that holds live dispatch, and a replay, run on the
+        # live instance up to the live edge; every other job on its own
+        # instance up to its end.
+        holding = job["end"] is None
         window = _window_of(cls, job)
         code_hash = await asyncio.to_thread(codehash.compute_code_hash, cls)
         position, windows = job["position"], job["windows"]
@@ -505,14 +571,27 @@ class BackfillRunner:
                 plan = await self._resolved(instance, stop)
                 if plan is None:
                     return
-                if self._service.historian is None and plan.signal_ids:
-                    # Without a historian the buffer is all there is: skip to
-                    # its first point, once the ingest has filled it.
-                    if initial and not await self._caught_up(plan, stop):
+                if replay:
+                    # A replay runs what the live handlers would have; ticks
+                    # run live from the watermark it leaves.
+                    plan.ticks = []
+                if (self._service.historian is None or replay) and plan.signal_ids:
+                    # Without a historian the buffer is all there is, and a
+                    # replay reads only the buffer: skip to its first point,
+                    # once the ingest has filled it.
+                    if (initial or replay) and not await self._caught_up(plan, stop):
                         continue
                     first = self._first(plan)
-                    if first is not None and position < first:
+                    if first is not None and (position < first or (replay and not windows and first < position)):
+                        # A replay starts at the earliest buffered point, also
+                        # one the ingest buffered after it was planned.
                         position = first
+                    if not plan.ticks:
+                        # Nothing to run between two buffered points: no
+                        # windows over a stretch that holds none.
+                        following = self._next_point(plan, position)
+                        if following is not None and following > position:
+                            position = following
                 if holding:
                     edge = self._edge(plan)
                     self._report(job, position, windows, edge)
@@ -574,6 +653,11 @@ class BackfillRunner:
         """The oldest buffered point of the producer's inputs, or ``None``."""
         earliest = [ts for ts in (self._buffer.earliest(sid) for sid in plan.signal_ids) if ts is not None]
         return min(earliest) if earliest else None
+
+    def _next_point(self, plan: _Plan, position: float) -> float | None:
+        """The oldest buffered point of the producer's inputs at or after ``position``."""
+        found = [ts for ts in (self._buffer.next_point(sid, position) for sid in plan.signal_ids) if ts is not None]
+        return min(found) if found else None
 
     def _edge(self, plan: _Plan) -> float:
         """The newest buffered point of the producer's inputs: what live
@@ -666,12 +750,16 @@ class BackfillRunner:
         every :data:`YIELD_EVERY` events."""
         # Without a historian, what the buffer holds is all there is.
         rows = await asyncio.to_thread(
-            fetch_many,
-            self._service,
-            [declared for _sid, declared, _h in plan.metrics],
-            start,
-            end,
-            clamp_to_buffer=True,
+            functools.partial(
+                fetch_many,
+                self._service,
+                [declared for _sid, declared, _h in plan.metrics],
+                start,
+                end,
+                clamp_to_buffer=True,
+                # A replay runs what the buffer holds through the new code.
+                history=job["job"] != REPLAY,
+            )
         )
         streams: list[Iterator[tuple[float, int, int, Any, Any]]] = [
             _records(rows[signal_id], order, (signal_id, handlers))
@@ -827,8 +915,8 @@ def request(
 
 
 def _holds_live(job: dict[str, Any]) -> bool:
-    """Whether ``job`` is a first backfill that holds live dispatch."""
-    return job["job"] == INITIAL and job["end"] is None
+    """Whether ``job`` holds live dispatch: a first backfill that does, or a replay."""
+    return job["end"] is None
 
 
 def _window_of(cls: type[Producer], job: dict[str, Any]) -> float:
@@ -868,6 +956,7 @@ __all__ = [
     "HOLD_LIVE",
     "INDEPENDENT",
     "INITIAL",
+    "REPLAY",
     "Backfill",
     "BackfillRunner",
     "request",

@@ -24,10 +24,11 @@ from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry, run_async, s
 from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 
 from chaski.dataops import AnnotationOutput, Backfill, NodeHistorian, Producer, SignalRangeInput, every, on_metric
-from chaski.dataops.backfill import INITIAL, BackfillRunner, tick_instants
+from chaski.dataops.backfill import INITIAL, REPLAY, BackfillRunner, tick_instants
+from chaski.dataops.base import save_checkpoint
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.outputs import bind_annotation_outputs
-from chaski.dataops.service import make_handler, replay_changed_producers, synthetic_record
+from chaski.dataops.service import make_handler, synthetic_record
 from chaski.dataops.triggers import CronSpec, IntervalSpec
 from chaski.door import Record
 from chaski.doorbell import Doorbell
@@ -180,18 +181,36 @@ class _Ingest:
 
 
 def _setup(
-    cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0, historian=None, stall_after=600.0
+    cls,
+    tmp_path,
+    *,
+    archive,
+    buffered,
+    name="buffer.sqlite3",
+    rate=1000.0,
+    busy=1.0,
+    historian=None,
+    stall_after=600.0,
+    first_start=False,
 ):
     """A service whose historian holds ``archive`` + ``buffered`` and whose
-    buffer holds ``buffered``, as after the ingest drained the stream."""
+    buffer holds ``buffered``, as after the ingest drained the stream. Unless
+    ``first_start``, the producer ran this code before, so its start does not
+    replay the buffer."""
+    from chaski.dataops import codehash
+
     buffer = Buffer(tmp_path / name)
     for ts, value in buffered:
         buffer.append(SIGNAL, ts, value)
+    if not first_start:
+        buffer.set_watermark(cls.name, 0.0, codehash.compute_code_hash(cls))
     if historian is None:
         historian = FakeHistorian({SIGNAL: [*archive, *buffered]})
     service = FakeService(_door(), buffer, historian)
     service._ingest = _Ingest()
     instance = _attach(cls, service)
+    if not first_start:
+        save_checkpoint(instance)
     runner = BackfillRunner(service, [instance], rate=rate, busy=busy, stall_after=stall_after)
     service.runner = runner
     runner.plan()
@@ -367,10 +386,10 @@ async def test_without_a_historian_the_backfill_covers_what_the_buffer_holds(tmp
 async def test_a_held_producer_is_left_out_of_the_code_change_replay(tmp_path):
     now = time.time()
     history = _history(now - DAY, 50)
-    service, instance, _runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=history)
+    _service, instance, runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=history, first_start=True)
 
-    await replay_changed_producers(service, [instance])
-
+    assert runner.holds("segmenter")
+    assert buffer.backfill_job("segmenter", REPLAY) is None
     assert instance.handled == []
     assert buffer.code_hash("segmenter") is None
     buffer.close()
@@ -638,22 +657,28 @@ async def test_an_independent_backfill_leaves_live_dispatch_running_and_ends_at_
     history = _history(now - 3 * DAY, 3 * 144)
     later = _history(now + 60.0, 30)
     cls = closer(window="1h")
-    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:300], buffered=history[300:], rate=40.0)
+    service, instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history[:300], buffered=history[300:], rate=40.0, first_start=True
+    )
     began = time.time()
 
-    # Not held: the start replays the buffer on the live instance at once.
-    assert not runner.holds("closer")
+    # The first start replays the buffer on the live instance first, and
+    # holds live dispatch only for that.
+    assert runner.holds("closer")
     job = buffer.backfill_job("closer", INITIAL)
     assert job is not None and not job["done"]
     assert now <= job["end"] <= began
     assert job["start"] == pytest.approx(job["end"] - 10 * DAY)
-    await replay_changed_producers(service, [instance])
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while runner.holds("closer"):
+        assert not task.done(), task
+        await asyncio.sleep(0.005)
     assert instance.handled == [ts for ts, _ in history[300:]]
+    assert not buffer.backfill_job("closer", INITIAL)["windows"], "the replay ran before the history"
 
     # Live records are dispatched while the history runs.
     live = make_handler(instance.on_state)
-    stop = asyncio.Event()
-    task = asyncio.ensure_future(runner.run(stop))
     while not (runner.status().get("running") or {}).get("windows", 0) >= 3:
         await asyncio.sleep(0.005)
     for offset, (ts, value) in enumerate(later, start=1000):
@@ -687,8 +712,9 @@ async def test_a_restart_mid_independent_backfill_keeps_its_live_start(tmp_path)
     now = time.time()
     history = _history(now - 4 * DAY, 4 * 144)
     cls = closer(window="2h")
-    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:500], buffered=history[500:], rate=50.0)
-    await replay_changed_producers(service, [instance])
+    service, _instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history[:500], buffered=history[500:], rate=50.0, first_start=True
+    )
     boundary = buffer.backfill_job("closer", INITIAL)["end"]
 
     stop = asyncio.Event()
@@ -727,7 +753,7 @@ async def test_a_held_first_backfill_switched_to_independent_releases_live_at_it
     now = time.time()
     history = _history(now - 2 * DAY, 2 * 144)
     service, _instance, runner, buffer = _setup(
-        closer(mode="hold_live"), tmp_path, archive=history[:200], buffered=history[200:], rate=50.0
+        closer(mode="hold_live"), tmp_path, archive=history[:200], buffered=history[200:], rate=50.0, first_start=True
     )
     assert runner.holds("closer")
     stop = asyncio.Event()
@@ -745,7 +771,9 @@ async def test_a_held_first_backfill_switched_to_independent_releases_live_at_it
     before = time.time()
     runner2.plan()
     job = buffer.backfill_job("closer", INITIAL)
-    assert not runner2.holds("closer")
+    # It never reached live: the buffer is replayed first, and the history
+    # goes on beside live dispatch from where it stood.
+    assert buffer.backfill_job("closer", REPLAY) is not None
     assert job["end"] >= before and job["position"] == held["position"]
     await _run_until_done(runner2, "closer")
     assert buffer.backfill_job("closer", INITIAL)["done"]
@@ -797,7 +825,8 @@ async def test_a_producer_without_a_backfill_declaration_repairs_with_the_window
     runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
     service.runner = runner
     runner.plan()
-    assert buffer.backfill_jobs() == []
+    # A new producer replays the (empty) buffer; it declares no backfill.
+    assert [job["job"] for job in buffer.backfill_jobs()] == [REPLAY]
 
     job = runner.request("plain", now - 12 * 3600, now, window="4h")
     assert buffer.backfill_job("plain", job)["window"] == 4 * 3600

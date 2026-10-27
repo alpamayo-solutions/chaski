@@ -1,19 +1,22 @@
-"""Tests for chaski.dataops.service.replay_changed_producers.
+"""The replay after a code change: a ``replay`` job of the backfill runner
+(:mod:`chaski.dataops.backfill`, "Replay").
 
 A fake Door (KV only) resolves inputs; a real Buffer on a temporary SQLite file
-holds watermarks, code hashes and the points replay reads.
+holds watermarks, code hashes, jobs and the points replay reads.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 from dataops_fakes import FakeDoor, FakeRuntime, run_async, signal_entry
 
 from chaski import Reject
+from chaski.dataops.backfill import REPLAY, BackfillRunner
 from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.inputs import SignalRangeInput
-from chaski.dataops.service import replay_changed_producers
 from chaski.dataops.triggers import every, on_metric
 
 
@@ -46,6 +49,28 @@ def _isolate_registry():
     yield
     Producer._registry.clear()
     Producer._registry.update(saved_registry)
+
+
+async def replay_changed_producers(runtime, instances) -> BackfillRunner:
+    """A service start as far as replays go: plan, then run the backfill
+    runner until no producer is held and no job is pending. A failed replay
+    raises, as the runner's task does under the service's supervisor."""
+    runtime._ingest = None
+    runtime._backfill_finding_topic = lambda: "colca/v1/_Finding/n-1/dataops/backfill"
+    runner = BackfillRunner(runtime, instances, rate=1e6, busy=1.0)
+    runtime.backfill_holds = runner.holds
+    runner.plan()
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    try:
+        while any(runner.holds(i.name) for i in instances) or runtime.buffer.backfill_jobs(pending_only=True):
+            if task.done():
+                task.result()
+            await asyncio.sleep(0.002)
+    finally:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+    return runner
 
 
 # ─── producers under test ───────────────────────────────────────────────────
@@ -142,7 +167,7 @@ async def test_unchanged_hash_does_not_reset_or_replay_again(buffer, runtime):
 async def test_a_second_real_code_change_replays_again(buffer, runtime, monkeypatch):
     """Replay happens once per change: a second code change, simulated by
     patching compute_code_hash, replays again."""
-    from chaski.dataops import service
+    from chaski.dataops import codehash
 
     buffer.append("sig-event", 100.0, "a")
     instance = RecordingProducer().attach(runtime)
@@ -152,7 +177,7 @@ async def test_a_second_real_code_change_replays_again(buffer, runtime, monkeypa
     buffer.append("sig-event", 200.0, "b")
     instance.received.clear()
 
-    monkeypatch.setattr(service.codehash, "compute_code_hash", lambda cls: "a-genuinely-different-hash")
+    monkeypatch.setattr(codehash, "compute_code_hash", lambda cls: "a-genuinely-different-hash")
     await replay_changed_producers(runtime, [instance])
 
     assert instance.received == [(100.0, "a"), (200.0, "b")], "a genuine second change must replay again"
@@ -371,7 +396,11 @@ async def test_a_rejected_record_is_recorded_and_the_replay_completes(buffer, ru
 
     assert instance.received == [(100.0, 1), (300.0, 3)]
     assert runtime.rejected == [
-        ("rejecting.on_event", {"replay": "rejecting", "signal_id": "sig-event", "ts": 200.0}, "negative")
+        (
+            "rejecting.on_event",
+            {"backfill": REPLAY, "producer": "rejecting", "signal_id": "sig-event", "ts": 200.0},
+            "negative",
+        )
     ]
     assert buffer.code_hash("rejecting") == codehash.compute_code_hash(RejectingProducer)
     assert buffer.watermark("rejecting") == 300.0
@@ -402,3 +431,109 @@ async def test_a_failed_replay_leaves_the_code_hash_unwritten(buffer, runtime):
 
     assert buffer.code_hash("rejecting") == "old-hash"
     assert buffer.watermark("rejecting") == 0.0
+
+
+# ─── a replay of a large buffer: windowed, resumable, visible ─────────────
+
+
+class Counting(Producer):
+    """A checkpointed handler that counts what it sees, by timestamp."""
+
+    name = "counting"
+    system_element_name = "SE-1"
+    state_version = 1
+
+    event_input = SignalRangeInput("on_metric_signal", window="1h")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[float] = []
+
+    def snapshot_state(self):
+        return self.seen
+
+    def restore_state(self, state) -> None:
+        self.seen = list(state)
+
+    @on_metric("event_input")
+    async def on_event(self, metric) -> None:
+        self.seen.append(metric.timestamp)
+
+
+def _fill(buffer, hours: float, step: float = 60.0) -> list[float]:
+    import time
+
+    start = time.time() - hours * 3600
+    stamps = [start + i * step for i in range(int(hours * 3600 / step))]
+    buffer.append_many([("sig-event", ts, 1.0) for ts in stamps])
+    return stamps
+
+
+@run_async
+async def test_a_replay_reads_the_buffer_window_by_window_never_all_of_it(buffer, runtime, monkeypatch):
+    """The replay used to load every buffered point into one list on the
+    event loop: gigabytes on a plant, and the health door timed out."""
+    stamps = _fill(buffer, 12)
+    reads: list[float] = []
+    points = buffer.points
+    monkeypatch.setattr(buffer, "points", lambda sid, s, e: (reads.append(e - s), points(sid, s, e))[1])
+
+    instance = Counting().attach(runtime)
+    runner = await replay_changed_producers(runtime, [instance])
+
+    assert instance.seen == stamps
+    assert reads and max(reads) <= 3600.0 + 1e-6, "every read covers one window (1 h) at most"
+    job = buffer.backfill_job("counting", REPLAY)
+    assert job["done"] and job["windows"] >= 12
+    assert not runner.holds("counting")
+
+
+@run_async
+async def test_a_replay_stopped_part_way_resumes_where_it_committed_and_sees_each_record_once(buffer, runtime):
+    stamps = _fill(buffer, 12)
+    instance = Counting().attach(runtime)
+    runtime._ingest = None
+    runtime._backfill_finding_topic = lambda: "colca/v1/_Finding/n-1/dataops/backfill"
+    runner = BackfillRunner(runtime, [instance], rate=20.0, busy=1.0)
+    runner.plan()
+    assert runner.holds("counting")
+    status = {}
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while (buffer.backfill_job("counting", REPLAY) or {}).get("windows", 0) < 3:
+        status = runner.status() or status
+        await asyncio.sleep(0.005)
+    stop.set()
+    await task
+    # On the health door while it runs: the replay, holding live dispatch.
+    assert status["running"]["job"] == REPLAY and status["running"]["holds_live"] is True
+    stopped = buffer.backfill_job("counting", REPLAY)
+    assert not stopped["done"] and 0 < stopped["windows"] < 12
+
+    # A new process with the same code resumes the replay, with the state it committed.
+    again = Counting().attach(runtime)
+    await replay_changed_producers(runtime, [again])
+    assert again.seen == stamps
+    assert buffer.backfill_job("counting", REPLAY)["done"]
+
+
+@run_async
+async def test_planning_a_replay_does_not_read_the_buffered_points(buffer, runtime, monkeypatch):
+    _fill(buffer, 48, step=10.0)
+    monkeypatch.setattr(buffer, "points", lambda *a: pytest.fail("the plan read the buffered points"))
+    runner = BackfillRunner(runtime, [Counting().attach(runtime)])
+    runner.plan()
+    assert runner.holds("counting")
+
+
+@run_async
+async def test_a_replay_skips_stretches_without_a_buffered_point(buffer, runtime):
+    """One stray old point must not make the replay walk years in 1 h windows."""
+    stamps = [1_000_000_000.0, *_fill(buffer, 2)]
+    buffer.append("sig-event", stamps[0], 1.0)
+    instance = Counting().attach(runtime)
+
+    await replay_changed_producers(runtime, [instance])
+
+    assert instance.seen == stamps
+    assert buffer.backfill_job("counting", REPLAY)["windows"] <= 4

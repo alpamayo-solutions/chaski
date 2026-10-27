@@ -335,6 +335,14 @@ class Buffer:
             row = self._conn.execute("SELECT MIN(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
+    def next_point(self, signal_id: str, at: float) -> float | None:
+        """The oldest ``ts >= at`` for ``signal_id``, or ``None``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts) FROM points WHERE signal_id = ? AND ts >= ?", (signal_id, at)
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def latest(self, signal_id: str) -> float | None:
         """``MAX(ts)`` for ``signal_id``, or ``None`` if the buffer holds nothing for it."""
         with self._lock:
@@ -476,6 +484,16 @@ class Buffer:
                 (producer, job, start, end, start, code_hash, created_at, window),
             )
             return cur.rowcount > 0
+
+    def restart_backfill(self, producer: str, job: str, start: float, code_hash: str, *, created_at: float) -> None:
+        """Record ``job`` anew from ``start``, ending at the live edge: a
+        replay that starts over, whatever it was before."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                'INSERT OR REPLACE INTO backfill_jobs (producer, job, start, "end", position, windows, code_hash, '
+                "done, created_at, window_s) VALUES (?, ?, ?, NULL, ?, 0, ?, 0, ?, NULL)",
+                (producer, job, start, start, code_hash, created_at),
+            )
 
     def set_backfill_end(self, producer: str, job: str, end: float) -> None:
         """Fix the end of a job that had none: a first backfill that no longer
