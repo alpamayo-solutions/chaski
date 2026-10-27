@@ -719,3 +719,39 @@ async def test_a_refused_write_is_answered_500_not_504():
     ack = acks(door)[0][1]
     assert ack["result_code"] == commands.ACK_FAILED == 500
     assert "deadline had passed" in ack["message"]
+
+
+@run_async
+async def test_reading_ahead_through_a_backlog_reads_each_page_once():
+    """Every full page with an unanswered command read the rest of the
+    backlog ahead: P pages cost P²/2 fetches."""
+
+    class OffsetDoor(FakeDoor):
+        """Serves the stream from its records by offset, one record a page."""
+
+        def __init__(self, records) -> None:
+            super().__init__()
+            self.records = records
+            self.position = 0
+
+        def fetch(self, stream, cursor, *, max=1000, from_offset=None, tail=False, **_kw):
+            if tail:
+                return Page(records=[], next=len(self.records) + 1)
+            start = from_offset if from_offset is not None else self.position + 1
+            self.fetch_calls.append({"from_offset": from_offset})
+            rows = self.records[start - 1 : start - 1 + max]
+            return Page(records=rows, next=start + len(rows), start=start)
+
+        def ack(self, stream, cursor, offset) -> bool:
+            self.position = offset
+            return super().ack(stream, cursor, offset)
+
+    pages = 60
+    door = OffsetDoor([record(offset=i, correlation_id=f"corr-{i}") for i in range(1, pages + 1)])
+    producer = Selection().attach(FakeRuntime(door, buffer=None))
+    ex = CommandExecutor(door, FlakySend(door, 0), Stream(door, "commands", CURSOR, max=1), gather([producer]), NODE_ID)
+
+    await ex.drain()
+
+    assert len(producer.seen) == pages
+    assert len(door.fetch_calls) <= 3 * pages, len(door.fetch_calls)

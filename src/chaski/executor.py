@@ -279,6 +279,8 @@ class CommandExecutor:
         self._watch: Any = None
         self._drained_on: int | None = None
         self._answered: OrderedDict[str, None] = OrderedDict()
+        #: The offset up to which a scan ahead noted the answers (see _scan_ahead).
+        self._scanned_to = 0
         self._contracts = sorted({*(contracts if contracts is not None else (c for c, _p in handlers)), ACK_CONTRACT})
 
     @property
@@ -463,13 +465,17 @@ class CommandExecutor:
 
     def _scan_ahead(self, from_offset: int) -> None:
         """Note the answers after ``from_offset`` without moving the cursor.
-        A node that cannot read ahead (no ``Page.start``) ends the scan."""
-        offset = from_offset
+        A node that cannot read ahead (no ``Page.start``) ends the scan.
+
+        What an earlier scan read is not read again: each page of a long
+        backlog would otherwise scan the rest of it, P²/2 fetches for P pages."""
+        offset = max(from_offset, self._scanned_to)
         while True:
             page = self._stream.fetch(from_offset=offset)
             if page.start is None:
                 return
             self._note_answers(page.records)
+            self._scanned_to = max(self._scanned_to, page.next)
             if len(page.records) < self._stream.page_size or page.next <= offset:
                 return
             offset = page.next
