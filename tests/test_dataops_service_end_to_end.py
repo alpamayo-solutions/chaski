@@ -678,6 +678,16 @@ def _buffered_before_a_code_change(tmp_path: Path) -> None:
         buffer.close()
 
 
+def _stored_code_hash(tmp_path: Path, producer: str) -> str | None:
+    from chaski.dataops.buffer import Buffer
+
+    buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
+    try:
+        return buffer.code_hash(producer)
+    finally:
+        buffer.close()
+
+
 @run_async
 async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_on(tmp_path: Path, monkeypatch):
     from chaski.dataops import codehash
@@ -696,6 +706,11 @@ async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_
         # The live record is handled too (its timestamp is older than the
         # buffered ones, so the replay takes it in order).
         await _poll_until(lambda: len(_door_metrics()) >= 3)
+        # The replay records the new code hash only once it has finished, after
+        # its last output went out; stopping before that would leave the old
+        # hash and replay again on the next start, which is the intended
+        # behaviour for an interrupted replay, not what this test is about.
+        await _poll_until(lambda: _stored_code_hash(tmp_path, "strict") == codehash.compute_code_hash(Strict))
         assert not task.done()
     finally:
         stop.set()
