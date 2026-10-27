@@ -97,6 +97,7 @@ from colca_data_contracts import Metric
 from chaski.door import Door, Record, Stream
 from chaski.failures import HandlerHealth, Reject
 from chaski.outage import Outage, expected_failure, warn_failure
+from chaski.publishing import PublishBatch
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
@@ -234,10 +235,19 @@ def off_loop(method):
         health = getattr(instance._runtime, "handler_health", None)
         try:
             with instance._lock:
+                batch = PublishBatch()
                 try:
-                    asyncio.run(method())
+                    asyncio.run(_in_batch(batch, method))
                 except Reject as rejected:
+                    batch.settle()
                     record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        batch.settle()
+                    raise
+                else:
+                    # A tick ends when the node confirmed what it published.
+                    batch.settle()
         except Exception as exc:
             # The next tick runs the method again. An expected failure (Colca
             # away) is logged here without a traceback; anything else is
@@ -252,6 +262,12 @@ def off_loop(method):
         outage.recovered()
 
     return job
+
+
+async def _in_batch(batch: PublishBatch, method: Callable[[], Awaitable[Any]]) -> Any:
+    """Run ``method()`` with its writes pipelined into ``batch``."""
+    with batch.active():
+        return await method()
 
 
 def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:

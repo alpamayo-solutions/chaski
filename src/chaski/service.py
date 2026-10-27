@@ -36,7 +36,9 @@ service's own identity.
 
 **Records and commands.** Everything a service writes goes over its MQTT
 session: ``send(topic, payload)`` publishes any other record at QoS 1 and
-waits for the PUBACK, ``retract(topic)`` retires a state record, and
+waits for the PUBACK, ``retract(topic)`` retires a state record (inside
+``with svc.pipelined():`` writes are confirmed together when the block ends,
+:mod:`chaski.publishing`), and
 ``command(contract, path, fields)`` sends a command to the service's node and
 returns its ``_Ack``. HTTP is for reading.
 
@@ -98,6 +100,7 @@ from .doorbell import IDLE_DRAIN_S
 from .failures import REJECTED_FINDING, UNHEALTHY, HandlerHealth, Reject, rejection_finding
 from .outage import Outage, warn_failure
 from .pending import PendingSamples
+from .publishing import Pubacks, PublishBatch
 from .startup import (
     STARTUP_LOG_REMINDER_S,
     STARTUP_RETRY_MAX_S,
@@ -553,6 +556,8 @@ class Service:
         # lock and publish after releasing it.
         self._lock = threading.RLock()
         self._client: Client | None = None
+        #: Matches PUBACKs to pipelined writes (:mod:`chaski.publishing`).
+        self._pubacks: Pubacks | None = None
         # Push wake-ups handed out by wake_on(); each rings after a reconnect.
         self._wakeups: list[TopicWakeup] = []
         self._fanout: TopicFanout | None = None
@@ -578,6 +583,8 @@ class Service:
         # The SIGNAL's own topic -> Binding. See Binding for why the key is
         # the signal's topic and not the tag id.
         self._bindings: dict[str, Binding] = {}
+        #: ``_bindings`` by tag id: what publish() looks up per sample.
+        self._bindings_by_tag: dict[str, list[Binding]] = {}
         self._pending_samples: PendingSamples | None = None
         self._pending_sources: set[str] = set()
         self._pending_wake = Wakeup()
@@ -857,6 +864,8 @@ class Service:
         guard_network_thread(client, self.name)
         self._reconnect_backoff = bound_reconnect(client, RECONNECT_MAX_S if self._external else LOCAL_RECONNECT_MAX_S)
         self._subscriptions = Subscriptions(client)
+        # Only franzmq's client hands PUBACK reason codes to on_publish.
+        self._pubacks = Pubacks(client) if isinstance(client, Client) else None
         client.loop_start()
         if not self._connected_event.wait(connect_timeout):
             raise TimeoutError(f"chaski.Service: no CONNACK from the broker within {connect_timeout}s")
@@ -1386,13 +1395,26 @@ class Service:
 
     def _bindings_for(self, tag_id: str) -> list[Binding]:
         """Under the lock: every Signal currently bound to ``tag_id``."""
-        return [b for b in self._bindings.values() if b.tag_id == tag_id]
+        return list(self._bindings_by_tag.get(tag_id, ()))
 
-    def _publish_metric(
-        self, topic: Topic, signal_id: str, value: Any, timestamp: Any | None, *, wait: bool = True
-    ) -> None:
+    def _set_binding(self, topic: str, binding: Binding | None) -> bool:
+        """Under the lock: bind ``topic``, or drop its binding (``None``), and
+        keep the index by tag. Whether the table changed."""
+        if binding is None:
+            dropped = self._bindings.pop(topic, None)
+            if dropped is None:
+                return False
+        else:
+            self._bindings[topic] = binding
+        index: dict[str, list[Binding]] = {}
+        for each in self._bindings.values():
+            index.setdefault(each.tag_id, []).append(each)
+        self._bindings_by_tag = index
+        return True
+
+    def _publish_metric(self, topic: Topic, signal_id: str, value: Any, timestamp: Any | None) -> None:
         metric = Metric(value=value, timestamp=_epoch(timestamp), signal_id=signal_id)
-        self._started_client.publish(topic, metric, qos=1, wait=wait)
+        self._write(self._started_client, topic, metric)
 
     def _open_pending(self):
         if self._pending_samples is None:
@@ -1433,9 +1455,12 @@ class Service:
                             continue
                         targets = [(b.topic, b.signal.id) for b in bound if b.signal.is_published]
                         rows = self._pending_samples.page(path)
-                    for _, value, timestamp, _ in rows:
-                        for topic, signal_id in targets:
-                            self._publish_metric(topic, signal_id, value, timestamp)
+                    batch = PublishBatch()
+                    with batch.active():
+                        for _, value, timestamp, _ in rows:
+                            for topic, signal_id in targets:
+                                self._publish_metric(topic, signal_id, value, timestamp)
+                    batch.settle()
                     # Disabled bindings deliberately suppress publication. Otherwise
                     # every target has acknowledged before these rows are removed.
                     with self._lock:
@@ -1479,12 +1504,42 @@ class Service:
         past the deadline or while the link is down raises :class:`NotSent`.
         """
         # franzmq sends ``payload.encode()``, which a JSON string already has.
-        self._writable("send", topic).publish(topic, payload, qos=1, retain=retain)
+        self._write(self._writable("send", topic), topic, payload, retain=retain)
+
+    @contextlib.contextmanager
+    def pipelined(self) -> Iterator[PublishBatch]:
+        """Pipeline the writes of the block (:meth:`publish`, :meth:`send`,
+        :meth:`retract`): each is handed to the MQTT client at once, and the
+        block ends when the node confirmed all of them. A refused or
+        unconfirmed write raises there (``PublishRejected``,
+        ``PublishTimeout``), as it would have from the write. At most
+        :data:`~chaski.publishing.PUBLISH_WINDOW` writes wait at a time."""
+        batch = PublishBatch()
+        try:
+            with batch.active():
+                yield batch
+        except BaseException:
+            with contextlib.suppress(Exception):
+                batch.settle()
+            raise
+        batch.settle()
 
     def retract(self, topic: str) -> None:
         """Retire the state record at ``topic``: an empty retained payload,
         which the node keeps as a tombstone and drops from its KV."""
-        self._writable("retract", topic).publish_tombstone(topic, qos=1)
+        self._write(self._writable("retract", topic), topic, None, tombstone=True)
+
+    def _write(self, client: Any, topic: Any, payload: Any, *, retain: bool = False, tombstone: bool = False) -> None:
+        """One QoS 1 write. Inside a :class:`~chaski.publishing.PublishBatch`
+        it is confirmed when the batch settles; outside one, now."""
+        batch = PublishBatch.current()
+        pubacks = self._pubacks
+        if batch is not None and pubacks is not None:
+            batch.add(pubacks.send(topic, payload, retain=retain, tombstone=tombstone))
+        elif tombstone:
+            client.publish_tombstone(topic, qos=1)
+        else:
+            client.publish(topic, payload, qos=1, retain=retain)
 
     def _writable(self, method: str, topic: str) -> Any:
         """The client, unless a write deadline (:func:`writes_until`) refuses
@@ -1872,7 +1927,7 @@ class Service:
         if signal is None:
             # Tombstone: the signal was retired and its binding goes with it.
             with self._lock:
-                if self._bindings.pop(topic_str, None) is not None:
+                if self._set_binding(topic_str, None):
                     logger.info("chaski.Service: binding retired: %s", topic_str)
                     self._bindings_changed()
             return
@@ -1882,12 +1937,12 @@ class Service:
             if not tag_id or source is None:
                 # Names a tag this service never minted — someone else's
                 # binding, or a signal that was unbound from one of ours.
-                if self._bindings.pop(topic_str, None) is not None:
+                if self._set_binding(topic_str, None):
                     self._bindings_changed()
                 return
             # The metric goes to the Signal's own position: same node and path.
             metric_topic = Topic(payload_type=Metric, node_id=parts[3], context=tuple(parts[4:]))
-            self._bindings[topic_str] = Binding(tag_id, metric_topic, signal)
+            self._set_binding(topic_str, Binding(tag_id, metric_topic, signal))
             self._bindings_changed()
             self._pending_wake.notify()
 

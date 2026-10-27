@@ -624,7 +624,7 @@ class ConnectorService(Service):
         """The route handler of one bound signal: check the binding and the
         tag, then :meth:`handle_signal_write`."""
         with self._lock:
-            binding = next((b for b in self._bindings.values() if b.tag_id == tag_id), None)
+            binding = next(iter(self._bindings_for(tag_id)), None)
             source = self._started_catalogue.source_for_tag(tag_id)
             tag = self._started_catalogue.tag(source) if source is not None else None
             handle = self._handles.get(tag_id)

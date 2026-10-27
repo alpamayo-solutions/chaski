@@ -114,6 +114,7 @@ import ulid
 from chaski.doorbell import Doorbell
 from chaski.failures import Reject
 from chaski.outage import warn_failure
+from chaski.publishing import PublishBatch
 
 from . import codehash
 from .base import Producer, event_time, restore_checkpoint, save_checkpoint, state_copy
@@ -654,7 +655,6 @@ class BackfillRunner:
         """Every record and tick of ``[start, end)`` through the producer's
         own handlers, in timestamp order. A checkpointed producer's state is
         put back if the window fails, so the retry starts where it did."""
-        from .service import synthetic_record
 
         historian = self._service.historian
         events: list[tuple[float, int, int, Any, Any]] = []
@@ -675,31 +675,41 @@ class BackfillRunner:
 
         checkpointed = _holds_live(job) and instance.state_version is not None
         previous = state_copy(instance) if checkpointed else None
+        # What the window publishes is confirmed before its position is committed.
+        batch = PublishBatch()
         try:
-            for ts, kind, _order, target, value in events:
-                if kind == 0:
-                    signal_id, handlers = target
-                    record = synthetic_record(signal_id, ts, value, actor="backfill")
-                    for handler in handlers:
-                        try:
-                            await handler(record)
-                        except Reject as rejected:
-                            subject = {
-                                "backfill": job["job"],
-                                "producer": instance.name,
-                                "signal_id": signal_id,
-                                "ts": ts,
-                            }
-                            await asyncio.to_thread(
-                                record_rejection, self._service, consumer_name(handler), subject, rejected
-                            )
-                else:
-                    await asyncio.to_thread(self._tick, instance, target, ts, job)
+            with batch.active():
+                await self._run_events(instance, job, events, batch)
+            await asyncio.to_thread(batch.settle)
         except BaseException:
             if previous is not None:
                 instance.restore_state(previous)
             raise
         return len(events)
+
+    async def _run_events(self, instance: Producer, job: dict[str, Any], events: list, batch: PublishBatch) -> None:
+        from .service import synthetic_record
+
+        for ts, kind, _order, target, value in events:
+            if kind == 0:
+                signal_id, handlers = target
+                record = synthetic_record(signal_id, ts, value, actor="backfill")
+                for handler in handlers:
+                    batch.origin = consumer_name(handler)
+                    try:
+                        await handler(record)
+                    except Reject as rejected:
+                        subject = {
+                            "backfill": job["job"],
+                            "producer": instance.name,
+                            "signal_id": signal_id,
+                            "ts": ts,
+                        }
+                        await asyncio.to_thread(
+                            record_rejection, self._service, consumer_name(handler), subject, rejected
+                        )
+            else:
+                await asyncio.to_thread(self._tick, instance, target, ts, job)
 
     def _tick(self, instance: Producer, method_name: str, due: float, job: dict[str, Any]) -> None:
         """One tick at its instant, off the loop like a live tick."""

@@ -144,3 +144,88 @@ class FakeRuntime:
     ) -> dict:
         self.door.published.append((f"colca/v1/{contract}/{node or NODE_ID}/{path}", json.dumps(fields or {})))
         return {"result_code": 200, "message": ""}
+
+
+class _Sent:
+    """What a client's ``publish`` returns: the message id the PUBACK names."""
+
+    def __init__(self, mid: int) -> None:
+        self.mid = mid
+
+
+class AckingClient:
+    """An MQTT client stand-in with a link of ``latency`` seconds each way
+    collapsed into one: a write is acknowledged ``latency`` after it was sent,
+    through ``on_publish`` from a thread of its own, as paho's network thread
+    does. A waited write (``wait=True``) blocks for the round trip.
+    ``refuse`` names topics the node answers with reason code 0x99."""
+
+    publish_timeout = 10.0
+
+    def __init__(self, latency: float = 0.0, *, refuse: set[str] | None = None, silent: set[str] | None = None) -> None:
+        import heapq
+        import threading
+
+        self._heapq = heapq
+        self.latency = latency
+        self.refuse = set(refuse or ())
+        self.silent = set(silent or ())
+        self.on_publish = None
+        self.sent: list[tuple[str, Any]] = []
+        self.waited = 0
+        self._mid = 0
+        self._due: list[tuple[float, int, int]] = []
+        self._cv = threading.Condition()
+        self._closed = False
+        self._thread = threading.Thread(target=self._ack_forever, daemon=True)
+        self._thread.start()
+
+    def is_connected(self) -> bool:
+        return True
+
+    def publish(self, topic, payload, qos=0, retain=False, wait=True):
+        import time
+
+        topic = str(topic)
+        self.sent.append((topic, payload))
+        if wait:
+            self.waited += 1
+            if self.latency:
+                time.sleep(self.latency)
+            return _Sent(0)
+        with self._cv:
+            self._mid += 1
+            mid = self._mid
+            if topic not in self.silent:
+                code = 0x99 if topic in self.refuse else 0
+                self._heapq.heappush(self._due, (time.monotonic() + self.latency, mid, code))
+                self._cv.notify()
+        return _Sent(mid)
+
+    def publish_tombstone(self, topic, qos=0, wait=True):
+        return self.publish(topic, b"", qos, True, wait)
+
+    def _ack_forever(self) -> None:
+        import time
+
+        while True:
+            with self._cv:
+                while not self._closed and not self._due:
+                    self._cv.wait()
+                if self._closed:
+                    return
+                due, mid, code = self._due[0]
+                delay = due - time.monotonic()
+                if delay > 0:
+                    self._cv.wait(delay)
+                    continue
+                self._heapq.heappop(self._due)
+            callback = self.on_publish
+            if callback is not None:
+                callback(self, None, mid, code, None)
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify()
+        self._thread.join(timeout=5)

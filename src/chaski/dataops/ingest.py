@@ -12,8 +12,10 @@ The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name, and so its position, stays.
 
-**Crash safety.** Per page: append and run handlers, save the checkpoints of
-the producers that keep one (once per page), commit, then ack. A crash before
+**Crash safety.** Per page: append and run handlers, wait until the node
+confirmed what they published (their writes are pipelined,
+:mod:`chaski.publishing`), save the checkpoints of the producers that keep one
+(once per page), commit, then ack. A crash before
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
 
@@ -77,6 +79,7 @@ from chaski.door import Gap, Page, Record, Stream, StreamGapError
 from chaski.doorbell import IDLE_DRAIN_S, Doorbell
 from chaski.failures import HandlerHealth, Reject, record_subject
 from chaski.outage import Outage
+from chaski.publishing import PublishBatch
 from chaski.retry import Backoff
 
 from .base import PageCheckpoints, RewindFailed
@@ -263,29 +266,48 @@ class Ingest:
         """Append and dispatch ``records`` in order, on the service's loop.
 
         A record is appended right before its handlers run, so a handler sees
-        no later record of the page. Checkpointed producers save their state
-        once, when the page ends (:class:`~chaski.dataops.base.PageCheckpoints`),
-        still inside the page's commit and before its ack.
+        no later record of the page. What the handlers publish is pipelined
+        (:class:`~chaski.publishing.PublishBatch`) and confirmed when the page
+        ends, before checkpointed producers save their state once
+        (:class:`~chaski.dataops.base.PageCheckpoints`), still inside the
+        page's commit and before its ack. A write the node refused or did not
+        confirm puts every checkpointed producer back to the page's start, and
+        the page is acked only before its first handled record.
         """
         page = PageCheckpoints()
+        batch = PublishBatch()
+        first_handled: Record | None = None
         try:
             with page.active():
-                # Records nobody handles are appended together, right before
-                # the next record that is handled (or the page's end).
-                quiet: list[Record] = []
-                for record in records:
-                    signal_id = self._signal_id_of(record)
-                    if signal_id is None or not self._dispatch.get(signal_id):
-                        quiet.append(record)
-                        continue
-                    self._append_many(quiet)
-                    quiet.clear()
-                    self._append(record)
-                    await self._handle(signal_id, record)
-                self._append_many(quiet)
+                try:
+                    with batch.active():
+                        # Records nobody handles are appended together, right
+                        # before the next record that is handled (or the page's end).
+                        quiet: list[Record] = []
+                        for record in records:
+                            signal_id = self._signal_id_of(record)
+                            if signal_id is None or not self._dispatch.get(signal_id):
+                                quiet.append(record)
+                                continue
+                            self._append_many(quiet)
+                            quiet.clear()
+                            self._append(record)
+                            if first_handled is None:
+                                first_handled = record
+                            await self._handle(signal_id, record)
+                        self._append_many(quiet)
+                finally:
+                    # Confirmed also when a handler failed: the records before
+                    # it are acked, and their writes with them.
+                    if len(batch):
+                        try:
+                            await asyncio.to_thread(batch.settle)
+                        except Exception as exc:
+                            page.abandon(batch.failed_origin or "publish", first_handled or records[0], exc)
         finally:
-            # A checkpoint that could not be saved puts its producer back to
-            # its first record of the page; the page is acked only before it.
+            # A checkpoint that could not be saved, or a write that was not
+            # confirmed, puts producers back to the page's records named here;
+            # the page is acked only before that record.
             late = page.failed
             if late is not None and (self._failed is None or late.record.offset < self._failed[1].offset):
                 self._failed = (late.consumer, late.record)
@@ -423,6 +445,9 @@ class Ingest:
     async def _handle(self, signal_id: str, record: Record) -> None:
         for handler in self._dispatch.get(signal_id, []):
             name = consumer_name(handler)
+            batch = PublishBatch.current()
+            if batch is not None:
+                batch.origin = name
             try:
                 try:
                     await handler(record)

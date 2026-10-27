@@ -188,9 +188,12 @@ class Buffer:
                 )
             ]
 
-    def output_sent(self, source, timestamp):
+    def outputs_sent(self, source: str, timestamps: list[float]) -> None:
+        """Drop the queued samples of ``source`` the node confirmed, in one commit."""
         with self._lock, self._conn:
-            self._conn.execute("DELETE FROM pending_outputs WHERE source=? AND ts=?", (source, timestamp))
+            self._conn.executemany(
+                "DELETE FROM pending_outputs WHERE source=? AND ts=?", [(source, ts) for ts in timestamps]
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -416,7 +419,9 @@ class Buffer:
                 "INSERT OR REPLACE INTO emitted_annotations (source, annotation_id, time_start) VALUES (?, ?, ?)",
                 (source, annotation_id, time_start),
             )
-            self._conn.commit()
+            # Inside an ingest page, with the page's commit.
+            if not self._deferred:
+                self._conn.commit()
 
     def emitted_annotations_in_window(self, source: str, start: float, end: float) -> list[tuple[str, float]]:
         """``(annotation_id, time_start)`` pairs ``source`` itself recorded

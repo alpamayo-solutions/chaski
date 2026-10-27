@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from chaski.failures import Reject
+from chaski.publishing import settle_current
 
 if TYPE_CHECKING:
     from chaski.door import Door
@@ -313,6 +314,8 @@ class Producer(ABC):
         Keeps the code hash already on file; only the replay check at startup
         records a new one.
         """
+        # What was published up to the watermark is confirmed before it moves.
+        settle_current()
         buffer = self.runtime.buffer
         existing_hash = buffer.code_hash(self.name) or ""
         buffer.set_watermark(self.name, position, existing_hash)
@@ -349,8 +352,10 @@ class RewindFailed(Exception):
     record it handled in the page: the page is acknowledged only up to the
     one before it, so the producer handles the rest again."""
 
-    def __init__(self, consumer: str, record: Any) -> None:
-        super().__init__(f"{consumer}: could not keep the state of the records before offset={record.offset}")
+    def __init__(self, consumer: str, record: Any, reason: str = "") -> None:
+        super().__init__(
+            f"{consumer}: {reason or 'could not keep the state of the records before'} offset={record.offset}"
+        )
         self.consumer = consumer
         self.record = record
 
@@ -480,6 +485,18 @@ class PageCheckpoints:
         entry.base_state, entry.base_offsets = entry.start_state, dict(entry.start_offsets)
         entry.since.clear()
 
+    def abandon(self, consumer: str, record: Any, cause: BaseException) -> None:
+        """Put every producer of the page back to the page's start and save
+        none of them: what the page did from ``record`` on is not confirmed
+        (``cause``, a write the node refused or did not acknowledge)."""
+        for producer, entry in self._entries.values():
+            self._to_start(producer, entry)
+            entry.first = None
+        failed = RewindFailed(consumer, record, f"a write was not confirmed ({cause}); the page is handled again from")
+        failed.__cause__ = cause
+        if self.failed is None or record.offset < self.failed.record.offset:
+            self.failed = failed
+
     def finish(self) -> None:
         """Save each producer's checkpoint and release it. A producer whose
         checkpoint cannot be saved goes back to the page's start, and
@@ -510,6 +527,8 @@ def save_checkpoint(producer: Producer) -> None:
     the change."""
     if producer.state_version is None:
         return
+    # The state saved must not run ahead of what the node confirmed.
+    settle_current()
     if producer._checkpoint_hash is None:
         from .codehash import compute_code_hash
 
