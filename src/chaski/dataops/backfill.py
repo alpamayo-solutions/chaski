@@ -363,6 +363,19 @@ class BackfillRunner:
                 )
 
         self._plan_replays(now)
+        # Until the runner starts it, the health door names the job to run first.
+        pending = [job for job in self._buffer.backfill_jobs(pending_only=True) if self._runs(job)]
+        pending.sort(key=lambda job: not _holds_live(job))
+        with self._lock:
+            self._pending = max(0, len(pending) - 1)
+        if pending:
+            self._report_next(pending[0])
+
+    def _report_next(self, job: dict[str, Any]) -> None:
+        """Report ``job`` as running from where it stands, before anything is awaited for it."""
+        instance = self._instances[job["producer"]]
+        self._report({**job, "window_s": _window_of(type(instance), job)}, job["position"], job["windows"], job["end"])
+        self._moved()
 
     def _plan_replays(self, now: float) -> None:
         """Record a replay of every producer whose code changed since it last
@@ -525,6 +538,9 @@ class BackfillRunner:
                 await self._publish_finding(force=True)
                 await _until(self.bell.after(seen), stop)
                 continue
+            # Reported before anything is awaited for it, so the health door
+            # never reads "no backfill" while one is about to run.
+            self._report_next(jobs[0])
             await self._run_job(jobs[0], stop)
 
     def _runs(self, job: dict[str, Any]) -> bool:
@@ -734,9 +750,10 @@ class BackfillRunner:
             await asyncio.to_thread(self._buffer.set_watermark, instance.name, edge, code_hash)
             with self._lock:
                 self._held.discard(instance.name)
-                self._current = None
-                self._moved_at = None
-                self._waiting = ""
+            # Done, and no longer holding: reported so until the runner
+            # reports the next job or that none is left, never as nothing.
+            self._report(job, end, windows + 1, end)
+            self._moved()
         finally:
             page_lock.release()
         log.info(

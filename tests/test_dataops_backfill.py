@@ -1117,3 +1117,30 @@ async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
     assert len(loops) <= job["windows"] < len(instance.ran)
     assert threading.get_ident() not in {thread for _d, thread, _l in instance.ran}
     buffer.close()
+
+
+@run_async
+async def test_the_status_never_reads_idle_while_a_job_is_pending(tmp_path):
+    """Between the replay's hand-over and the next job the status named no
+    running job for a moment: the health door then said none ran."""
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    _service, _instance, runner, buffer = _setup(
+        closer(window="6h"), tmp_path, archive=history[:300], buffered=history[300:], first_start=True
+    )
+    assert runner.holds("closer")
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    idle_with_work: list[list[str]] = []
+    deadline = time.monotonic() + 20
+    while not buffer.backfill_job("closer", INITIAL)["done"]:
+        assert time.monotonic() < deadline and not task.done()
+        status = runner.status()
+        pending = [job["job"] for job in buffer.backfill_jobs(pending_only=True)]
+        if not status.get("running") and pending:
+            idle_with_work.append(pending)
+        await asyncio.sleep(0)
+    stop.set()
+    await task
+    assert idle_with_work == []
+    buffer.close()

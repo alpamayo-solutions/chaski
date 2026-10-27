@@ -398,10 +398,14 @@ def test_an_independent_backfill_lets_live_output_flow_and_its_union_with_live_i
             # Live cycles reach the node while the history is far from done.
             _publish(machine, later)
             _wait(lambda: live_cycles <= {ts for ts, _ in _outputs(reader)})
+            # The runner reports the independent job as running, beside live.
+            status = _wait(
+                lambda: (r := svc._backfill.status().get("running")) and r["job"] == INITIAL and r,
+            )
+            assert status["holds_live"] is False
             running = svc.buffer.backfill_job("cycles", INITIAL)
             assert not running["done"], "the history finished before live output was checked"
             assert running["position"] < job["end"] - DAY
-            assert (svc._backfill.status().get("running") or {}).get("holds_live") is False
 
             _wait(lambda: svc.buffer.backfill_job("cycles", INITIAL)["done"], timeout=120.0)
             outputs = _until_outputs(reader, len(expected))
