@@ -215,8 +215,12 @@ class Ingest:
         """Swap what this loop dispatches and fetches, mid-run.
 
         Producers often start before the signals they read are commissioned.
-        Only the table and the filter change; the cursor keeps its position,
-        and records a newly resolved signal missed are recovered by replay.
+        Only the table and the filter change; the cursor keeps its position.
+        Records of a newly resolved signal that the cursor passed while the
+        filter left it out are not read again: nothing recovers them on its
+        own. A producer that needs them repairs the range
+        (:meth:`~chaski.dataops.DataOpsService.request_backfill`, from the
+        historian).
         """
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
