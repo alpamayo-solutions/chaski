@@ -63,7 +63,9 @@ class HealthState:
     watched record arrives. An ingest that is busy, not waiting, and has not
     finished a drain for ``stall_after_s`` is stalled. So does
     another process running as this service (``identity_conflict``): the
-    broker hands their one session back and forth and wake-ups get lost.
+    broker hands their one session back and forth and wake-ups get lost. So
+    does an ingest waiting at input records the stream pruned before it read
+    them (``stream_gap``), until an operator accepts their loss.
 
     ``handlers`` counts failing handlers: while one is retried the answer
     says ``degraded`` and names it; once one failed ``unhealthy_after`` times
@@ -118,6 +120,8 @@ class HealthState:
     handlers: HandlerHealth | None = None
     #: What startup waits for while not ``ready``.
     not_ready: Callable[[], str] | None = None
+    #: Why the ingest waits at input records pruned before it read them, "" while it does not.
+    gap: Callable[[], str] | None = None
     #: The running backfill and how many are pending, ``{}`` while none is.
     backfill: Callable[[], dict] | None = None
     #: Monotonic time of the last beat on the event loop, None before the first.
@@ -176,6 +180,9 @@ class HealthState:
     def _conflict(self) -> str:
         return self.identity_conflict() if self.identity_conflict is not None else ""
 
+    def _gap(self) -> str:
+        return self.gap() if self.gap is not None else ""
+
     def _handlers(self) -> str:
         return self.handlers.status if self.handlers is not None else "ok"
 
@@ -186,6 +193,7 @@ class HealthState:
             and self._loop() != "stalled"
             and not self._lag()
             and not self._conflict()
+            and not self._gap()
             and self._handlers() != UNHEALTHY
         )
 
@@ -209,12 +217,14 @@ class HealthState:
         conflict = self._conflict()
         handlers = self._handlers()
         loop = self._loop()
+        gap = self._gap()
         body = {
             "ok": ingest in ("not-started", "running")
             and broker != "down"
             and loop != "stalled"
             and not lag
             and not conflict
+            and not gap
             and handlers != UNHEALTHY,
             "ingest": ingest,
             "broker": broker,
@@ -249,6 +259,8 @@ class HealthState:
             body["cursor_lag"] = lag
         if conflict:
             body["identity_conflict"] = conflict
+        if gap:
+            body["stream_gap"] = gap
         if self.handlers is not None and handlers != "ok":
             body["failing"] = {
                 name: {"failures": f.failures, "error": f.error, "since": round(f.since, 3)}

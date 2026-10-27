@@ -218,6 +218,23 @@ class Buffer:
             log.info("Minted new buffer generation %s at %s", generation, self._path)
             return generation
 
+    def accepted_gap(self) -> int:
+        """The stream offset through which an operator accepted lost input
+        records (:meth:`accept_gap`), 0 when none was accepted."""
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'accepted_gap_through'").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def accept_gap(self, through_offset: int) -> None:
+        """Record, durably, that the input records pruned up to
+        ``through_offset`` are accepted as lost."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('accepted_gap_through', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(max(through_offset, self.accepted_gap())),),
+            )
+
     # ------------------------------------------------------------------ points
 
     def append(self, signal_id: str, ts: float, value: Any) -> None:

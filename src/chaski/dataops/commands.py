@@ -198,6 +198,8 @@ class CommandExecutor(executor.CommandExecutor):
     ran into the node's rate limit when commands came fast."""
 
     async def _invoke(self, handler: Any, command: Command) -> Any:
-        producer = handler.__self__
+        producer = getattr(handler, "__self__", None)
+        if not isinstance(producer, Producer):
+            return await handler(command)  # the service's own command
         with resolve.lazy_pass(resolve.Snapshot(self._door)), producer._lock:
             return await handler(command)

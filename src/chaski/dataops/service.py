@@ -96,7 +96,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
-from chaski.door import Door, Record, Stream
+from chaski.door import Door, Gap, Record, Stream
 from chaski.failures import HandlerHealth, Reject
 from chaski.outage import Outage, expected_failure, warn_failure
 from chaski.publishing import PublishBatch
@@ -104,7 +104,7 @@ from chaski.retained_view import ViewScope
 from chaski.service import Service
 
 from . import commands, health, resolve, watch
-from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
+from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
 from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
 from .buffer import Buffer
@@ -132,6 +132,33 @@ INDEX_SETTLE_S = 0.5
 #: doubling per consecutive failure up to :data:`WAKE_RETRY_MAX_S`.
 INDEX_RETRY_S = 1.0
 _METRIC_FIELDS = {f.name for f in fields(Metric)}
+#: The retained finding that names input records pruned before they were read.
+GAP_FINDING = "stream_gap"
+#: The verb, below the service's own path, of the command accepting their loss.
+ACCEPT_GAP = "acceptGap"
+ACCEPT_GAP_CONTRACT = "_CmdMaintain"
+#: The cursor its executor reads the commands stream with.
+ACCEPT_GAP_CURSOR = "accept-gap"
+#: A gap's repair covers this much more on either side of what the node
+#: stored in it: event times differ from storage times.
+GAP_MARGIN_S = 3600.0
+
+
+def _iso_span(span: tuple[float, float]) -> str:
+    from datetime import UTC, datetime
+
+    start, end = (datetime.fromtimestamp(ts, UTC).isoformat(timespec="seconds") for ts in span)
+    return f"{start} to {end}"
+
+
+def _gap_detail(gap: Gap) -> dict[str, Any]:
+    return {
+        "from_offset": gap.from_offset,
+        "to_offset": gap.to_offset,
+        "first_ts": gap.first_ts,
+        "last_ts": gap.last_ts,
+        "approx": gap.approx,
+    }
 
 
 # ─── discovery ──────────────────────────────────────────────────────────────
@@ -801,6 +828,11 @@ class DataOpsService(Service):
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
         self._definition_cache: resolve.LiveIndex | None = None
+        #: The gap the ingest waits at for an operator's acceptance, if any.
+        self._pending_gap: Gap | None = None
+        self._gap_executor: commands.CommandExecutor | None = None
+        self._gap_task: asyncio.Future | None = None
+        self._stop: asyncio.Event | None = None
 
     def _after_connect(self) -> None:
         super()._after_connect()
@@ -922,11 +954,129 @@ class DataOpsService(Service):
         return record_backfill_request(self.buffer, producer_cls, start, end, window=window)
 
     def _backfill_finding_topic(self) -> str:
-        from colca_data_contracts import topic_prefix
-
         from .backfill import FINDING
 
-        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{FINDING}"
+        return self._finding_topic(FINDING)
+
+    # -- input records the stream pruned before they were read -------------
+
+    def _finding_topic(self, reason: str) -> str:
+        from colca_data_contracts import topic_prefix
+
+        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{reason}"
+
+    @property
+    def accept_gap_path(self) -> str:
+        """The node-local path of this service's accept-gap command (``_CmdMaintain``)."""
+        return "/".join((*self._hierarchy, ACCEPT_GAP))
+
+    def _on_gap(self, gap: Gap, survivors: list[Record]) -> bool:
+        """The ingest reached input records the stream pruned before it read
+        them; in its worker thread. Whether it may go on past them.
+
+        With a historian every producer reading inputs gets a repair backfill
+        over the gap's time range (a job named after the gap, recorded once),
+        and the ingest goes on; the ``stream_gap`` finding stands until the
+        repairs are done. Without one the loss is the operator's to accept:
+        the finding says how (a ``_CmdMaintain`` at :attr:`accept_gap_path`),
+        and the ingest waits until the acceptance is recorded."""
+        span = self._gap_span(gap, survivors)
+        pruned = f"offsets {gap.from_offset}..{gap.to_offset} of the metrics stream ({_iso_span(span)})"
+        if self._historian is not None:
+            job = f"{GAP_REPAIR}{gap.from_offset}-{gap.to_offset}"
+            producers = [i.name for i in self.instances if any(True for _ in declared_inputs(i))]
+            runner = self._backfill
+            for name in producers:
+                if runner is not None:
+                    runner.request(name, span[0], span[1], job_id=job)
+                else:
+                    record_backfill_request(self.buffer, self._producers[name], span[0], span[1], job=job)
+            self._publish_gap_finding(
+                f"{pruned} were pruned before this service read them; repaired from the historian ({job})",
+                "warning",
+                "None needed: the finding is retired when the repair backfills are done.",
+                {"gap": _gap_detail(gap), "repair": job, "producers": producers},
+            )
+            log.warning("Input records were pruned before they were read: %s; repair backfill %s recorded", pruned, job)
+            self._pending_gap = None
+            return True
+        if self.buffer.accepted_gap() >= gap.to_offset:
+            log.warning("Going on past %s: the loss was accepted", pruned)
+            self._pending_gap = None
+            self._retract_gap_finding()
+            return True
+        if self._pending_gap != gap:
+            self._pending_gap = gap
+            route = (ACCEPT_GAP_CONTRACT, self.accept_gap_path)
+            if route not in self._announced_commands:
+                try:
+                    self.announce_commands([*self._announced_commands, route])
+                except Exception as exc:
+                    warn_failure(log, exc, "Could not announce the accept-gap command")
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._accept_gaps)
+            self._publish_gap_finding(
+                f"{pruned} were pruned before this service read them, and there is no historian to repair them "
+                "from; its ingest waits",
+                "error",
+                f"Accept the loss with a _CmdMaintain command at {self.accept_gap_path}; the ingest then goes on.",
+                {"gap": _gap_detail(gap), "accept": {"contract": "_CmdMaintain", "path": self.accept_gap_path}},
+            )
+        return False
+
+    def _gap_span(self, gap: Gap, survivors: list[Record]) -> tuple[float, float]:
+        """The event-time range a gap may have held, generously: the node's
+        storage times with :data:`GAP_MARGIN_S` on each side."""
+        first = gap.first_ts / 1000.0 if gap.first_ts is not None else None
+        last = gap.last_ts / 1000.0 if gap.last_ts is not None else None
+        after = min((Ingest._timestamp_of(r) for r in survivors), default=None)
+        end = (last if last is not None else after if after is not None else time.time()) + GAP_MARGIN_S
+        start = (first if first is not None else end - self.retention_s) - GAP_MARGIN_S
+        return start, end
+
+    def _publish_gap_finding(self, summary: str, severity: str, remedy: str, detail: dict[str, Any]) -> None:
+        import json
+
+        payload = {
+            "reason": GAP_FINDING,
+            "summary": summary[:300],
+            "observed_at": time.time(),
+            "suggested_severity": severity,
+            "detail": detail,
+            "remedy": remedy,
+        }
+        try:
+            self.send(self._finding_topic(GAP_FINDING), json.dumps(payload), retain=True)
+        except Exception as exc:
+            warn_failure(log, exc, "Could not publish the stream_gap finding")
+
+    def _retract_gap_finding(self) -> None:
+        try:
+            self.retract(self._finding_topic(GAP_FINDING))
+        except Exception as exc:
+            warn_failure(log, exc, "Could not retire the stream_gap finding")
+
+    def _gap_repaired(self) -> None:
+        """A gap repair finished; retire the finding once none is pending."""
+        if not any(job["job"].startswith(GAP_REPAIR) for job in self.buffer.backfill_jobs(pending_only=True)):
+            self._retract_gap_finding()
+
+    async def _accept_gap(self, command: commands.Command) -> str:
+        """``_CmdMaintain`` at :attr:`accept_gap_path`: accept the loss of the
+        input records the ingest waits at, durably, and let it go on."""
+        gap = self._pending_gap
+        if gap is None:
+            raise commands.CommandRejected(409, "no pruned input records wait for acceptance")
+        await asyncio.to_thread(self.buffer.accept_gap, gap.to_offset)
+        log.warning(
+            "%s accepted the loss of input offsets %d..%d",
+            command.actor_label or command.actor_id,
+            gap.from_offset,
+            gap.to_offset,
+        )
+        if self._ingest is not None:
+            self._ingest.wake()
+        return f"accepted: offsets {gap.from_offset}..{gap.to_offset} are not read; the ingest goes on"
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1133,13 +1283,16 @@ class DataOpsService(Service):
         handlers = commands.gather(instances)
         if not handlers:
             return None
+        return self._executor(handlers, commands.CURSOR)
+
+    def _executor(self, handlers: dict[tuple[str, str], Callable], cursor: str) -> commands.CommandExecutor:
         node_id = cast(str, self._node_id)
         executor = commands.CommandExecutor(
             self.door,
             self.send,
             self.stream(
                 commands.STREAM,
-                cursor=commands.CURSOR,
+                cursor=cursor,
                 contracts=commands.stream_contracts(handlers),
                 topics=commands.stream_topics(handlers, node_id),
             ),
@@ -1152,21 +1305,37 @@ class DataOpsService(Service):
             executor.link_changed(False)
         return executor
 
+    def _accept_gaps(self) -> None:
+        """On the loop, once the ingest first waits at a gap: execute the
+        accept-gap command (announced by :meth:`_on_gap`), on a cursor of its
+        own. Nothing of it runs while no gap waits."""
+        stop = self._stop
+        if self._gap_executor is not None or stop is None or stop.is_set():
+            return
+        route = (ACCEPT_GAP_CONTRACT, self.accept_gap_path)
+        executor = self._executor({route: self._accept_gap}, ACCEPT_GAP_CURSOR)
+        self._gap_executor = executor
+        self._gap_task = asyncio.ensure_future(
+            supervise("accept gap", lambda: executor.run_forever(stop), stop, self.handler_health)
+        )
+
     def _broker_state_changed(self, connected: bool) -> None:
         """Back on the broker: commands and input metrics sent while the link
         was down only rang a bell nobody heard, so drain both once."""
         super()._broker_state_changed(connected)
-        loop, executor = self._loop, self._commands
+        loop = self._loop
         if connected and loop is not None and self._ingest is not None:
             loop.call_soon_threadsafe(self._ingest.wake)
-        if loop is not None and executor is not None:
-            loop.call_soon_threadsafe(executor.link_changed, connected)
+        for executor in (self._commands, self._gap_executor):
+            if loop is not None and executor is not None:
+                loop.call_soon_threadsafe(executor.link_changed, connected)
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
         the blocking wrapper with signal handling."""
         stop = stop or asyncio.Event()
+        self._stop = stop
         loop = asyncio.get_running_loop()
         self._loop = loop
 
@@ -1271,6 +1440,7 @@ class DataOpsService(Service):
                 retry_min_s=self._retry_min_s,
                 health=self.handler_health,
                 reject=self.reject,
+                on_gap=self._on_gap,
             )
             self._ingest = ingest
 
@@ -1279,6 +1449,7 @@ class DataOpsService(Service):
             health_state.last_drain_at = lambda: ingest.last_drain_at
             health_state.stall_after_s = health.STALL_AFTER_MIN_S
             health_state.waiting = lambda: ingest.waiting
+            health_state.gap = lambda: ingest.gap_waiting
             health_state.connected = self.is_broker_connected
             ingest_task: asyncio.Task | None = None
             tasks_health = self.handler_health
@@ -1355,12 +1526,14 @@ class DataOpsService(Service):
                     reresolve_task.cancel()
                 backfill_task.cancel()
                 await asyncio.gather(backfill_task, return_exceptions=True)
-                if commands_task is not None:
+                for name, running in (("Command executor", commands_task), ("Accept-gap executor", self._gap_task)):
+                    if running is None:
+                        continue
                     try:
-                        await asyncio.wait_for(commands_task, timeout=10.0)
+                        await asyncio.wait_for(running, timeout=10.0)
                     except Exception:
-                        log.exception("Command executor did not shut down cleanly")
-                    self._commands = None
+                        log.exception("%s did not shut down cleanly", name)
+                self._commands = self._gap_executor = self._gap_task = None
                 if ingest_task is not None:
                     ingest.wake()
                     try:

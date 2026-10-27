@@ -44,7 +44,13 @@ fetch, and a :meth:`Ingest.rebind`, restart the read at the acked cursor. On
 older nodes the loop fetches, processes and acks in turn.
 
 **Gaps.** When the cursor fell below the stream's low-water mark, colca
-returns a ``gap`` with the surviving records. Processing fails visibly rather than acknowledging missing history.
+returns a ``gap`` with the surviving records. The loop asks ``on_gap`` what
+to do: it may let the loop go on past the gap (the service recorded a repair
+from the historian, or an operator accepted the loss), and the page is
+processed and acked past it. Until it does, the loop neither processes nor
+acks, and waits for :meth:`Ingest.wake` instead of failing again and again;
+``gap_waiting`` says why. Without ``on_gap`` a gap raises
+:class:`~chaski.door.StreamGapError`.
 
 **MQTT only wakes it.** A message on one of the service's input topics calls
 :meth:`Ingest.wake` (through
@@ -105,6 +111,20 @@ OpenStream = Callable[[str, "list[str] | None"], Stream]
 #: returns only then (:meth:`chaski.Service.reject`).
 RejectFn = Callable[[str, "dict[str, Any]", Reject], None]
 
+#: ``on_gap(gap, survivors)``: whether the loop may go on past ``gap``; runs
+#: in a worker thread. ``survivors`` are the page's records after the gap.
+OnGap = Callable[[Gap, "list[Record]"], bool]
+
+
+class GapPending(Exception):
+    """The page starts with a gap the loop may not go past yet."""
+
+    def __init__(self, gap: Gap) -> None:
+        super().__init__(
+            f"offsets {gap.from_offset}..{gap.to_offset} of {gap.stream} were pruned before they were read"
+        )
+        self.gap = gap
+
 
 def consumer_name(handler: Any) -> str:
     """How health and logs name a handler: ``Producer.method`` where known."""
@@ -144,8 +164,12 @@ class Ingest:
         health: HandlerHealth | None = None,
         reject: RejectFn | None = None,
         idle_drain_s: float | None = IDLE_DRAIN_S,
+        on_gap: OnGap | None = None,
     ) -> None:
         self._retry_min_s = retry_min_s
+        self._on_gap = on_gap
+        #: Why the loop waits at a gap, ``""`` while it does not.
+        self.gap_waiting = ""
         self._idle_drain_s = idle_drain_s
         self._health = health or HandlerHealth()
         self._reject = reject
@@ -248,7 +272,11 @@ class Ingest:
         """Append every record of ``page`` and run its handlers on ``loop``,
         in stream order. Runs in a worker thread; does not ack."""
         if page.gap is not None:
-            raise StreamGapError(f"input stream has a retention gap: {page.gap}")
+            if self._on_gap is None:
+                raise StreamGapError(f"input stream has a retention gap: {page.gap}")
+            if not self._on_gap(page.gap, page.records):
+                raise GapPending(page.gap)
+            self.gap_waiting = ""
 
         self._failed = None
         records = page.records
@@ -530,19 +558,6 @@ class Ingest:
             return payload.get("value")
         return getattr(payload, "value", None)
 
-    @staticmethod
-    def _log_gap(gap: Gap) -> None:
-        log.warning(
-            "Gap on stream=%s: offsets %d..%d were pruned (first_ts=%s last_ts=%s approx=%s) — "
-            "continuing from the low-water mark; deep-backfill from the historian is the repair tool.",
-            gap.stream,
-            gap.from_offset,
-            gap.to_offset,
-            gap.first_ts,
-            gap.last_ts,
-            gap.approx,
-        )
-
     # ------------------------------------------------------------------ wake
 
     def wake(self) -> None:
@@ -598,7 +613,7 @@ class Ingest:
         return getattr(getattr(self._stream, "_door", None), "link_up", None)
 
     async def _sleep_or_stop(
-        self, seconds: float, stop: asyncio.Event, wake: Doorbell | None = None, since: int = 0
+        self, seconds: float | None, stop: asyncio.Event, wake: Doorbell | None = None, since: int = 0
     ) -> bool:
         """Sleep up to ``seconds``, waking early if ``stop`` is set or ``wake``
         rang after ``since``. True when ``wake`` ended the sleep."""
@@ -625,9 +640,9 @@ class Ingest:
         restarting, a timeout, 429, 5xx) is retried with backoff, and logged
         once when it starts and once when it recovers
         (:class:`chaski.outage.Outage`); the unacked page is simply fetched
-        again. Any other exception, a
-        retention gap included, propagates, ends the task and turns the health
-        door to 503.
+        again. A gap ``on_gap`` does not let the loop past waits for a wake
+        (module docstring, "Gaps"). Any other exception propagates, ends the
+        task and turns the health door to 503.
         """
         stop = stop or asyncio.Event()
         try:
@@ -647,6 +662,16 @@ class Ingest:
             link_seen = link.generation if link is not None else 0
             try:
                 processed = await self._step()
+            except GapPending as pending:
+                # Not a failure to retry: nothing changes until on_gap's owner
+                # wakes the loop (a repair recorded, a gap accepted).
+                await self._restart_from_cursor()
+                if not self.gap_waiting:
+                    log.error("Ingest waits at a gap on cursor=%s: %s", self.cursor, pending)
+                self.gap_waiting = str(pending)
+                await self._sleep_or_stop(None, stop, self._bell, seen)
+                seen = self._bell.generation
+                continue
             except Exception as exc:
                 if await self._handler_failed(exc, retry, stop, link_seen):
                     continue

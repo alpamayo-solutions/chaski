@@ -155,6 +155,9 @@ HOLD_LIVE = "hold_live"
 INDEPENDENT = "independent"
 #: The job a code change starts: the buffer through the changed handlers.
 REPLAY = "replay"
+#: The prefix of a repair over input records the stream pruned before the
+#: ingest read them (:meth:`DataOpsService._on_gap`).
+GAP_REPAIR = "gap-"
 MODES = (HOLD_LIVE, INDEPENDENT)
 DEFAULT_WINDOW = "1h"
 #: At most this many windows per second.
@@ -413,10 +416,10 @@ class BackfillRunner:
 
     # -- repair ------------------------------------------------------------
 
-    def request(self, producer: str, start: float, end: float, *, window: Any = None) -> str:
+    def request(self, producer: str, start: float, end: float, *, window: Any = None, job_id: str | None = None) -> str:
         """Record a job over ``[start, end)`` and wake the runner. Returns its id."""
         job = (
-            request(self._buffer, self._instances[producer], start, end, window=window)
+            request(self._buffer, self._instances[producer], start, end, window=window, job=job_id)
             if producer in self._instances
             else None
         )
@@ -608,6 +611,9 @@ class BackfillRunner:
                 if position >= end:
                     await asyncio.to_thread(self._buffer.finish_backfill, name, job_id)
                     log.info("%s: backfill %s done (%d window(s))", name, job_id, windows)
+                    repaired = getattr(self._service, "_gap_repaired", None)
+                    if job_id.startswith(GAP_REPAIR) and repaired is not None:
+                        await asyncio.to_thread(repaired)
                     return
                 position, windows = await self._step(
                     instance, plan, job, position, min(position + window, end), windows, stop
@@ -893,7 +899,13 @@ class _Ticks:
 
 
 def request(
-    buffer: Any, instance_or_cls: Producer | type[Producer], start: Any, end: Any, *, window: Any = None
+    buffer: Any,
+    instance_or_cls: Producer | type[Producer],
+    start: Any,
+    end: Any,
+    *,
+    window: Any = None,
+    job: str | None = None,
 ) -> str:
     """Record a repair job for a producer over ``[start, end)`` (unix
     seconds or datetimes) in ``buffer``; returns the job id. ``window``
@@ -907,7 +919,8 @@ def request(
     if not math.isfinite(start_s) or not math.isfinite(end_s) or end_s <= start_s:
         raise ValueError(f"a backfill needs start < end, got {start!r} .. {end!r}")
     window_s = None if window is None else parse_duration(window)
-    job = f"repair-{ulid.new()}"
+    # A named job is recorded once: asking again is a no-op.
+    job = job or f"repair-{ulid.new()}"
     # The runner records the code hash with the first window it commits.
     buffer.add_backfill_job(cls.name, job, start_s, end_s, "", created_at=time.time(), window=window_s)
     log.info("%s: backfill %s requested over %s .. %s", cls.name, job, _iso(start_s), _iso(end_s))
