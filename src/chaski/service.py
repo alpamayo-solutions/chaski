@@ -889,6 +889,12 @@ class Service:
             logger.warning("chaski.Service: %s reconnect refused by the broker (%s)", self.name, reason_code)
             return
         fresh = not getattr(flags, "session_present", False)
+        if fresh:
+            # A new session holds no queued messages: a cursor_lag finding the
+            # node retired meanwhile would never be heard of again. Forget it;
+            # the subscription restored below redelivers it if it still stands.
+            self._cursor_lag = ""
+            self._cursor_lag_cursors = ()
         if fresh and self._subscriptions is not None:
             # _reannounce renews its own record's subscription after the announce
             restored = self._subscriptions.restore(later=[str(self._details_topic)])
