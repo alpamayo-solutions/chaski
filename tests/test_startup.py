@@ -228,7 +228,7 @@ def test_a_dataops_service_health_door_answers_while_colca_is_away(monkeypatch, 
 
     async def serve(state, port):
         server = await original_serve(state, port)
-        ports.append(server.sockets[0].getsockname()[1])
+        ports.append(server.port)
         return server
 
     monkeypatch.setattr(health_module, "serve", serve)
