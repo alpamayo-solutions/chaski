@@ -549,3 +549,46 @@ def _raises(read):
     except RuntimeError:
         return True
     return False
+
+
+def test_a_read_does_not_wait_for_a_drain_that_holds_the_lock_across_http():
+    """Readers took the drain's lock, which a drain holds across its HTTP
+    calls, and deep-copied every entry under it: every resolution of a
+    DataOps service waited out the drain."""
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    held, release = threading.Event(), threading.Event()
+
+    def drain():
+        with current.lock:
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    try:
+        assert held.wait(5)
+        result: list = []
+        reader = threading.Thread(target=lambda: result.append(current.read()))
+        reader.start()
+        reader.join(1.0)
+        assert not reader.is_alive(), "the read waited for the drain"
+        assert result[0][0].payload == {"value": 1}
+    finally:
+        release.set()
+        thread.join()
+
+
+def test_a_drain_publishes_a_new_map_and_leaves_the_one_readers_hold():
+    door = Door()
+    door.put({"value": 1})
+    current = view(door)
+    current.synchronize()
+    before = current._published
+    door.put({"value": 2})
+    current.synchronize()
+    assert before[1][TOPIC].payload == {"value": 1}
+    assert current._published[1][TOPIC].payload == {"value": 2}
+    assert current._published[0] > before[0]
