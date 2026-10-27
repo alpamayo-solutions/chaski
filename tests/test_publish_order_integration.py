@@ -15,7 +15,6 @@ import socket
 import time
 import uuid
 
-import franzmq.client
 import pytest
 from colca_data_contracts.payload import Metric
 
@@ -24,12 +23,6 @@ import chaski
 pytestmark = [
     pytest.mark.skipif(
         not os.environ.get("COLCAD_BINARY"), reason="requires COLCAD_BINARY and matching COLCAD_CONTRACTS_BUNDLE"
-    ),
-    # franzmq 0.6.5 lets a write made during the reconnect overtake older
-    # unacknowledged ones (this test fails in most runs with it); the fix
-    # comes with the franzmq release that has MAX_INFLIGHT.
-    pytest.mark.skipif(
-        not hasattr(franzmq.client, "MAX_INFLIGHT"), reason="needs franzmq with ordered resend across a reconnect"
     ),
 ]
 

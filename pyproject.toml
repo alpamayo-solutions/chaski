@@ -7,8 +7,8 @@ readme = "README.md"
 license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
-  "colca-data-contracts>=0.32.1,<0.42",
-  "franzmq==0.6.5",
+  "colca-data-contracts>=0.32.1,<0.43",
+  "franzmq==0.7.0",
   "paho-mqtt==2.1.0",
   "ulid-py>=1.1",
   "pyyaml>=6.0",
