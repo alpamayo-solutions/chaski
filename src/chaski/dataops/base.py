@@ -20,12 +20,13 @@ import math
 import threading
 import time
 from abc import ABC
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
+from chaski.doorbell import Doorbell
 from chaski.failures import Reject
 from chaski.publishing import settle_current
 
@@ -161,6 +162,9 @@ class Producer(ABC):
 
     # Set on every instance in __new__.
     _lock: threading.RLock
+    _turn_owner: asyncio.Task | None
+    _turn_depth: int
+    _turn_bell: Doorbell
     _runtime: Runtime | None
     _handled_offsets: dict[str, int]
     _checkpoint_hash: str | None
@@ -217,6 +221,10 @@ class Producer(ABC):
         # slot, so a subclass that overrides __init__ without super() has both.
         self = super().__new__(cls)
         self._lock = threading.RLock()
+        # Which task on the service's loop holds the lock (see take_turn).
+        self._turn_owner = None
+        self._turn_depth = 0
+        self._turn_bell = Doorbell()
         self._runtime = None
         self._handled_offsets = {}
         self._checkpoint_hash = None
@@ -319,6 +327,49 @@ class Producer(ABC):
         buffer = self.runtime.buffer
         existing_hash = buffer.code_hash(self.name) or ""
         buffer.set_watermark(self.name, position, existing_hash)
+
+
+# ─── a producer's turn on the service's loop ──────────────────────────────
+
+
+async def take_turn(producer: Producer) -> None:
+    """Take ``producer``'s lock from a coroutine on the service's loop.
+
+    The lock is a thread lock (ticks run in threads), and every coroutine on
+    the loop runs on the same thread: a command or ``@on_constant`` handler
+    would enter it while an ingest page holds it and awaits between two
+    records, and the page could enter it while the handler awaits. So the
+    task holding the turn is kept, and another task waits for it here, without
+    blocking the loop. Re-entrant within one task; :func:`give_turn` releases."""
+    task = _current_task()
+    while producer._turn_owner is not None and producer._turn_owner is not task:
+        seen = producer._turn_bell.generation
+        if producer._turn_owner is None or producer._turn_owner is task:
+            break
+        await producer._turn_bell.after(seen)
+    producer._lock.acquire()
+    producer._turn_owner = task
+    producer._turn_depth += 1
+
+
+def give_turn(producer: Producer) -> None:
+    """Release a :func:`take_turn` of the current task."""
+    producer._turn_depth -= 1
+    if producer._turn_depth == 0:
+        producer._turn_owner = None
+    producer._lock.release()
+    if producer._turn_depth == 0:
+        producer._turn_bell.ring()
+
+
+@asynccontextmanager
+async def turn(producer: Producer) -> AsyncIterator[None]:
+    """``async with turn(producer):`` — :func:`take_turn` for a block."""
+    await take_turn(producer)
+    try:
+        yield
+    finally:
+        give_turn(producer)
 
 
 # The checkpoint machinery is chaski's, not the producer's: module functions,
@@ -425,7 +476,7 @@ class PageCheckpoints:
 
     async def handle(self, producer: Producer, method: Any, metric: Any, record: Any) -> None:
         """Run one ``@on_metric`` call of a checkpointed producer at ``record``."""
-        entry = self._enter(producer)
+        entry = await self._enter(producer)
         key = method.__name__
         if record.offset <= producer._handled_offsets.get(key, -1):
             return
@@ -448,15 +499,15 @@ class PageCheckpoints:
         producer._handled_offsets[key] = record.offset
         entry.since.append((method, metric, key, record))
 
-    def _enter(self, producer: Producer) -> _PageEntry:
+    async def _enter(self, producer: Producer) -> _PageEntry:
         held = self._entries.get(id(producer))
         if held is not None:
             return held[1]
-        producer._lock.acquire()
+        await take_turn(producer)
         try:
             state = state_copy(producer)
         except BaseException:
-            producer._lock.release()
+            give_turn(producer)
             raise
         offsets = dict(producer._handled_offsets)
         entry = _PageEntry(state, offsets, base_state=state, base_offsets=dict(offsets))
@@ -513,7 +564,7 @@ class PageCheckpoints:
                 if self.failed is None or entry.first.offset < self.failed.record.offset:
                     self.failed = failed
             finally:
-                producer._lock.release()
+                give_turn(producer)
 
 
 def save_checkpoint(producer: Producer) -> None:

@@ -289,3 +289,30 @@ async def test_a_tick_waits_for_the_page_so_a_rewind_keeps_what_it_did(world):
         await drain
     await ticking
     assert world.producer.seen == [["a", 1], ["b", 2], ["tick", 0]]
+
+
+@run_async
+async def test_a_command_on_the_loop_waits_for_the_page_that_holds_the_producer(world):
+    """The producer's lock is a thread lock, and a command handler runs on the
+    same loop thread as the page: it entered the lock while the page awaited
+    between two records, and changed the state the page was keeping."""
+    from chaski.dataops.base import turn
+
+    world.producer.gate = asyncio.Event()
+    world.door.queue(_page(1, _rename([("a", 1), ("b", 2)])))
+    page = asyncio.ensure_future(world.ingest.run_once())
+    while not world.producer.started.is_set():
+        await asyncio.sleep(0.001)
+
+    async def command() -> None:
+        async with turn(world.producer):
+            world.producer.seen.append(["command", 0])
+
+    running = asyncio.ensure_future(command())
+    await asyncio.sleep(0.05)
+    assert not running.done(), "the command ran inside the page"
+    world.producer.gate.set()
+    await page
+    await running
+    assert world.producer.seen == [["a", 1], ["b", 2], ["command", 0]]
+    assert world.buffer.checkpoint("counter")[2]["seen"] == [["a", 1], ["b", 2]]

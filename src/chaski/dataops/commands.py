@@ -112,7 +112,7 @@ from chaski.executor import (
 )
 
 from . import resolve
-from .base import Producer
+from .base import Producer, turn
 from .triggers import OnCommandSpec
 
 __all__ = [
@@ -201,5 +201,6 @@ class CommandExecutor(executor.CommandExecutor):
         producer = getattr(handler, "__self__", None)
         if not isinstance(producer, Producer):
             return await handler(command)  # the service's own command
-        with resolve.lazy_pass(resolve.Snapshot(self._door)), producer._lock:
-            return await handler(command)
+        with resolve.lazy_pass(resolve.Snapshot(self._door)):
+            async with turn(producer):
+                return await handler(command)

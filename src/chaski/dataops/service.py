@@ -106,7 +106,7 @@ from chaski.service import Service
 from . import commands, health, resolve, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
+from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy, turn
 from .buffer import Buffer
 from .ingest import Ingest, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
@@ -658,29 +658,35 @@ def make_handler(method):
             if page is not None:
                 await page.handle(instance, method, metric, record)
                 return
-        with instance._lock, event_time(float(metric.timestamp)):
-            checkpointed = instance.state_version is not None and record.offset >= 0
-            key = method.__name__
-            if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
-                return
-            previous = state_copy(instance) if checkpointed else None
-            try:
-                await method(metric)
-                if checkpointed:
-                    offsets = dict(instance._handled_offsets)
-                    instance._handled_offsets[key] = record.offset
-                    try:
-                        save_checkpoint(instance)
-                    except BaseException:
-                        instance._handled_offsets = offsets
-                        raise
-            except BaseException:
-                if checkpointed:
-                    instance.restore_state(previous)
-                raise
+        async with turn(instance):
+            await _handle_one(instance, method, metric, record)
 
     _handler.consumer = f"{method.__self__.name}.{method.__name__}"
     return _handler
+
+
+async def _handle_one(instance: Producer, method: Any, metric: Metric, record: Record) -> None:
+    """One ``@on_metric`` call outside an ingest page, its checkpoint after it."""
+    with event_time(float(metric.timestamp)):
+        checkpointed = instance.state_version is not None and record.offset >= 0
+        key = method.__name__
+        if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
+            return
+        previous = state_copy(instance) if checkpointed else None
+        try:
+            await method(metric)
+            if checkpointed:
+                offsets = dict(instance._handled_offsets)
+                instance._handled_offsets[key] = record.offset
+                try:
+                    save_checkpoint(instance)
+                except BaseException:
+                    instance._handled_offsets = offsets
+                    raise
+        except BaseException:
+            if checkpointed:
+                instance.restore_state(previous)
+            raise
 
 
 def _held(instance: Producer) -> bool:
