@@ -934,3 +934,157 @@ async def test_a_backfill_waiting_for_the_ingest_names_what_it_waits_for_when_st
         stop.set()
         await task
         buffer.close()
+
+
+# ─── one window: reads, merging, ticks ─────────────────────────────────────
+
+
+class ManyHistorian(FakeHistorian):
+    """A historian that reads several signals in one request, like NodeHistorian."""
+
+    def __init__(self, points) -> None:
+        super().__init__(points)
+        del self.windows  # the method below, not the parent's list of reads
+        self.single: list[tuple[str, float, float]] = []
+        self.many: list[tuple[tuple[str, ...], float, float]] = []
+
+    def window(self, signal_id, start, end):
+        self.single.append((signal_id, start, end))
+        return self._rows(signal_id, start, end)
+
+    def windows(self, signal_ids, start, end):
+        self.many.append((tuple(signal_ids), start, end))
+        return {sid: self._rows(sid, start, end) for sid in signal_ids}
+
+    def _rows(self, signal_id, start, end):
+        rows = [(ts, v) for ts, v in self.points.get(signal_id, []) if start <= ts < end]
+        return pd.DataFrame({"ts": [r[0] for r in rows], "value": [r[1] for r in rows]}, columns=["ts", "value"])
+
+
+def _three_inputs():
+    class Three(Producer):
+        name = "three"
+        system_element_name = "press"
+        backfill = Backfill(horizon="3h", window="1h")
+        a = SignalRangeInput("a", window="1h")
+        b = SignalRangeInput("b", window="1h")
+        c = SignalRangeInput("c", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[tuple[str, float]] = []
+
+        @on_metric("a")
+        async def on_a(self, metric) -> None:
+            self.seen.append(("a", metric.timestamp))
+
+        @on_metric("b")
+        async def on_b(self, metric) -> None:
+            self.seen.append(("b", metric.timestamp))
+
+        @on_metric("c")
+        async def on_c(self, metric) -> None:
+            self.seen.append(("c", metric.timestamp))
+
+    return Three
+
+
+@run_async
+async def test_a_window_reads_the_history_of_every_input_in_one_request_and_merges_them_in_time_order(tmp_path):
+    now = time.time()
+    start = now - 3 * 3600
+    points = {
+        sid: [(start + 60 + offset + i * 97.0, i) for i in range(100)] for offset, sid in enumerate(("a", "b", "c"))
+    }
+    historian = ManyHistorian(points)
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    door = FakeDoor([signal_entry("a", "a"), signal_entry("b", "b"), signal_entry("c", "c")])
+    service = FakeService(door, buffer, historian)
+    service._ingest = _Ingest()
+    instance = _three_inputs()().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+
+    await _run_until_done(runner, "three")
+
+    assert historian.single == [], "no signal was read by itself"
+    assert historian.many and all(sorted(signals) == ["a", "b", "c"] for signals, _s, _e in historian.many)
+    expected = sorted((sid, ts) for sid, rows in points.items() for ts, _ in rows)
+    assert sorted(instance.seen) == expected
+    assert [ts for _, ts in instance.seen] == sorted(ts for _, ts in instance.seen)
+    buffer.close()
+
+
+@run_async
+async def test_a_window_with_many_records_lets_the_loop_run_between_them(tmp_path):
+    """A window of thousands of records ran without giving the event loop a
+    turn: the health door and the ingest's wake-ups waited for the whole
+    window."""
+    now = time.time()
+    history = [(now - 2 * 3600 + i * 0.5, i % 2) for i in range(4000)]
+    cls = segmenter(horizon="3h", window="3h")
+    _service, instance, runner, buffer = _setup(cls, tmp_path, archive=history, buffered=[])
+    turns = [0]
+    seen_turns: list[int] = []
+
+    async def other_work() -> None:
+        while True:
+            turns[0] += 1
+            await asyncio.sleep(0)
+
+    on_state = cls.on_state
+
+    async def noting(self, metric) -> None:
+        seen_turns.append(turns[0])
+        await on_state(self, metric)
+
+    instance.on_state = noting.__get__(instance)
+    from chaski.dataops.backfill import _plan as plan_of
+
+    plan = plan_of(instance)
+    plan.metrics = [(sid, declared, [make_handler(instance.on_state)]) for sid, declared, _h in plan.metrics]
+    job = buffer.backfill_job("segmenter", INITIAL)
+    worker = asyncio.ensure_future(other_work())
+    try:
+        await runner._window(instance, plan, {**job, "code_hash": "x"}, history[0][0], history[-1][0] + 1)
+    finally:
+        worker.cancel()
+    assert len(seen_turns) == len(history)
+    assert seen_turns[-1] - seen_turns[0] >= len(history) // 256 - 1
+    buffer.close()
+
+
+@run_async
+async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
+    class Minutely(Producer):
+        name = "minutely"
+        system_element_name = "press"
+        backfill = Backfill(horizon="2h", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.ran: list[tuple[float, int, int]] = []
+
+        @every("1m")
+        async def tick(self) -> None:
+            self.ran.append((self.now, threading.get_ident(), id(asyncio.get_running_loop())))
+
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    service = FakeService(_door(), buffer, FakeHistorian({}))
+    service._ingest = _Ingest()
+    instance = Minutely().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+    await _run_until_done(runner, "minutely")
+
+    job = buffer.backfill_job("minutely", INITIAL)
+    assert [due for due, _t, _l in instance.ran] == tick_instants(
+        IntervalSpec(seconds=60.0), job["start"], job["position"]
+    )
+    # One loop per window, not one per tick.
+    loops = {loop for _d, _t, loop in instance.ran}
+    assert len(loops) <= job["windows"] < len(instance.ran)
+    assert threading.get_ident() not in {thread for _d, thread, _l in instance.ran}
+    buffer.close()

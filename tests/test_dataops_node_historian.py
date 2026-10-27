@@ -274,3 +274,27 @@ def test_without_the_environment_a_dataops_service_has_no_historian(monkeypatch,
         monkeypatch.delenv(key, raising=False)
 
     assert chaski.DataOpsService("cycles", data_dir=tmp_path).historian is None
+
+
+def test_a_window_of_many_signals_costs_one_request_plus_the_pages_of_long_ones(api):
+    """A backfill window over every input used to read each signal by itself:
+    a request per signal per window. Their first pages now come in one."""
+    quiet = [f"01HQUIET{i:018d}" for i in range(8)]
+    for number, signal_id in enumerate(quiet):
+        api.add(signal_id, [(T0 + number, float(number))])
+    historian = _historian(api, page_size=10)
+
+    frames = historian.windows([SIGNAL, *quiet], T0, T0 + 3600)
+
+    assert frames[SIGNAL]["value"].tolist() == [float(i) for i in range(23)]
+    assert [frames[s]["value"].tolist() for s in quiet] == [[float(n)] for n in range(8)]
+    # One request for every signal's first page; the long one pages on by itself.
+    first, *rest = api.metric_requests
+    assert first["signal_ids"] == [SIGNAL, *quiet] and "cursor" not in first
+    assert [r["signal_ids"] for r in rest] == [[SIGNAL], [SIGNAL]]
+    assert all("cursor" in r for r in rest)
+
+
+def test_a_signal_the_node_leaves_out_of_a_many_signal_read_fails_it(api):
+    with pytest.raises(NodeHistorianError, match="returned no history"):
+        _historian(api).windows([SIGNAL, OTHER], T0, T0 + 3600)

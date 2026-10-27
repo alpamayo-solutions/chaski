@@ -99,12 +99,16 @@ the runner waits on its own doorbell (a new request) and on the ingest's.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
+import heapq
 import json
 import logging
 import math
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -119,7 +123,7 @@ from chaski.publishing import PublishBatch
 from . import codehash
 from .base import Producer, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .ingest import consumer_name
-from .inputs import SignalRangeInput, declared_inputs
+from .inputs import SignalRangeInput, declared_inputs, fetch_many
 from .outputs import AnnotationOutput, SignalOutput, resolved_outputs
 from .scheduling import next_tick, record_rejection
 from .triggers import CronSpec, IntervalSpec, parse_duration
@@ -654,72 +658,150 @@ class BackfillRunner:
     async def _window(self, instance: Producer, plan: _Plan, job: dict[str, Any], start: float, end: float) -> int:
         """Every record and tick of ``[start, end)`` through the producer's
         own handlers, in timestamp order. A checkpointed producer's state is
-        put back if the window fails, so the retry starts where it did."""
+        put back if the window fails, so the retry starts where it did.
 
-        historian = self._service.historian
-        events: list[tuple[float, int, int, Any, Any]] = []
-        for order, (signal_id, declared_input, handlers) in enumerate(plan.metrics):
-            low = start
-            if historian is None:
-                # Without a historian, what the buffer holds is all there is.
-                earliest = self._buffer.earliest(signal_id)
-                if earliest is None or earliest >= end:
-                    continue
-                low = max(start, earliest)
-            frame = await asyncio.to_thread(declared_input.fetch, low, end)
-            for ts, value in zip(frame["ts"].tolist(), frame["value"].tolist(), strict=True):
-                events.append((float(ts), 0, order, (signal_id, handlers), value))
-        for order, (method_name, spec) in enumerate(plan.ticks):
-            events.extend((due, 1, order, method_name, None) for due in tick_instants(spec, start, end))
-        events.sort(key=lambda event: event[:3])
+        The inputs are read in one go (:func:`~chaski.dataops.inputs.fetch_many`:
+        one historian request for all of them), merged with the tick instants
+        in timestamp order as they are handled, and the loop is yielded to
+        every :data:`YIELD_EVERY` events."""
+        # Without a historian, what the buffer holds is all there is.
+        rows = await asyncio.to_thread(
+            fetch_many,
+            self._service,
+            [declared for _sid, declared, _h in plan.metrics],
+            start,
+            end,
+            clamp_to_buffer=True,
+        )
+        streams: list[Iterator[tuple[float, int, int, Any, Any]]] = [
+            _records(rows[signal_id], order, (signal_id, handlers))
+            for order, (signal_id, _declared, handlers) in enumerate(plan.metrics)
+        ]
+        streams.extend(
+            _instants(tick_instants(spec, start, end), order, method_name)
+            for order, (method_name, spec) in enumerate(plan.ticks)
+        )
+        events = heapq.merge(*streams, key=lambda event: event[:3])
 
         checkpointed = _holds_live(job) and instance.state_version is not None
         previous = state_copy(instance) if checkpointed else None
         # What the window publishes is confirmed before its position is committed.
         batch = PublishBatch()
+        ticks = _Ticks(self._service, instance, job)
         try:
             with batch.active():
-                await self._run_events(instance, job, events, batch)
+                count = await self._run_events(instance, job, events, batch, ticks)
             await asyncio.to_thread(batch.settle)
         except BaseException:
             if previous is not None:
                 instance.restore_state(previous)
             raise
-        return len(events)
+        finally:
+            await ticks.close()
+        return count
 
-    async def _run_events(self, instance: Producer, job: dict[str, Any], events: list, batch: PublishBatch) -> None:
+    async def _run_events(
+        self, instance: Producer, job: dict[str, Any], events: Iterator, batch: PublishBatch, ticks: _Ticks
+    ) -> int:
         from .service import synthetic_record
 
+        count = 0
+        due: list[tuple[float, str]] = []
         for ts, kind, _order, target, value in events:
-            if kind == 0:
-                signal_id, handlers = target
-                record = synthetic_record(signal_id, ts, value, actor="backfill")
-                for handler in handlers:
-                    batch.origin = consumer_name(handler)
+            count += 1
+            if count % YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+            if kind == 1:
+                # Consecutive ticks run together, in one hop to their thread.
+                due.append((ts, target))
+                continue
+            if due:
+                await ticks.run(due)
+                due = []
+            signal_id, handlers = target
+            record = synthetic_record(signal_id, ts, value, actor="backfill")
+            for handler in handlers:
+                batch.origin = consumer_name(handler)
+                try:
+                    await handler(record)
+                except Reject as rejected:
+                    subject = {"backfill": job["job"], "producer": instance.name, "signal_id": signal_id, "ts": ts}
+                    await asyncio.to_thread(record_rejection, self._service, consumer_name(handler), subject, rejected)
+        if due:
+            await ticks.run(due)
+        return count
+
+
+#: A backfill window yields the event loop after this many events.
+YIELD_EVERY = 256
+
+
+def _records(rows: list[tuple[float, Any]], order: int, target: Any) -> Iterator[tuple[float, int, int, Any, Any]]:
+    """One input's rows as window events, in timestamp order."""
+    for ts, value in rows:
+        yield (ts, 0, order, target, value)
+
+
+def _instants(instants: list[float], order: int, method_name: str) -> Iterator[tuple[float, int, int, Any, Any]]:
+    """One tick's instants as window events; after the records of the same instant."""
+    for due in instants:
+        yield (due, 1, order, method_name, None)
+
+
+class _Ticks:
+    """Runs a backfill window's ticks off the loop, like live ticks, on one
+    thread with one private event loop for the whole window, instead of a
+    thread hop and a new event loop per tick. What a run of ticks publishes
+    is confirmed before the run returns."""
+
+    def __init__(self, service: Any, instance: Producer, job: dict[str, Any]) -> None:
+        self._service = service
+        self._instance = instance
+        self._job = job
+        self._thread: concurrent.futures.ThreadPoolExecutor | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def run(self, due: list[tuple[float, str]]) -> None:
+        if self._thread is None:
+            self._thread = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="backfill-ticks")
+        await asyncio.get_running_loop().run_in_executor(self._thread, contextvars.copy_context().run, self._run, due)
+
+    def _run(self, due: list[tuple[float, str]]) -> None:
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        instance = self._instance
+        batch = PublishBatch()
+        with instance._lock:
+            try:
+                self._loop.run_until_complete(self._ticks(due, batch))
+            finally:
+                batch.settle()
+
+    async def _ticks(self, due: list[tuple[float, str]], batch: PublishBatch) -> None:
+        instance, job = self._instance, self._job
+        with batch.active():
+            for instant, method_name in due:
+                batch.origin = f"{instance.name}.{method_name}"
+                with event_time(instant):
                     try:
-                        await handler(record)
+                        await getattr(instance, method_name)()
                     except Reject as rejected:
                         subject = {
                             "backfill": job["job"],
                             "producer": instance.name,
-                            "signal_id": signal_id,
-                            "ts": ts,
+                            "timer": method_name,
+                            "due": instant,
                         }
-                        await asyncio.to_thread(
-                            record_rejection, self._service, consumer_name(handler), subject, rejected
-                        )
-            else:
-                await asyncio.to_thread(self._tick, instance, target, ts, job)
+                        record_rejection(self._service, f"{instance.name}.{method_name}", subject, rejected)
 
-    def _tick(self, instance: Producer, method_name: str, due: float, job: dict[str, Any]) -> None:
-        """One tick at its instant, off the loop like a live tick."""
-        with instance._lock, event_time(due):
-            try:
-                asyncio.run(getattr(instance, method_name)())
-            except Reject as rejected:
-                consumer = f"{instance.name}.{method_name}"
-                subject = {"backfill": job["job"], "producer": instance.name, "timer": method_name, "due": due}
-                record_rejection(self._service, consumer, subject, rejected)
+    async def close(self) -> None:
+        thread, loop = self._thread, self._loop
+        self._thread = self._loop = None
+        if thread is None:
+            return
+        if loop is not None:
+            await asyncio.get_running_loop().run_in_executor(thread, loop.close)
+        thread.shutdown(wait=False)
 
 
 def request(
