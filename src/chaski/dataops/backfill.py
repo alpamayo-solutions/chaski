@@ -369,13 +369,13 @@ class BackfillRunner:
         with self._lock:
             self._pending = max(0, len(pending) - 1)
         if pending:
+            # Not moving yet: the stall clock starts when the runner does.
             self._report_next(pending[0])
 
     def _report_next(self, job: dict[str, Any]) -> None:
         """Report ``job`` as running from where it stands, before anything is awaited for it."""
         instance = self._instances[job["producer"]]
         self._report({**job, "window_s": _window_of(type(instance), job)}, job["position"], job["windows"], job["end"])
-        self._moved()
 
     def _plan_replays(self, now: float) -> None:
         """Record a replay of every producer whose code changed since it last
@@ -541,6 +541,7 @@ class BackfillRunner:
             # Reported before anything is awaited for it, so the health door
             # never reads "no backfill" while one is about to run.
             self._report_next(jobs[0])
+            self._moved()
             await self._run_job(jobs[0], stop)
 
     def _runs(self, job: dict[str, Any]) -> bool:

@@ -953,11 +953,13 @@ async def test_a_backfill_waiting_for_the_ingest_names_what_it_waits_for_when_st
     task = asyncio.ensure_future(runner.run(stop))
     try:
         deadline = time.monotonic() + 10
-        while "stalled" not in (running := (runner.status().get("running") or {})):
-            assert time.monotonic() < deadline, "the stall was not reported"
+        reason = "it waits for the live ingest to reach the stream head"
+        # Under load the job may read as stalled before it reaches the wait;
+        # what matters is that the stall then names what it waits for.
+        while not (running := (runner.status().get("running") or {})).get("stalled", "").endswith(reason):
+            assert time.monotonic() < deadline, f"the stall was not reported with its reason: {running}"
             assert not task.done(), task
             await asyncio.sleep(0.02)
-        assert running["stalled"].endswith("it waits for the live ingest to reach the stream head")
         assert running["windows"] == 0 and running["holds_live"] is True
     finally:
         stop.set()
