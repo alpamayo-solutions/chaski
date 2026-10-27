@@ -53,7 +53,7 @@ from chaski.outage import Outage
 from chaski.retry import Backoff
 
 from . import resolve
-from .base import Producer
+from .base import Producer, turn
 from .triggers import OnConstantSpec, OnSignalSpec
 
 log = logging.getLogger("chaski.dataops.watch")
@@ -208,7 +208,7 @@ async def _dispatch(
         try:
             with resolve.lazy_pass(snapshot):
                 try:
-                    with producer._lock:
+                    async with turn(producer):
                         await handler(record)
                 except Reject as rejected:
                     if bursts._reject is None:

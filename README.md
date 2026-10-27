@@ -335,8 +335,11 @@ answers from the start: while the node's Colca cannot be reached it answers 503
 with the reason (`not ready: cannot reach Colca at ...`), and the connector
 retries with a jittered backoff of at most 5 s (longer when the node answers
 `429` with `Retry-After`) instead of exiting. A `DataOpsService` does the same
-on its health door, with the reason under `not_ready`. Only a configuration
-error ends startup. `svc.readiness` says where startup is; a plain `Service`
+on its health door, with the reason under `not_ready`. Both doors answer from
+their own thread, so a service busy catching up a backlog still answers its
+probe at once; a `DataOpsService` reports an event loop that is late as
+`loop: busy` (`degraded`, 200) and one that has not moved for five minutes as
+`loop: stalled` (503). Only a configuration error ends startup. `svc.readiness` says where startup is; a plain `Service`
 gets the same retries from `svc.start_when_reachable()`.
 
 Every retry loop in chaski logs a node that is away the same way: one WARNING

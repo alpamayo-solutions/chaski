@@ -43,6 +43,7 @@ from colca_data_contracts import (
 from franzmq import Topic
 
 from ..catalogue import tag_meta
+from ..publishing import PublishBatch
 from . import resolve
 from .base import current_time
 from .inputs import _PerInstance
@@ -109,6 +110,10 @@ class SignalOutput(_PerInstance):
         self._tag_id: str | None = None
         self._last_unbound_log_ts: float = 0.0
         self._binding: tuple[str, str] | None = None
+        #: Whether the buffer may hold samples queued for this output: until
+        #: a flush found none, and again after one is queued. publish() looks
+        #: in the buffer only then.
+        self._maybe_queued = True
 
     def forget(self) -> None:
         """Drop the resolved binding so the next publish resolves again.
@@ -173,7 +178,8 @@ class SignalOutput(_PerInstance):
             self._queue(value, timestamp)
             return
         self._binding = binding
-        self.flush()
+        if self._maybe_queued:
+            self.flush()
         topic, signal_id = binding
 
         metric = Metric(
@@ -189,27 +195,37 @@ class SignalOutput(_PerInstance):
         if buffer is None:
             raise RuntimeError("Unbound SignalOutput requires a durable runtime buffer")
         buffer.queue_output(self.source, timestamp, value)
+        self._maybe_queued = True
         self._log_unbound()
 
     def flush(self):
-        """Drain samples preserved during commissioning after a binding update."""
-        buffer = self._runtime().buffer
+        """Drain samples preserved during commissioning after a binding update.
+
+        A page of samples is published pipelined and removed from the buffer
+        once the node confirmed all of them."""
+        runtime = self._runtime()
+        buffer = runtime.buffer
         if buffer is None:
             return
         pending = buffer.pending_outputs(self.source)
         if not pending:
+            self._maybe_queued = False
             return
-        binding = self._binding or resolve.resolve_output_binding(self._runtime().door, self.tag_id)
+        binding = self._binding or resolve.resolve_output_binding(runtime.door, self.tag_id)
         if binding is None:
             return
         self._binding = binding
         topic, signal_id = binding
         while pending:
-            for timestamp, value in pending:
-                metric = Metric(value=value, timestamp=timestamp, signal_id=signal_id)
-                self._runtime().send(topic, metric.encode())
-                buffer.output_sent(self.source, timestamp)
+            batch = PublishBatch()
+            with batch.active():
+                for timestamp, value in pending:
+                    metric = Metric(value=value, timestamp=timestamp, signal_id=signal_id)
+                    runtime.send(topic, metric.encode())
+            batch.settle()
+            buffer.outputs_sent(self.source, [timestamp for timestamp, _value in pending])
             pending = buffer.pending_outputs(self.source)
+        self._maybe_queued = False
 
     def _log_unbound(self) -> None:
         now = time.time()

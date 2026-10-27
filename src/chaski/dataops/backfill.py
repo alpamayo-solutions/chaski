@@ -75,6 +75,18 @@ interval, and a ``SignalOutput`` sample is keyed by signal and timestamp, so
 processing a record twice (a window redone after a crash, a repair over a range
 live processing covered) overwrites rather than duplicates.
 
+**Replay.** A producer whose code hash changed since it last ran, a new one
+included (:mod:`chaski.dataops.codehash`), gets a ``replay`` job at start: the
+buffered records of its ``@on_metric`` inputs, from the earliest buffered
+point to the live edge, through its live handlers on the live instance, held
+and handed over like a first backfill, in windows, throttled and resumable
+the same way, and reported on the health door. Its ticks are not run; they
+continue live from the watermark the hand-over sets. A producer without an
+``@on_metric`` handler only has its watermark reset to the earliest buffered
+point. A producer whose held first backfill is still running is left out;
+the backfill covers the buffer. A changed hash while a replay runs restarts
+it.
+
 **Repair.** :meth:`DataOpsService.request_backfill` records a job for an
 explicit range. It runs on a separate instance of the producer, after
 ``setup()``, so the live instance's state and its live dispatch are left
@@ -99,12 +111,17 @@ the runner waits on its own doorbell (a new request) and on the ingest's.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
+import functools
+import heapq
 import json
 import logging
 import math
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -114,11 +131,12 @@ import ulid
 from chaski.doorbell import Doorbell
 from chaski.failures import Reject
 from chaski.outage import warn_failure
+from chaski.publishing import PublishBatch
 
 from . import codehash
 from .base import Producer, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .ingest import consumer_name
-from .inputs import SignalRangeInput, declared_inputs
+from .inputs import SignalRangeInput, declared_inputs, fetch_many
 from .outputs import AnnotationOutput, SignalOutput, resolved_outputs
 from .scheduling import next_tick, record_rejection
 from .triggers import CronSpec, IntervalSpec, parse_duration
@@ -135,6 +153,11 @@ INITIAL = "initial"
 HOLD_LIVE = "hold_live"
 #: Live dispatch starts at once; the first backfill covers what lies before.
 INDEPENDENT = "independent"
+#: The job a code change starts: the buffer through the changed handlers.
+REPLAY = "replay"
+#: The prefix of a repair over input records the stream pruned before the
+#: ingest read them (:meth:`DataOpsService._on_gap`).
+GAP_REPAIR = "gap-"
 MODES = (HOLD_LIVE, INDEPENDENT)
 DEFAULT_WINDOW = "1h"
 #: At most this many windows per second.
@@ -339,17 +362,77 @@ class BackfillRunner:
                     _iso(job["end"]),
                 )
 
+        self._plan_replays(now)
+        # Until the runner starts it, the health door names the job to run first.
+        pending = [job for job in self._buffer.backfill_jobs(pending_only=True) if self._runs(job)]
+        pending.sort(key=lambda job: not _holds_live(job))
+        with self._lock:
+            self._pending = max(0, len(pending) - 1)
+        if pending:
+            # Not moving yet: the stall clock starts when the runner does.
+            self._report_next(pending[0])
+
+    def _report_next(self, job: dict[str, Any]) -> None:
+        """Report ``job`` as running from where it stands, before anything is awaited for it."""
+        instance = self._instances[job["producer"]]
+        self._report({**job, "window_s": _window_of(type(instance), job)}, job["position"], job["windows"], job["end"])
+
+    def _plan_replays(self, now: float) -> None:
+        """Record a replay of every producer whose code changed since it last
+        ran, a new one included, and hold its live triggers until the replay
+        reaches the live edge (module docstring, "Replay"). Every other
+        producer gets its checkpoint back.
+
+        A producer whose first backfill is held is left out: that backfill
+        covers the buffer. One without an ``@on_metric`` handler has nothing
+        to replay: its watermark goes back to the earliest buffered point of
+        its inputs."""
+        for name, instance in self._instances.items():
+            with self._lock:
+                if name in self._held:
+                    continue
+            cls = type(instance)
+            new_hash = codehash.compute_code_hash(cls)
+            old_hash = self._buffer.code_hash(name)
+            restored = restore_checkpoint(instance)
+            job = self._buffer.backfill_job(name, REPLAY)
+            resuming = job is not None and not job["done"] and job["code_hash"] == new_hash
+            if not resuming and old_hash == new_hash and (instance.state_version is None or restored):
+                continue
+            plan = _plan(instance)
+            earliest = self._first(plan)
+            start = earliest if earliest is not None else now
+            if not plan.metrics:
+                save_checkpoint(instance)
+                self._buffer.set_watermark(name, start, new_hash)
+                log.info("%s: code changed; no @on_metric handler to replay, watermark reset to %s", name, _iso(start))
+                continue
+            if not resuming:
+                self._buffer.restart_backfill(name, REPLAY, start, new_hash, created_at=time.time())
+            with self._lock:
+                self._held.add(name)
+            log.info(
+                "%s: code hash changed (%s -> %s); %s the replay of the buffer from %s, live triggers held until "
+                "it reaches the live edge",
+                name,
+                (old_hash or "none")[:12],
+                new_hash[:12],
+                "resuming" if resuming else "starting",
+                _iso(job["position"] if resuming and job is not None else start),
+            )
+
     def holds(self, producer: str) -> bool:
-        """Whether ``producer``'s live triggers are held for its first backfill."""
+        """Whether ``producer``'s live triggers are held for its first backfill
+        or its replay."""
         with self._lock:
             return producer in self._held
 
     # -- repair ------------------------------------------------------------
 
-    def request(self, producer: str, start: float, end: float, *, window: Any = None) -> str:
+    def request(self, producer: str, start: float, end: float, *, window: Any = None, job_id: str | None = None) -> str:
         """Record a job over ``[start, end)`` and wake the runner. Returns its id."""
         job = (
-            request(self._buffer, self._instances[producer], start, end, window=window)
+            request(self._buffer, self._instances[producer], start, end, window=window, job=job_id)
             if producer in self._instances
             else None
         )
@@ -443,6 +526,8 @@ class BackfillRunner:
             jobs = [
                 job for job in await asyncio.to_thread(self._buffer.backfill_jobs, pending_only=True) if self._runs(job)
             ]
+            # A job that holds live dispatch goes first: the rest run beside live.
+            jobs.sort(key=lambda job: not _holds_live(job))
             with self._lock:
                 self._pending = max(0, len(jobs) - 1)
             if not jobs:
@@ -453,6 +538,10 @@ class BackfillRunner:
                 await self._publish_finding(force=True)
                 await _until(self.bell.after(seen), stop)
                 continue
+            # Reported before anything is awaited for it, so the health door
+            # never reads "no backfill" while one is about to run.
+            self._report_next(jobs[0])
+            self._moved()
             await self._run_job(jobs[0], stop)
 
     def _runs(self, job: dict[str, Any]) -> bool:
@@ -466,9 +555,11 @@ class BackfillRunner:
         live = self._instances[name]
         cls = type(live)
         initial = job_id == INITIAL
-        # A first backfill that holds live dispatch runs on the live instance
-        # up to the live edge; every other job on its own instance up to its end.
-        holding = initial and job["end"] is None
+        replay = job_id == REPLAY
+        # A first backfill that holds live dispatch, and a replay, run on the
+        # live instance up to the live edge; every other job on its own
+        # instance up to its end.
+        holding = job["end"] is None
         window = _window_of(cls, job)
         code_hash = await asyncio.to_thread(codehash.compute_code_hash, cls)
         position, windows = job["position"], job["windows"]
@@ -500,14 +591,27 @@ class BackfillRunner:
                 plan = await self._resolved(instance, stop)
                 if plan is None:
                     return
-                if self._service.historian is None and plan.signal_ids:
-                    # Without a historian the buffer is all there is: skip to
-                    # its first point, once the ingest has filled it.
-                    if initial and not await self._caught_up(plan, stop):
+                if replay:
+                    # A replay runs what the live handlers would have; ticks
+                    # run live from the watermark it leaves.
+                    plan.ticks = []
+                if (self._service.historian is None or replay) and plan.signal_ids:
+                    # Without a historian the buffer is all there is, and a
+                    # replay reads only the buffer: skip to its first point,
+                    # once the ingest has filled it.
+                    if (initial or replay) and not await self._caught_up(plan, stop):
                         continue
                     first = self._first(plan)
-                    if first is not None and position < first:
+                    if first is not None and (position < first or (replay and not windows and first < position)):
+                        # A replay starts at the earliest buffered point, also
+                        # one the ingest buffered after it was planned.
                         position = first
+                    if not plan.ticks:
+                        # Nothing to run between two buffered points: no
+                        # windows over a stretch that holds none.
+                        following = self._next_point(plan, position)
+                        if following is not None and following > position:
+                            position = following
                 if holding:
                     edge = self._edge(plan)
                     self._report(job, position, windows, edge)
@@ -524,6 +628,9 @@ class BackfillRunner:
                 if position >= end:
                     await asyncio.to_thread(self._buffer.finish_backfill, name, job_id)
                     log.info("%s: backfill %s done (%d window(s))", name, job_id, windows)
+                    repaired = getattr(self._service, "_gap_repaired", None)
+                    if job_id.startswith(GAP_REPAIR) and repaired is not None:
+                        await asyncio.to_thread(repaired)
                     return
                 position, windows = await self._step(
                     instance, plan, job, position, min(position + window, end), windows, stop
@@ -569,6 +676,11 @@ class BackfillRunner:
         """The oldest buffered point of the producer's inputs, or ``None``."""
         earliest = [ts for ts in (self._buffer.earliest(sid) for sid in plan.signal_ids) if ts is not None]
         return min(earliest) if earliest else None
+
+    def _next_point(self, plan: _Plan, position: float) -> float | None:
+        """The oldest buffered point of the producer's inputs at or after ``position``."""
+        found = [ts for ts in (self._buffer.next_point(sid, position) for sid in plan.signal_ids) if ts is not None]
+        return min(found) if found else None
 
     def _edge(self, plan: _Plan) -> float:
         """The newest buffered point of the producer's inputs: what live
@@ -639,9 +751,10 @@ class BackfillRunner:
             await asyncio.to_thread(self._buffer.set_watermark, instance.name, edge, code_hash)
             with self._lock:
                 self._held.discard(instance.name)
-                self._current = None
-                self._moved_at = None
-                self._waiting = ""
+            # Done, and no longer holding: reported so until the runner
+            # reports the next job or that none is left, never as nothing.
+            self._report(job, end, windows + 1, end)
+            self._moved()
         finally:
             page_lock.release()
         log.info(
@@ -653,67 +766,164 @@ class BackfillRunner:
     async def _window(self, instance: Producer, plan: _Plan, job: dict[str, Any], start: float, end: float) -> int:
         """Every record and tick of ``[start, end)`` through the producer's
         own handlers, in timestamp order. A checkpointed producer's state is
-        put back if the window fails, so the retry starts where it did."""
-        from .service import synthetic_record
+        put back if the window fails, so the retry starts where it did.
 
-        historian = self._service.historian
-        events: list[tuple[float, int, int, Any, Any]] = []
-        for order, (signal_id, declared_input, handlers) in enumerate(plan.metrics):
-            low = start
-            if historian is None:
-                # Without a historian, what the buffer holds is all there is.
-                earliest = self._buffer.earliest(signal_id)
-                if earliest is None or earliest >= end:
-                    continue
-                low = max(start, earliest)
-            frame = await asyncio.to_thread(declared_input.fetch, low, end)
-            for ts, value in zip(frame["ts"].tolist(), frame["value"].tolist(), strict=True):
-                events.append((float(ts), 0, order, (signal_id, handlers), value))
-        for order, (method_name, spec) in enumerate(plan.ticks):
-            events.extend((due, 1, order, method_name, None) for due in tick_instants(spec, start, end))
-        events.sort(key=lambda event: event[:3])
+        The inputs are read in one go (:func:`~chaski.dataops.inputs.fetch_many`:
+        one historian request for all of them), merged with the tick instants
+        in timestamp order as they are handled, and the loop is yielded to
+        every :data:`YIELD_EVERY` events."""
+        # Without a historian, what the buffer holds is all there is.
+        rows = await asyncio.to_thread(
+            functools.partial(
+                fetch_many,
+                self._service,
+                [declared for _sid, declared, _h in plan.metrics],
+                start,
+                end,
+                clamp_to_buffer=True,
+                # A replay runs what the buffer holds through the new code.
+                history=job["job"] != REPLAY,
+            )
+        )
+        streams: list[Iterator[tuple[float, int, int, Any, Any]]] = [
+            _records(rows[signal_id], order, (signal_id, handlers))
+            for order, (signal_id, _declared, handlers) in enumerate(plan.metrics)
+        ]
+        streams.extend(
+            _instants(tick_instants(spec, start, end), order, method_name)
+            for order, (method_name, spec) in enumerate(plan.ticks)
+        )
+        events = heapq.merge(*streams, key=lambda event: event[:3])
 
         checkpointed = _holds_live(job) and instance.state_version is not None
         previous = state_copy(instance) if checkpointed else None
+        # What the window publishes is confirmed before its position is committed.
+        batch = PublishBatch()
+        ticks = _Ticks(self._service, instance, job)
         try:
-            for ts, kind, _order, target, value in events:
-                if kind == 0:
-                    signal_id, handlers = target
-                    record = synthetic_record(signal_id, ts, value, actor="backfill")
-                    for handler in handlers:
-                        try:
-                            await handler(record)
-                        except Reject as rejected:
-                            subject = {
-                                "backfill": job["job"],
-                                "producer": instance.name,
-                                "signal_id": signal_id,
-                                "ts": ts,
-                            }
-                            await asyncio.to_thread(
-                                record_rejection, self._service, consumer_name(handler), subject, rejected
-                            )
-                else:
-                    await asyncio.to_thread(self._tick, instance, target, ts, job)
+            with batch.active():
+                count = await self._run_events(instance, job, events, batch, ticks)
+            await asyncio.to_thread(batch.settle)
         except BaseException:
             if previous is not None:
                 instance.restore_state(previous)
             raise
-        return len(events)
+        finally:
+            await ticks.close()
+        return count
 
-    def _tick(self, instance: Producer, method_name: str, due: float, job: dict[str, Any]) -> None:
-        """One tick at its instant, off the loop like a live tick."""
-        with instance._lock, event_time(due):
+    async def _run_events(
+        self, instance: Producer, job: dict[str, Any], events: Iterator, batch: PublishBatch, ticks: _Ticks
+    ) -> int:
+        from .service import synthetic_record
+
+        count = 0
+        due: list[tuple[float, str]] = []
+        for ts, kind, _order, target, value in events:
+            count += 1
+            if count % YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+            if kind == 1:
+                # Consecutive ticks run together, in one hop to their thread.
+                due.append((ts, target))
+                continue
+            if due:
+                await ticks.run(due)
+                due = []
+            signal_id, handlers = target
+            record = synthetic_record(signal_id, ts, value, actor="backfill")
+            for handler in handlers:
+                batch.origin = consumer_name(handler)
+                try:
+                    await handler(record)
+                except Reject as rejected:
+                    subject = {"backfill": job["job"], "producer": instance.name, "signal_id": signal_id, "ts": ts}
+                    await asyncio.to_thread(record_rejection, self._service, consumer_name(handler), subject, rejected)
+        if due:
+            await ticks.run(due)
+        return count
+
+
+#: A backfill window yields the event loop after this many events.
+YIELD_EVERY = 256
+
+
+def _records(rows: list[tuple[float, Any]], order: int, target: Any) -> Iterator[tuple[float, int, int, Any, Any]]:
+    """One input's rows as window events, in timestamp order."""
+    for ts, value in rows:
+        yield (ts, 0, order, target, value)
+
+
+def _instants(instants: list[float], order: int, method_name: str) -> Iterator[tuple[float, int, int, Any, Any]]:
+    """One tick's instants as window events; after the records of the same instant."""
+    for due in instants:
+        yield (due, 1, order, method_name, None)
+
+
+class _Ticks:
+    """Runs a backfill window's ticks off the loop, like live ticks, on one
+    thread with one private event loop for the whole window, instead of a
+    thread hop and a new event loop per tick. What a run of ticks publishes
+    is confirmed before the run returns."""
+
+    def __init__(self, service: Any, instance: Producer, job: dict[str, Any]) -> None:
+        self._service = service
+        self._instance = instance
+        self._job = job
+        self._thread: concurrent.futures.ThreadPoolExecutor | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def run(self, due: list[tuple[float, str]]) -> None:
+        if self._thread is None:
+            self._thread = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="backfill-ticks")
+        await asyncio.get_running_loop().run_in_executor(self._thread, contextvars.copy_context().run, self._run, due)
+
+    def _run(self, due: list[tuple[float, str]]) -> None:
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        instance = self._instance
+        batch = PublishBatch()
+        with instance._lock:
             try:
-                asyncio.run(getattr(instance, method_name)())
-            except Reject as rejected:
-                consumer = f"{instance.name}.{method_name}"
-                subject = {"backfill": job["job"], "producer": instance.name, "timer": method_name, "due": due}
-                record_rejection(self._service, consumer, subject, rejected)
+                self._loop.run_until_complete(self._ticks(due, batch))
+            finally:
+                batch.settle()
+
+    async def _ticks(self, due: list[tuple[float, str]], batch: PublishBatch) -> None:
+        instance, job = self._instance, self._job
+        with batch.active():
+            for instant, method_name in due:
+                batch.origin = f"{instance.name}.{method_name}"
+                with event_time(instant):
+                    try:
+                        await getattr(instance, method_name)()
+                    except Reject as rejected:
+                        subject = {
+                            "backfill": job["job"],
+                            "producer": instance.name,
+                            "timer": method_name,
+                            "due": instant,
+                        }
+                        record_rejection(self._service, f"{instance.name}.{method_name}", subject, rejected)
+
+    async def close(self) -> None:
+        thread, loop = self._thread, self._loop
+        self._thread = self._loop = None
+        if thread is None:
+            return
+        if loop is not None:
+            await asyncio.get_running_loop().run_in_executor(thread, loop.close)
+        thread.shutdown(wait=False)
 
 
 def request(
-    buffer: Any, instance_or_cls: Producer | type[Producer], start: Any, end: Any, *, window: Any = None
+    buffer: Any,
+    instance_or_cls: Producer | type[Producer],
+    start: Any,
+    end: Any,
+    *,
+    window: Any = None,
+    job: str | None = None,
 ) -> str:
     """Record a repair job for a producer over ``[start, end)`` (unix
     seconds or datetimes) in ``buffer``; returns the job id. ``window``
@@ -727,7 +937,8 @@ def request(
     if not math.isfinite(start_s) or not math.isfinite(end_s) or end_s <= start_s:
         raise ValueError(f"a backfill needs start < end, got {start!r} .. {end!r}")
     window_s = None if window is None else parse_duration(window)
-    job = f"repair-{ulid.new()}"
+    # A named job is recorded once: asking again is a no-op.
+    job = job or f"repair-{ulid.new()}"
     # The runner records the code hash with the first window it commits.
     buffer.add_backfill_job(cls.name, job, start_s, end_s, "", created_at=time.time(), window=window_s)
     log.info("%s: backfill %s requested over %s .. %s", cls.name, job, _iso(start_s), _iso(end_s))
@@ -735,8 +946,8 @@ def request(
 
 
 def _holds_live(job: dict[str, Any]) -> bool:
-    """Whether ``job`` is a first backfill that holds live dispatch."""
-    return job["job"] == INITIAL and job["end"] is None
+    """Whether ``job`` holds live dispatch: a first backfill that does, or a replay."""
+    return job["end"] is None
 
 
 def _window_of(cls: type[Producer], job: dict[str, Any]) -> float:
@@ -776,6 +987,7 @@ __all__ = [
     "HOLD_LIVE",
     "INDEPENDENT",
     "INITIAL",
+    "REPLAY",
     "Backfill",
     "BackfillRunner",
     "request",

@@ -66,6 +66,78 @@ class Historian(Protocol):
         ...
 
 
+def history_windows(
+    historian: Any, signal_ids: list[str], start: float, end: float
+) -> dict[str, list[tuple[float, Any]]]:
+    """``(ts, value)`` rows with ``start <= ts < end`` per signal, ordered by
+    ts. A historian with a ``windows(signal_ids, start, end)`` method (a frame
+    per signal, like :meth:`NodeHistorian.windows`) reads every signal in one
+    request; any other one signal by signal."""
+    if not signal_ids or end <= start:
+        return {signal_id: [] for signal_id in signal_ids}
+    read_many = getattr(historian, "windows", None)
+    frames = (
+        read_many(signal_ids, start, end)
+        if callable(read_many)
+        else {signal_id: historian.window(signal_id, start, end) for signal_id in signal_ids}
+    )
+    return {signal_id: _rows(frames.get(signal_id)) for signal_id in signal_ids}
+
+
+def _rows(frame: Any) -> list[tuple[float, Any]]:
+    if frame is None or len(frame) == 0:
+        return []
+    return [(float(ts), value) for ts, value in zip(frame["ts"].tolist(), frame["value"].tolist(), strict=True)]
+
+
+def fetch_many(
+    runtime: Runtime,
+    inputs: Iterable[SignalRangeInput],
+    start: float,
+    end: float,
+    *,
+    clamp_to_buffer: bool = False,
+    history: bool = True,
+) -> dict[str, list[tuple[float, Any]]]:
+    """:meth:`SignalRangeInput.fetch` for several signals at once, as
+    ``(ts, value)`` rows per signal id: the buffer where it holds the range, the
+    historian (one read for every signal it serves, :func:`history_windows`)
+    for what lies before the buffer's earliest point.
+
+    Without a historian a range reaching before the buffer raises, unless
+    ``clamp_to_buffer``: then it starts at the buffer's earliest point, and a
+    signal the buffer holds nothing of has no rows. ``history=False`` reads
+    the buffer alone, as without a historian."""
+    buffer = runtime.buffer
+    historian = runtime.historian if history else None
+    out: dict[str, list[tuple[float, Any]]] = {}
+    from_history: dict[str, float] = {}
+    for declared in inputs:
+        signal_id = declared.signal_id
+        earliest = buffer.earliest(signal_id)
+        if earliest is None:
+            if historian is not None:
+                from_history[signal_id] = end
+            out[signal_id] = []
+        elif start < earliest:
+            if historian is None and not clamp_to_buffer:
+                raise RuntimeError(
+                    f"fetch({declared.signal_name!r}): requested range starts at {start}, before the buffer's "
+                    f"earliest retained point ({earliest}) for this signal, and no historian is configured to "
+                    "serve the gap"
+                )
+            if historian is not None:
+                from_history[signal_id] = min(end, earliest)
+            out[signal_id] = buffer.points(signal_id, earliest, end) if earliest < end else []
+        else:
+            out[signal_id] = buffer.points(signal_id, start, end)
+    if from_history:
+        older = history_windows(historian, list(from_history), start, max(from_history.values()))
+        for signal_id, history_end in from_history.items():
+            out[signal_id] = [row for row in older[signal_id] if row[0] < history_end] + out[signal_id]
+    return out
+
+
 class _PerInstance:
     """Descriptor shared by inputs and outputs: on the class it is the
     declaration, on an instance a copy kept in the instance's ``__dict__``.
@@ -185,32 +257,8 @@ class SignalRangeInput(_PerInstance):
         """
         import pandas as pd
 
-        runtime = self._runtime()
-        buffer = runtime.buffer
-        historian = runtime.historian
-        signal_id = self.signal_id
-        buf_earliest = buffer.earliest(signal_id)
-
-        if buf_earliest is None:
-            if historian is not None:
-                return historian.window(signal_id, start, end)
-            return pd.DataFrame(columns=["ts", "value"])
-
-        if start < buf_earliest:
-            if historian is None:
-                raise RuntimeError(
-                    f"fetch({self.signal_name!r}): requested range starts at {start}, "
-                    f"before the buffer's earliest retained point ({buf_earliest}) for "
-                    "this signal, and no historian is configured to serve the gap"
-                )
-            hist_end = min(end, buf_earliest)
-            hist_df = historian.window(signal_id, start, hist_end)
-            if buf_earliest < end:
-                buf_df = buffer.window(signal_id, buf_earliest, end)
-                return pd.concat([hist_df, buf_df], ignore_index=True)
-            return hist_df
-
-        return buffer.window(signal_id, start, end)
+        rows = fetch_many(self._runtime(), [self], start, end)[self.signal_id]
+        return pd.DataFrame({"ts": [r[0] for r in rows], "value": [r[1] for r in rows]}, columns=["ts", "value"])
 
     def latest_value_before(self, before: float) -> Any:
         """Value of the most recent point with ``ts <= before``, from the buffer

@@ -26,8 +26,10 @@ The two reads:
 * :meth:`~NodeHistorian.window` pages the raw metric read
   (``POST /api/v1/workbench/grafana/metrics/`` with ``raw``, ``limit`` and
   ``cursor``), ``page_size`` rows per request, so one response never holds
-  more than a page. The frame it returns holds the window, so memory is
+  more than a page per signal. The frame it returns holds the window, so memory is
   bounded by the caller's window (a backfill's ``window``), not the horizon.
+  :meth:`~NodeHistorian.windows` reads the first page of many signals in one
+  request; a backfill window over every input then costs one request.
 * :meth:`~NodeHistorian.latest_before` asks
   ``POST /api/v1/workbench/grafana/metrics/latest-before/``.
 
@@ -64,6 +66,8 @@ METRICS_PATH = "/api/v1/workbench/grafana/metrics/"
 LATEST_BEFORE_PATH = "/api/v1/workbench/grafana/metrics/latest-before/"
 #: Rows per request. The API accepts up to 100,000.
 DEFAULT_PAGE_SIZE = 10_000
+#: Signals whose first page one request reads (:meth:`NodeHistorian.windows`).
+SIGNALS_PER_READ = 50
 DEFAULT_REALM = "prekit"
 #: Tries per request, the first included, before :class:`NodeHistorianError`.
 DEFAULT_ATTEMPTS = 6
@@ -146,37 +150,68 @@ class NodeHistorian:
 
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
         """Points with ``start <= ts < end``, ordered by ts, read page by page."""
+        return self.windows([signal_id], start, end)[signal_id]
+
+    def windows(self, signal_ids: list[str], start: float, end: float) -> dict[str, pd.DataFrame]:
+        """:meth:`window` for several signals: the first page of up to
+        :data:`SIGNALS_PER_READ` signals in one request, and the rest of a
+        signal with more than a page by itself, as the API pages one signal
+        per cursor. A backfill window then costs one request, not one per
+        signal."""
         import pandas as pd
 
-        timestamps: list[float] = []
-        values: list[Any] = []
+        rows: dict[str, tuple[list[float], list[Any]]] = {signal_id: ([], []) for signal_id in signal_ids}
         if end > start:
-            body: dict[str, Any] = {
-                "signal_ids": [signal_id],
-                "from": _iso(start),
-                "to": _iso(end),
-                "raw": True,
-                "limit": self.page_size,
-            }
-            seen: set[str] = set()
-            while True:
-                series = self._series(self._post(METRICS_PATH, body), signal_id)
-                for point in series.get("points", []):
-                    timestamps.append(_epoch(point["timestamp"]))
-                    values.append(_value(point))
-                if "next_cursor" not in series:
-                    raise NodeHistorianError(
-                        f"{self.url} answered a paged read without next_cursor: the node's PREKIT "
-                        "is too old to page raw metric reads"
-                    )
-                cursor = series["next_cursor"]
-                if cursor is None:
-                    break
-                if cursor in seen:
-                    raise NodeHistorianError(f"{self.url} repeated a page cursor for signal {signal_id}")
-                seen.add(cursor)
-                body["cursor"] = cursor
-        return pd.DataFrame({"ts": timestamps, "value": values}, columns=["ts", "value"])
+            unique = list(dict.fromkeys(signal_ids))
+            for first in range(0, len(unique), SIGNALS_PER_READ):
+                group = unique[first : first + SIGNALS_PER_READ]
+                body: dict[str, Any] = {
+                    "signal_ids": group,
+                    "from": _iso(start),
+                    "to": _iso(end),
+                    "raw": True,
+                    "limit": self.page_size,
+                }
+                payload = self._post(METRICS_PATH, body)
+                for signal_id in group:
+                    series = self._series(payload, signal_id)
+                    cursor = self._take(series, signal_id, rows[signal_id])
+                    if cursor is not None:
+                        self._rest(signal_id, start, end, cursor, rows[signal_id])
+        return {
+            signal_id: pd.DataFrame({"ts": ts, "value": values}, columns=["ts", "value"])
+            for signal_id, (ts, values) in rows.items()
+        }
+
+    def _take(self, series: dict[str, Any], signal_id: str, into: tuple[list[float], list[Any]]) -> str | None:
+        """Add one page's points to ``into``; the cursor of the next page, or ``None``."""
+        for point in series.get("points", []):
+            into[0].append(_epoch(point["timestamp"]))
+            into[1].append(_value(point))
+        if "next_cursor" not in series:
+            raise NodeHistorianError(
+                f"{self.url} answered a paged read without next_cursor: the node's PREKIT "
+                "is too old to page raw metric reads"
+            )
+        return series["next_cursor"]
+
+    def _rest(self, signal_id: str, start: float, end: float, cursor: str, into: tuple[list[float], list[Any]]) -> None:
+        """The pages after the first of one signal."""
+        body: dict[str, Any] = {
+            "signal_ids": [signal_id],
+            "from": _iso(start),
+            "to": _iso(end),
+            "raw": True,
+            "limit": self.page_size,
+        }
+        seen: set[str] = set()
+        next_cursor: str | None = cursor
+        while next_cursor is not None:
+            if next_cursor in seen:
+                raise NodeHistorianError(f"{self.url} repeated a page cursor for signal {signal_id}")
+            seen.add(next_cursor)
+            body["cursor"] = next_cursor
+            next_cursor = self._take(self._series(self._post(METRICS_PATH, body), signal_id), signal_id, into)
 
     def latest_before(self, signal_id: str, before: float) -> tuple[float, Any] | None:
         """``(ts, value)`` of the most recent point with ``ts <= before``, or ``None``."""

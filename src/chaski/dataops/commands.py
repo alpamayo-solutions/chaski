@@ -112,7 +112,7 @@ from chaski.executor import (
 )
 
 from . import resolve
-from .base import Producer
+from .base import Producer, turn
 from .triggers import OnCommandSpec
 
 __all__ = [
@@ -198,6 +198,9 @@ class CommandExecutor(executor.CommandExecutor):
     ran into the node's rate limit when commands came fast."""
 
     async def _invoke(self, handler: Any, command: Command) -> Any:
-        producer = handler.__self__
-        with resolve.lazy_pass(resolve.Snapshot(self._door)), producer._lock:
-            return await handler(command)
+        producer = getattr(handler, "__self__", None)
+        if not isinstance(producer, Producer):
+            return await handler(command)  # the service's own command
+        with resolve.lazy_pass(resolve.Snapshot(self._door)):
+            async with turn(producer):
+                return await handler(command)

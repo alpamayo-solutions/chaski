@@ -678,6 +678,16 @@ def _buffered_before_a_code_change(tmp_path: Path) -> None:
         buffer.close()
 
 
+def _stored_code_hash(tmp_path: Path, producer: str) -> str | None:
+    from chaski.dataops.buffer import Buffer
+
+    buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
+    try:
+        return buffer.code_hash(producer)
+    finally:
+        buffer.close()
+
+
 @run_async
 async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_on(tmp_path: Path, monkeypatch):
     from chaski.dataops import codehash
@@ -693,8 +703,14 @@ async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_
     stop = asyncio.Event()
     task = asyncio.ensure_future(svc.serve(stop))
     try:
-        # The live record after the replay is handled too.
-        await _poll_until(lambda: any(p["value"] == 43.0 for _t, p in _door_metrics()))
+        # The live record is handled too (its timestamp is older than the
+        # buffered ones, so the replay takes it in order).
+        await _poll_until(lambda: len(_door_metrics()) >= 3)
+        # The replay records the new code hash only once it has finished, after
+        # its last output went out; stopping before that would leave the old
+        # hash and replay again on the next start, which is the intended
+        # behaviour for an interrupted replay, not what this test is about.
+        await _poll_until(lambda: _stored_code_hash(tmp_path, "strict") == codehash.compute_code_hash(Strict))
         assert not task.done()
     finally:
         stop.set()
@@ -703,7 +719,7 @@ async def test_a_record_rejected_during_replay_is_recorded_and_the_service_goes_
     assert sorted(p["value"] for _t, p in _door_metrics()) == [2.0, 6.0, 43.0]
     (finding,) = [json.loads(p) for t, p in client.published if t.endswith("/rejected_input")]
     assert finding["detail"]["consumer"] == "strict.recompute"
-    assert finding["detail"]["replay"] == "strict"
+    assert finding["detail"]["backfill"] == "replay" and finding["detail"]["producer"] == "strict"
     assert svc.handler_health.status == "ok"
     buffer = Buffer(tmp_path / "data" / "buffer.sqlite3")
     try:
@@ -726,11 +742,13 @@ async def test_a_failing_replay_is_retried_with_the_service_up_and_degraded(tmp_
     stop = asyncio.Event()
     task = asyncio.ensure_future(svc.serve(stop))
     try:
-        await _poll_until(lambda: svc.handler_health.failing().get("task replay", None) is not None)
+        await _poll_until(lambda: svc.handler_health.failing().get("task backfill", None) is not None)
         assert not task.done()
         assert svc.handler_health.status == "degraded"
-        # The replay is not marked complete, and live intake waits for it.
-        assert svc._ingest is None
+        # The replay is not marked complete, and live dispatch waits for it;
+        # the ingest goes on buffering beside it.
+        assert svc.backfill_holds("strict")
+        assert svc._ingest is not None
     finally:
         stop.set()
         await asyncio.wait_for(task, timeout=10.0)

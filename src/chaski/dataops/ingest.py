@@ -12,9 +12,16 @@ The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name, and so its position, stays.
 
-**Crash safety.** Per page: append and run handlers, then ack. A crash before
+**Crash safety.** Per page: append and run handlers, wait until the node
+confirmed what they published (their writes are pipelined,
+:mod:`chaski.publishing`), save the checkpoints of the producers that keep one
+(once per page), commit, then ack. A crash before
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
+
+**One page, one hop.** The worker thread hands a page with handlers to the
+service's loop once; there each record is appended, then handled, in stream
+order (:meth:`Ingest._dispatch_page`).
 
 **A failed handler is not acknowledged.** The cursor moves only past the
 records before it, and :meth:`Ingest.run_forever` retries the same record
@@ -37,7 +44,13 @@ fetch, and a :meth:`Ingest.rebind`, restart the read at the acked cursor. On
 older nodes the loop fetches, processes and acks in turn.
 
 **Gaps.** When the cursor fell below the stream's low-water mark, colca
-returns a ``gap`` with the surviving records. Processing fails visibly rather than acknowledging missing history.
+returns a ``gap`` with the surviving records. The loop asks ``on_gap`` what
+to do: it may let the loop go on past the gap (the service recorded a repair
+from the historian, or an operator accepted the loss), and the page is
+processed and acked past it. Until it does, the loop neither processes nor
+acks, and waits for :meth:`Ingest.wake` instead of failing again and again;
+``gap_waiting`` says why. Without ``on_gap`` a gap raises
+:class:`~chaski.door.StreamGapError`.
 
 **MQTT only wakes it.** A message on one of the service's input topics calls
 :meth:`Ingest.wake` (through
@@ -72,8 +85,10 @@ from chaski.door import Gap, Page, Record, Stream, StreamGapError
 from chaski.doorbell import IDLE_DRAIN_S, Doorbell
 from chaski.failures import HandlerHealth, Reject, record_subject
 from chaski.outage import Outage
+from chaski.publishing import PublishBatch
 from chaski.retry import Backoff
 
+from .base import PageCheckpoints, RewindFailed
 from .buffer import Buffer
 
 log = logging.getLogger("chaski.dataops.ingest")
@@ -95,6 +110,20 @@ OpenStream = Callable[[str, "list[str] | None"], Stream]
 #: ``reject(consumer, subject, rejection)``: records a rejection durably and
 #: returns only then (:meth:`chaski.Service.reject`).
 RejectFn = Callable[[str, "dict[str, Any]", Reject], None]
+
+#: ``on_gap(gap, survivors)``: whether the loop may go on past ``gap``; runs
+#: in a worker thread. ``survivors`` are the page's records after the gap.
+OnGap = Callable[[Gap, "list[Record]"], bool]
+
+
+class GapPending(Exception):
+    """The page starts with a gap the loop may not go past yet."""
+
+    def __init__(self, gap: Gap) -> None:
+        super().__init__(
+            f"offsets {gap.from_offset}..{gap.to_offset} of {gap.stream} were pruned before they were read"
+        )
+        self.gap = gap
 
 
 def consumer_name(handler: Any) -> str:
@@ -135,8 +164,12 @@ class Ingest:
         health: HandlerHealth | None = None,
         reject: RejectFn | None = None,
         idle_drain_s: float | None = IDLE_DRAIN_S,
+        on_gap: OnGap | None = None,
     ) -> None:
         self._retry_min_s = retry_min_s
+        self._on_gap = on_gap
+        #: Why the loop waits at a gap, ``""`` while it does not.
+        self.gap_waiting = ""
         self._idle_drain_s = idle_drain_s
         self._health = health or HandlerHealth()
         self._reject = reject
@@ -182,8 +215,12 @@ class Ingest:
         """Swap what this loop dispatches and fetches, mid-run.
 
         Producers often start before the signals they read are commissioned.
-        Only the table and the filter change; the cursor keeps its position,
-        and records a newly resolved signal missed are recovered by replay.
+        Only the table and the filter change; the cursor keeps its position.
+        Records of a newly resolved signal that the cursor passed while the
+        filter left it out are not read again: nothing recovers them on its
+        own. A producer that needs them repairs the range
+        (:meth:`~chaski.dataops.DataOpsService.request_backfill`, from the
+        historian).
         """
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
@@ -239,17 +276,75 @@ class Ingest:
         """Append every record of ``page`` and run its handlers on ``loop``,
         in stream order. Runs in a worker thread; does not ack."""
         if page.gap is not None:
-            raise StreamGapError(f"input stream has a retention gap: {page.gap}")
+            if self._on_gap is None:
+                raise StreamGapError(f"input stream has a retention gap: {page.gap}")
+            if not self._on_gap(page.gap, page.records):
+                raise GapPending(page.gap)
+            self.gap_waiting = ""
 
         self._failed = None
+        records = page.records
         # One commit per page: the page is acked only after it, and a crash
         # before the ack appends the page again.
         with self.page_lock, self._buffer.one_commit():
-            for record in page.records:
-                signal_id = self._append(record)
-                if signal_id is not None and self._dispatch.get(signal_id):
-                    asyncio.run_coroutine_threadsafe(self._handle(signal_id, record), loop).result()
-        return len(page.records)
+            if any(self._dispatch.get(self._signal_id_of(record) or "") for record in records):
+                # One hop to the loop per page, not per record.
+                asyncio.run_coroutine_threadsafe(self._dispatch_page(records), loop).result()
+            else:
+                self._append_many(records)
+        return len(records)
+
+    async def _dispatch_page(self, records: list[Record]) -> None:
+        """Append and dispatch ``records`` in order, on the service's loop.
+
+        A record is appended right before its handlers run, so a handler sees
+        no later record of the page. What the handlers publish is pipelined
+        (:class:`~chaski.publishing.PublishBatch`) and confirmed when the page
+        ends, before checkpointed producers save their state once
+        (:class:`~chaski.dataops.base.PageCheckpoints`), still inside the
+        page's commit and before its ack. A write the node refused or did not
+        confirm puts every checkpointed producer back to the page's start, and
+        the page is acked only before its first handled record.
+        """
+        page = PageCheckpoints()
+        batch = PublishBatch()
+        first_handled: Record | None = None
+        try:
+            with page.active():
+                try:
+                    with batch.active():
+                        # Records nobody handles are appended together, right
+                        # before the next record that is handled (or the page's end).
+                        quiet: list[Record] = []
+                        for record in records:
+                            signal_id = self._signal_id_of(record)
+                            if signal_id is None or not self._dispatch.get(signal_id):
+                                quiet.append(record)
+                                continue
+                            self._append_many(quiet)
+                            quiet.clear()
+                            self._append(record)
+                            if first_handled is None:
+                                first_handled = record
+                            await self._handle(signal_id, record)
+                        self._append_many(quiet)
+                finally:
+                    # Confirmed also when a handler failed: the records before
+                    # it are acked, and their writes with them.
+                    if len(batch):
+                        try:
+                            await asyncio.to_thread(batch.settle)
+                        except Exception as exc:
+                            page.abandon(batch.failed_origin or "publish", first_handled or records[0], exc)
+        finally:
+            # A checkpoint that could not be saved, or a write that was not
+            # confirmed, puts producers back to the page's records named here;
+            # the page is acked only before that record.
+            late = page.failed
+            if late is not None and (self._failed is None or late.record.offset < self._failed[1].offset):
+                self._failed = (late.consumer, late.record)
+        if page.failed is not None:
+            raise page.failed
 
     # ------------------------------------------------------------------ read-ahead
 
@@ -353,13 +448,28 @@ class Ingest:
         self._ack_failed = False
         self._ack_error = None
 
+    def _append_many(self, records: list[Record]) -> None:
+        """Buffer ``records`` in one statement; one without a ``signal_id`` is logged and left out."""
+        points = []
+        for record in records:
+            signal_id = self._signal_id_of(record)
+            if signal_id is None:
+                self._no_signal_id(record)
+                continue
+            points.append((signal_id, self._timestamp_of(record), self._value_of(record)))
+        self._buffer.append_many(points)
+
+    @staticmethod
+    def _no_signal_id(record: Record) -> None:
+        log.warning(
+            "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
+        )
+
     def _append(self, record: Record) -> str | None:
         """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
         signal_id = self._signal_id_of(record)
         if signal_id is None:
-            log.warning(
-                "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
-            )
+            self._no_signal_id(record)
             return None
         self._buffer.append(signal_id, self._timestamp_of(record), self._value_of(record))
         return signal_id
@@ -367,6 +477,9 @@ class Ingest:
     async def _handle(self, signal_id: str, record: Record) -> None:
         for handler in self._dispatch.get(signal_id, []):
             name = consumer_name(handler)
+            batch = PublishBatch.current()
+            if batch is not None:
+                batch.origin = name
             try:
                 try:
                     await handler(record)
@@ -378,6 +491,10 @@ class Ingest:
                         **record_subject(record),
                     }
                     await asyncio.to_thread(self._record_rejection, name, subject, rejected)
+            except RewindFailed as exc:
+                # The producer went back to its first record of the page.
+                self._failed = (exc.consumer, exc.record)
+                raise
             except Exception:
                 self._failed = (name, record)
                 raise
@@ -445,19 +562,6 @@ class Ingest:
             return payload.get("value")
         return getattr(payload, "value", None)
 
-    @staticmethod
-    def _log_gap(gap: Gap) -> None:
-        log.warning(
-            "Gap on stream=%s: offsets %d..%d were pruned (first_ts=%s last_ts=%s approx=%s) — "
-            "continuing from the low-water mark; deep-backfill from the historian is the repair tool.",
-            gap.stream,
-            gap.from_offset,
-            gap.to_offset,
-            gap.first_ts,
-            gap.last_ts,
-            gap.approx,
-        )
-
     # ------------------------------------------------------------------ wake
 
     def wake(self) -> None:
@@ -513,7 +617,7 @@ class Ingest:
         return getattr(getattr(self._stream, "_door", None), "link_up", None)
 
     async def _sleep_or_stop(
-        self, seconds: float, stop: asyncio.Event, wake: Doorbell | None = None, since: int = 0
+        self, seconds: float | None, stop: asyncio.Event, wake: Doorbell | None = None, since: int = 0
     ) -> bool:
         """Sleep up to ``seconds``, waking early if ``stop`` is set or ``wake``
         rang after ``since``. True when ``wake`` ended the sleep."""
@@ -540,9 +644,9 @@ class Ingest:
         restarting, a timeout, 429, 5xx) is retried with backoff, and logged
         once when it starts and once when it recovers
         (:class:`chaski.outage.Outage`); the unacked page is simply fetched
-        again. Any other exception, a
-        retention gap included, propagates, ends the task and turns the health
-        door to 503.
+        again. A gap ``on_gap`` does not let the loop past waits for a wake
+        (module docstring, "Gaps"). Any other exception propagates, ends the
+        task and turns the health door to 503.
         """
         stop = stop or asyncio.Event()
         try:
@@ -562,6 +666,16 @@ class Ingest:
             link_seen = link.generation if link is not None else 0
             try:
                 processed = await self._step()
+            except GapPending as pending:
+                # Not a failure to retry: nothing changes until on_gap's owner
+                # wakes the loop (a repair recorded, a gap accepted).
+                await self._restart_from_cursor()
+                if not self.gap_waiting:
+                    log.error("Ingest waits at a gap on cursor=%s: %s", self.cursor, pending)
+                self.gap_waiting = str(pending)
+                await self._sleep_or_stop(None, stop, self._bell, seen)
+                seen = self._bell.generation
+                continue
             except Exception as exc:
                 if await self._handler_failed(exc, retry, stop, link_seen):
                     continue

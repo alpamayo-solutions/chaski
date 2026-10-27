@@ -24,10 +24,11 @@ from dataops_fakes import NODE_ID, FakeDoor, FakeRuntime, kv_entry, run_async, s
 from node_api_fake import CLIENT_ID, CLIENT_SECRET, FakeNodeApi
 
 from chaski.dataops import AnnotationOutput, Backfill, NodeHistorian, Producer, SignalRangeInput, every, on_metric
-from chaski.dataops.backfill import INITIAL, BackfillRunner, tick_instants
+from chaski.dataops.backfill import INITIAL, REPLAY, BackfillRunner, tick_instants
+from chaski.dataops.base import save_checkpoint
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.outputs import bind_annotation_outputs
-from chaski.dataops.service import make_handler, replay_changed_producers, synthetic_record
+from chaski.dataops.service import make_handler, synthetic_record
 from chaski.dataops.triggers import CronSpec, IntervalSpec
 from chaski.door import Record
 from chaski.doorbell import Doorbell
@@ -180,18 +181,36 @@ class _Ingest:
 
 
 def _setup(
-    cls, tmp_path, *, archive, buffered, name="buffer.sqlite3", rate=1000.0, busy=1.0, historian=None, stall_after=600.0
+    cls,
+    tmp_path,
+    *,
+    archive,
+    buffered,
+    name="buffer.sqlite3",
+    rate=1000.0,
+    busy=1.0,
+    historian=None,
+    stall_after=600.0,
+    first_start=False,
 ):
     """A service whose historian holds ``archive`` + ``buffered`` and whose
-    buffer holds ``buffered``, as after the ingest drained the stream."""
+    buffer holds ``buffered``, as after the ingest drained the stream. Unless
+    ``first_start``, the producer ran this code before, so its start does not
+    replay the buffer."""
+    from chaski.dataops import codehash
+
     buffer = Buffer(tmp_path / name)
     for ts, value in buffered:
         buffer.append(SIGNAL, ts, value)
+    if not first_start:
+        buffer.set_watermark(cls.name, 0.0, codehash.compute_code_hash(cls))
     if historian is None:
         historian = FakeHistorian({SIGNAL: [*archive, *buffered]})
     service = FakeService(_door(), buffer, historian)
     service._ingest = _Ingest()
     instance = _attach(cls, service)
+    if not first_start:
+        save_checkpoint(instance)
     runner = BackfillRunner(service, [instance], rate=rate, busy=busy, stall_after=stall_after)
     service.runner = runner
     runner.plan()
@@ -367,10 +386,10 @@ async def test_without_a_historian_the_backfill_covers_what_the_buffer_holds(tmp
 async def test_a_held_producer_is_left_out_of_the_code_change_replay(tmp_path):
     now = time.time()
     history = _history(now - DAY, 50)
-    service, instance, _runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=history)
+    _service, instance, runner, buffer = _setup(segmenter(), tmp_path, archive=[], buffered=history, first_start=True)
 
-    await replay_changed_producers(service, [instance])
-
+    assert runner.holds("segmenter")
+    assert buffer.backfill_job("segmenter", REPLAY) is None
     assert instance.handled == []
     assert buffer.code_hash("segmenter") is None
     buffer.close()
@@ -638,22 +657,28 @@ async def test_an_independent_backfill_leaves_live_dispatch_running_and_ends_at_
     history = _history(now - 3 * DAY, 3 * 144)
     later = _history(now + 60.0, 30)
     cls = closer(window="1h")
-    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:300], buffered=history[300:], rate=40.0)
+    service, instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history[:300], buffered=history[300:], rate=40.0, first_start=True
+    )
     began = time.time()
 
-    # Not held: the start replays the buffer on the live instance at once.
-    assert not runner.holds("closer")
+    # The first start replays the buffer on the live instance first, and
+    # holds live dispatch only for that.
+    assert runner.holds("closer")
     job = buffer.backfill_job("closer", INITIAL)
     assert job is not None and not job["done"]
     assert now <= job["end"] <= began
     assert job["start"] == pytest.approx(job["end"] - 10 * DAY)
-    await replay_changed_producers(service, [instance])
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    while runner.holds("closer"):
+        assert not task.done(), task
+        await asyncio.sleep(0.005)
     assert instance.handled == [ts for ts, _ in history[300:]]
+    assert not buffer.backfill_job("closer", INITIAL)["windows"], "the replay ran before the history"
 
     # Live records are dispatched while the history runs.
     live = make_handler(instance.on_state)
-    stop = asyncio.Event()
-    task = asyncio.ensure_future(runner.run(stop))
     while not (runner.status().get("running") or {}).get("windows", 0) >= 3:
         await asyncio.sleep(0.005)
     for offset, (ts, value) in enumerate(later, start=1000):
@@ -687,8 +712,9 @@ async def test_a_restart_mid_independent_backfill_keeps_its_live_start(tmp_path)
     now = time.time()
     history = _history(now - 4 * DAY, 4 * 144)
     cls = closer(window="2h")
-    service, instance, runner, buffer = _setup(cls, tmp_path, archive=history[:500], buffered=history[500:], rate=50.0)
-    await replay_changed_producers(service, [instance])
+    service, _instance, runner, buffer = _setup(
+        cls, tmp_path, archive=history[:500], buffered=history[500:], rate=50.0, first_start=True
+    )
     boundary = buffer.backfill_job("closer", INITIAL)["end"]
 
     stop = asyncio.Event()
@@ -727,7 +753,7 @@ async def test_a_held_first_backfill_switched_to_independent_releases_live_at_it
     now = time.time()
     history = _history(now - 2 * DAY, 2 * 144)
     service, _instance, runner, buffer = _setup(
-        closer(mode="hold_live"), tmp_path, archive=history[:200], buffered=history[200:], rate=50.0
+        closer(mode="hold_live"), tmp_path, archive=history[:200], buffered=history[200:], rate=50.0, first_start=True
     )
     assert runner.holds("closer")
     stop = asyncio.Event()
@@ -745,7 +771,9 @@ async def test_a_held_first_backfill_switched_to_independent_releases_live_at_it
     before = time.time()
     runner2.plan()
     job = buffer.backfill_job("closer", INITIAL)
-    assert not runner2.holds("closer")
+    # It never reached live: the buffer is replayed first, and the history
+    # goes on beside live dispatch from where it stood.
+    assert buffer.backfill_job("closer", REPLAY) is not None
     assert job["end"] >= before and job["position"] == held["position"]
     await _run_until_done(runner2, "closer")
     assert buffer.backfill_job("closer", INITIAL)["done"]
@@ -797,7 +825,8 @@ async def test_a_producer_without_a_backfill_declaration_repairs_with_the_window
     runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
     service.runner = runner
     runner.plan()
-    assert buffer.backfill_jobs() == []
+    # A new producer replays the (empty) buffer; it declares no backfill.
+    assert [job["job"] for job in buffer.backfill_jobs()] == [REPLAY]
 
     job = runner.request("plain", now - 12 * 3600, now, window="4h")
     assert buffer.backfill_job("plain", job)["window"] == 4 * 3600
@@ -924,13 +953,196 @@ async def test_a_backfill_waiting_for_the_ingest_names_what_it_waits_for_when_st
     task = asyncio.ensure_future(runner.run(stop))
     try:
         deadline = time.monotonic() + 10
-        while "stalled" not in (running := (runner.status().get("running") or {})):
-            assert time.monotonic() < deadline, "the stall was not reported"
+        reason = "it waits for the live ingest to reach the stream head"
+        # Under load the job may read as stalled before it reaches the wait;
+        # what matters is that the stall then names what it waits for.
+        while not (running := (runner.status().get("running") or {})).get("stalled", "").endswith(reason):
+            assert time.monotonic() < deadline, f"the stall was not reported with its reason: {running}"
             assert not task.done(), task
             await asyncio.sleep(0.02)
-        assert running["stalled"].endswith("it waits for the live ingest to reach the stream head")
         assert running["windows"] == 0 and running["holds_live"] is True
     finally:
         stop.set()
         await task
         buffer.close()
+
+
+# ─── one window: reads, merging, ticks ─────────────────────────────────────
+
+
+class ManyHistorian(FakeHistorian):
+    """A historian that reads several signals in one request, like NodeHistorian."""
+
+    def __init__(self, points) -> None:
+        super().__init__(points)
+        del self.windows  # the method below, not the parent's list of reads
+        self.single: list[tuple[str, float, float]] = []
+        self.many: list[tuple[tuple[str, ...], float, float]] = []
+
+    def window(self, signal_id, start, end):
+        self.single.append((signal_id, start, end))
+        return self._rows(signal_id, start, end)
+
+    def windows(self, signal_ids, start, end):
+        self.many.append((tuple(signal_ids), start, end))
+        return {sid: self._rows(sid, start, end) for sid in signal_ids}
+
+    def _rows(self, signal_id, start, end):
+        rows = [(ts, v) for ts, v in self.points.get(signal_id, []) if start <= ts < end]
+        return pd.DataFrame({"ts": [r[0] for r in rows], "value": [r[1] for r in rows]}, columns=["ts", "value"])
+
+
+def _three_inputs():
+    class Three(Producer):
+        name = "three"
+        system_element_name = "press"
+        backfill = Backfill(horizon="3h", window="1h")
+        a = SignalRangeInput("a", window="1h")
+        b = SignalRangeInput("b", window="1h")
+        c = SignalRangeInput("c", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[tuple[str, float]] = []
+
+        @on_metric("a")
+        async def on_a(self, metric) -> None:
+            self.seen.append(("a", metric.timestamp))
+
+        @on_metric("b")
+        async def on_b(self, metric) -> None:
+            self.seen.append(("b", metric.timestamp))
+
+        @on_metric("c")
+        async def on_c(self, metric) -> None:
+            self.seen.append(("c", metric.timestamp))
+
+    return Three
+
+
+@run_async
+async def test_a_window_reads_the_history_of_every_input_in_one_request_and_merges_them_in_time_order(tmp_path):
+    now = time.time()
+    start = now - 3 * 3600
+    points = {
+        sid: [(start + 60 + offset + i * 97.0, i) for i in range(100)] for offset, sid in enumerate(("a", "b", "c"))
+    }
+    historian = ManyHistorian(points)
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    door = FakeDoor([signal_entry("a", "a"), signal_entry("b", "b"), signal_entry("c", "c")])
+    service = FakeService(door, buffer, historian)
+    service._ingest = _Ingest()
+    instance = _three_inputs()().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+
+    await _run_until_done(runner, "three")
+
+    assert historian.single == [], "no signal was read by itself"
+    assert historian.many and all(sorted(signals) == ["a", "b", "c"] for signals, _s, _e in historian.many)
+    expected = sorted((sid, ts) for sid, rows in points.items() for ts, _ in rows)
+    assert sorted(instance.seen) == expected
+    assert [ts for _, ts in instance.seen] == sorted(ts for _, ts in instance.seen)
+    buffer.close()
+
+
+@run_async
+async def test_a_window_with_many_records_lets_the_loop_run_between_them(tmp_path):
+    """A window of thousands of records ran without giving the event loop a
+    turn: the health door and the ingest's wake-ups waited for the whole
+    window."""
+    now = time.time()
+    history = [(now - 2 * 3600 + i * 0.5, i % 2) for i in range(4000)]
+    cls = segmenter(horizon="3h", window="3h")
+    _service, instance, runner, buffer = _setup(cls, tmp_path, archive=history, buffered=[])
+    turns = [0]
+    seen_turns: list[int] = []
+
+    async def other_work() -> None:
+        while True:
+            turns[0] += 1
+            await asyncio.sleep(0)
+
+    on_state = cls.on_state
+
+    async def noting(self, metric) -> None:
+        seen_turns.append(turns[0])
+        await on_state(self, metric)
+
+    instance.on_state = noting.__get__(instance)
+    from chaski.dataops.backfill import _plan as plan_of
+
+    plan = plan_of(instance)
+    plan.metrics = [(sid, declared, [make_handler(instance.on_state)]) for sid, declared, _h in plan.metrics]
+    job = buffer.backfill_job("segmenter", INITIAL)
+    worker = asyncio.ensure_future(other_work())
+    try:
+        await runner._window(instance, plan, {**job, "code_hash": "x"}, history[0][0], history[-1][0] + 1)
+    finally:
+        worker.cancel()
+    assert len(seen_turns) == len(history)
+    assert seen_turns[-1] - seen_turns[0] >= len(history) // 256 - 1
+    buffer.close()
+
+
+@run_async
+async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
+    class Minutely(Producer):
+        name = "minutely"
+        system_element_name = "press"
+        backfill = Backfill(horizon="2h", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.ran: list[tuple[float, int, int]] = []
+
+        @every("1m")
+        async def tick(self) -> None:
+            self.ran.append((self.now, threading.get_ident(), id(asyncio.get_running_loop())))
+
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    service = FakeService(_door(), buffer, FakeHistorian({}))
+    service._ingest = _Ingest()
+    instance = Minutely().attach(service)
+    runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
+    service.runner = runner
+    runner.plan()
+    await _run_until_done(runner, "minutely")
+
+    job = buffer.backfill_job("minutely", INITIAL)
+    assert [due for due, _t, _l in instance.ran] == tick_instants(
+        IntervalSpec(seconds=60.0), job["start"], job["position"]
+    )
+    # One loop per window, not one per tick.
+    loops = {loop for _d, _t, loop in instance.ran}
+    assert len(loops) <= job["windows"] < len(instance.ran)
+    assert threading.get_ident() not in {thread for _d, thread, _l in instance.ran}
+    buffer.close()
+
+
+@run_async
+async def test_the_status_never_reads_idle_while_a_job_is_pending(tmp_path):
+    """Between the replay's hand-over and the next job the status named no
+    running job for a moment: the health door then said none ran."""
+    now = time.time()
+    history = _history(now - 3 * DAY, 3 * 144)
+    _service, _instance, runner, buffer = _setup(
+        closer(window="6h"), tmp_path, archive=history[:300], buffered=history[300:], first_start=True
+    )
+    assert runner.holds("closer")
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(runner.run(stop))
+    idle_with_work: list[list[str]] = []
+    deadline = time.monotonic() + 20
+    while not buffer.backfill_job("closer", INITIAL)["done"]:
+        assert time.monotonic() < deadline and not task.done()
+        status = runner.status()
+        pending = [job["job"] for job in buffer.backfill_jobs(pending_only=True)]
+        if not status.get("running") and pending:
+            idle_with_work.append(pending)
+        await asyncio.sleep(0)
+    stop.set()
+    await task
+    assert idle_with_work == []
+    buffer.close()

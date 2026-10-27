@@ -277,6 +277,34 @@ def test_a_reconnect_subscribes_everything_again_unless_the_broker_kept_the_sess
     assert set(again) == (set() if session_present else held)
 
 
+@pytest.mark.parametrize("session_present", [False, True])
+def test_a_new_session_forgets_a_cursor_lag_finding_the_node_may_have_retired_meanwhile(
+    tmp_path, monkeypatch, session_present
+):
+    svc, client = _local_service(tmp_path, monkeypatch)
+    lag_topic = "colca/v1/_Finding/n-edge1/line1/svc1/cursor_lag"
+    finding = b'{"summary": "1 record waits unread", "detail": {"cursors": [{"cursor": "c/svc1/x"}]}}'
+    on_lag = client.subscriptions[lag_topic]
+    on_lag(_LagMessage(lag_topic, finding))
+    assert svc.cursor_lag == "1 record waits unread"
+
+    # Retired while the link was down: on a new session no tombstone comes.
+    svc._on_connect(client, None, _Flags(session_present), _FakeReasonCode())
+
+    # A kept session delivers the queued tombstone itself; a new one starts clean.
+    assert svc.cursor_lag == ("1 record waits unread" if session_present else "")
+    assert svc.cursor_lag_cursors == (("c/svc1/x",) if session_present else ())
+    # A finding that still stands is redelivered on the restored subscription.
+    on_lag(_LagMessage(lag_topic, finding))
+    assert svc.cursor_lag == "1 record waits unread"
+
+
+class _LagMessage:
+    def __init__(self, topic: str, payload: bytes) -> None:
+        self.topic = topic
+        self.payload = payload
+
+
 # -- NotEnrolled / enroll_hint / wait_enrolled -------------------------------
 
 

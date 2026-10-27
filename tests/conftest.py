@@ -79,7 +79,7 @@ def health_doors(monkeypatch):
 
     async def serve_noted(state, port=health.PORT_DEFAULT):
         server = await serve(state, port=port)
-        doors.dataops.append(server.sockets[0].getsockname()[1])
+        doors.dataops.append(server.port)
         return server
 
     def start_noted(port, is_healthy, *, reason=None):

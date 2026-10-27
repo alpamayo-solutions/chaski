@@ -22,8 +22,9 @@ producer runtime.
   declares them into the service's own catalogue, which is published as a
   ``_DataTags`` record like a connector's; annotations are ``_Annotation``
   records.
-* **A code change replays**: :func:`replay_changed_producers`, keyed by
-  :func:`~chaski.dataops.codehash.compute_code_hash`.
+* **A code change replays**: a ``replay`` job of the backfill runner, keyed
+  by :func:`~chaski.dataops.codehash.compute_code_hash`
+  (:mod:`chaski.dataops.backfill`, "Replay").
 * **History older than the stream is backfilled**: a producer that declares
   ``backfill`` is run once over its horizon from the historian, in windows,
   before its live dispatch starts, or beside it in ``independent`` mode
@@ -50,10 +51,11 @@ Startup order inside :meth:`DataOpsService.serve`:
     its live triggers unless it is ``independent``
     (:mod:`chaski.dataops.backfill`), then build the
     ``signal_id -> [handler]`` dispatch table and the set of input signal ids
- 7. replay every producer whose code hash changed, a new one included: reset
-    its watermark to the earliest buffered point of its inputs and feed the
-    buffered records through the live handlers. Unchanged producers are left
-    alone. A failed replay is retried under :func:`supervise`
+ 7. record a replay of every producer whose code hash changed, a new one
+    included, and hold its live triggers: the backfill runner feeds the
+    buffered records through the live handlers in windows, beside startup,
+    and hands over at the live edge. Unchanged producers get their
+    checkpoint back
  8. retire the ingest cursors of earlier buffer generations (a lost or
     deleted buffer starts a new generation; nothing reads its old cursor)
  9. start the ingest task, and resolve again whenever the live index changes
@@ -66,8 +68,8 @@ Startup order inside :meth:`DataOpsService.serve`:
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 
-The replay of step 7 and every background task of steps 9 to 11 run under
-:func:`supervise`: a task
+Every background task of steps 9 to 11, the backfill runner with the
+replays of step 7 included, runs under :func:`supervise`: a task
 that raises is logged at once, counted in ``handler_health`` (degraded, then
 unhealthy) and restarted with jittered backoff. None dies silently.
 """
@@ -94,18 +96,19 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
-from chaski.door import Door, Record, Stream
+from chaski.door import Door, Gap, Record, Stream
 from chaski.failures import HandlerHealth, Reject
 from chaski.outage import Outage, expected_failure, warn_failure
+from chaski.publishing import PublishBatch
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
-from . import codehash, commands, health, resolve, watch
-from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
+from . import commands, health, resolve, watch
+from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import Producer, Runtime, event_time, restore_checkpoint, save_checkpoint, state_copy
+from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy, turn
 from .buffer import Buffer
-from .ingest import Ingest, consumer_name, cursor_name
+from .ingest import Ingest, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import record_rejection
@@ -129,6 +132,33 @@ INDEX_SETTLE_S = 0.5
 #: doubling per consecutive failure up to :data:`WAKE_RETRY_MAX_S`.
 INDEX_RETRY_S = 1.0
 _METRIC_FIELDS = {f.name for f in fields(Metric)}
+#: The retained finding that names input records pruned before they were read.
+GAP_FINDING = "stream_gap"
+#: The verb, below the service's own path, of the command accepting their loss.
+ACCEPT_GAP = "acceptGap"
+ACCEPT_GAP_CONTRACT = "_CmdMaintain"
+#: The cursor its executor reads the commands stream with.
+ACCEPT_GAP_CURSOR = "accept-gap"
+#: A gap's repair covers this much more on either side of what the node
+#: stored in it: event times differ from storage times.
+GAP_MARGIN_S = 3600.0
+
+
+def _iso_span(span: tuple[float, float]) -> str:
+    from datetime import UTC, datetime
+
+    start, end = (datetime.fromtimestamp(ts, UTC).isoformat(timespec="seconds") for ts in span)
+    return f"{start} to {end}"
+
+
+def _gap_detail(gap: Gap) -> dict[str, Any]:
+    return {
+        "from_offset": gap.from_offset,
+        "to_offset": gap.to_offset,
+        "first_ts": gap.first_ts,
+        "last_ts": gap.last_ts,
+        "approx": gap.approx,
+    }
 
 
 # ─── discovery ──────────────────────────────────────────────────────────────
@@ -234,10 +264,19 @@ def off_loop(method):
         health = getattr(instance._runtime, "handler_health", None)
         try:
             with instance._lock:
+                batch = PublishBatch()
                 try:
-                    asyncio.run(method())
+                    asyncio.run(_in_batch(batch, method))
                 except Reject as rejected:
+                    batch.settle()
                     record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        batch.settle()
+                    raise
+                else:
+                    # A tick ends when the node confirmed what it published.
+                    batch.settle()
         except Exception as exc:
             # The next tick runs the method again. An expected failure (Colca
             # away) is logged here without a traceback; anything else is
@@ -252,6 +291,12 @@ def off_loop(method):
         outage.recovered()
 
     return job
+
+
+async def _in_batch(batch: PublishBatch, method: Callable[[], Awaitable[Any]]) -> Any:
+    """Run ``method()`` with its writes pipelined into ``batch``."""
+    with batch.active():
+        return await method()
 
 
 def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
@@ -597,36 +642,51 @@ def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -
 def make_handler(method):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
-    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`."""
+    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`.
+
+    Within an ingest page (:class:`~chaski.dataops.base.PageCheckpoints`) a
+    checkpointed producer's state is kept and saved once per page; outside
+    one, around every record."""
 
     async def _handler(record: Record) -> None:
         if record.offset >= 0 and _held(method.__self__):
             return  # buffered; its backfill handles it before live dispatch resumes
         metric = decode_metric(record)
         instance = method.__self__
-        with instance._lock, event_time(float(metric.timestamp)):
-            checkpointed = instance.state_version is not None and record.offset >= 0
-            key = method.__name__
-            if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
+        if instance.state_version is not None and record.offset >= 0:
+            page = PageCheckpoints.current()
+            if page is not None:
+                await page.handle(instance, method, metric, record)
                 return
-            previous = state_copy(instance) if checkpointed else None
-            try:
-                await method(metric)
-                if checkpointed:
-                    offsets = dict(instance._handled_offsets)
-                    instance._handled_offsets[key] = record.offset
-                    try:
-                        save_checkpoint(instance)
-                    except BaseException:
-                        instance._handled_offsets = offsets
-                        raise
-            except BaseException:
-                if checkpointed:
-                    instance.restore_state(previous)
-                raise
+        async with turn(instance):
+            await _handle_one(instance, method, metric, record)
 
     _handler.consumer = f"{method.__self__.name}.{method.__name__}"
     return _handler
+
+
+async def _handle_one(instance: Producer, method: Any, metric: Metric, record: Record) -> None:
+    """One ``@on_metric`` call outside an ingest page, its checkpoint after it."""
+    with event_time(float(metric.timestamp)):
+        checkpointed = instance.state_version is not None and record.offset >= 0
+        key = method.__name__
+        if checkpointed and record.offset <= instance._handled_offsets.get(key, -1):
+            return
+        previous = state_copy(instance) if checkpointed else None
+        try:
+            await method(metric)
+            if checkpointed:
+                offsets = dict(instance._handled_offsets)
+                instance._handled_offsets[key] = record.offset
+                try:
+                    save_checkpoint(instance)
+                except BaseException:
+                    instance._handled_offsets = offsets
+                    raise
+        except BaseException:
+            if checkpointed:
+                instance.restore_state(previous)
+            raise
 
 
 def _held(instance: Producer) -> bool:
@@ -665,96 +725,6 @@ def synthetic_record(signal_id: str, ts: float, value: Any, *, actor: str = "rep
         actor_label="",
         actor_kind=actor,
     )
-
-
-# ─── hash-triggered replay ────────────────────────────────────────────────
-
-
-async def replay_changed_producers(runtime: Runtime, instances: list[Producer]) -> None:
-    """Replay every producer whose code hash changed, a new producer included.
-
-    Its watermark is reset to the earliest buffered point of its inputs, and
-    every buffered record for its ``@on_metric`` signals goes, in timestamp
-    order, through the same handlers live traffic uses. Replayed publishes
-    overwrite like live ones. A producer with an unchanged hash is skipped, so
-    a replay happens once per change; a tick-only producer only gets its
-    watermark reset.
-
-    A handler that raises :class:`chaski.Reject` has the record recorded as
-    rejected (the runtime's ``reject``), as live ingest does, and the replay
-    goes on. Any other failure stops recovery: the producer's watermark and
-    code hash are not marked complete, a checkpointed producer's state is put
-    back, and the exception propagates, so the caller retries the replay.
-    Handlers must make repeated effects idempotent. A producer whose first
-    backfill is still running is skipped; the backfill covers the buffer.
-    """
-    # One KV read for the whole sweep; the per-producer passes below reuse it.
-    with resolve.one_pass(runtime.door):
-        await _replay_each(runtime, instances)
-
-
-async def _replay_each(runtime: Runtime, instances: list[Producer]) -> None:
-    buffer = runtime.buffer
-    for instance in instances:
-        if _held(instance):
-            continue  # its first backfill covers the buffer too
-        cls = type(instance)
-        new_hash = codehash.compute_code_hash(cls)
-        old_hash = buffer.code_hash(instance.name)
-        restored = restore_checkpoint(instance)
-        if old_hash == new_hash and (instance.state_version is None or restored):
-            continue
-
-        mini_dispatch, mini_signal_ids, _ = build_dispatch(runtime, [instance])
-        earliest = _earliest_across(buffer, mini_signal_ids)
-        now = time.time()
-        start = earliest if earliest is not None else now
-
-        log.info(
-            "%s: code hash changed (%s -> %s) — replaying buffered window [%.3f, %.3f)",
-            instance.name,
-            (old_hash or "none")[:12],
-            new_hash[:12],
-            start,
-            now,
-        )
-
-        rows: list[tuple[float, str, Any]] = []
-        for signal_id in mini_signal_ids:
-            rows.extend((ts, signal_id, value) for ts, value in buffer.points(signal_id, start, now))
-        rows.sort(key=lambda r: r[0])
-
-        previous = state_copy(instance) if instance.state_version is not None else None
-        try:
-            for ts, signal_id, value in rows:
-                record = synthetic_record(signal_id, ts, value)
-                for handler in mini_dispatch.get(signal_id, []):
-                    try:
-                        await handler(record)
-                    except Reject as rejected:
-                        subject = {"replay": instance.name, "signal_id": signal_id, "ts": ts}
-                        await asyncio.to_thread(record_rejection, runtime, consumer_name(handler), subject, rejected)
-        except BaseException:
-            if previous is not None:
-                instance.restore_state(previous)
-            raise
-
-        final_position = rows[-1][0] if rows else start
-        save_checkpoint(instance)
-        buffer.set_watermark(instance.name, final_position, new_hash)
-        log.info(
-            "%s: replay complete (%d record(s)) — watermark=%.3f",
-            instance.name,
-            len(rows),
-            final_position,
-        )
-
-
-def _earliest_across(buffer: Buffer, signal_ids: Iterable[str]) -> float | None:
-    """``MIN`` of :meth:`Buffer.earliest` across several signals, or
-    ``None`` when none of them holds anything yet."""
-    values = [e for e in (buffer.earliest(sid) for sid in signal_ids) if e is not None]
-    return min(values) if values else None
 
 
 # ─── MQTT dispatch ──────────────────────────────────────────────────────────
@@ -864,6 +834,11 @@ class DataOpsService(Service):
         self._commands: commands.CommandExecutor | None = None
         self.instances: list[Producer] = []
         self._definition_cache: resolve.LiveIndex | None = None
+        #: The gap the ingest waits at for an operator's acceptance, if any.
+        self._pending_gap: Gap | None = None
+        self._gap_executor: commands.CommandExecutor | None = None
+        self._gap_task: asyncio.Future | None = None
+        self._stop: asyncio.Event | None = None
 
     def _after_connect(self) -> None:
         super()._after_connect()
@@ -985,11 +960,129 @@ class DataOpsService(Service):
         return record_backfill_request(self.buffer, producer_cls, start, end, window=window)
 
     def _backfill_finding_topic(self) -> str:
-        from colca_data_contracts import topic_prefix
-
         from .backfill import FINDING
 
-        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{FINDING}"
+        return self._finding_topic(FINDING)
+
+    # -- input records the stream pruned before they were read -------------
+
+    def _finding_topic(self, reason: str) -> str:
+        from colca_data_contracts import topic_prefix
+
+        return f"{topic_prefix()}_Finding/{self._node_id}/{'/'.join(self._hierarchy)}/{reason}"
+
+    @property
+    def accept_gap_path(self) -> str:
+        """The node-local path of this service's accept-gap command (``_CmdMaintain``)."""
+        return "/".join((*self._hierarchy, ACCEPT_GAP))
+
+    def _on_gap(self, gap: Gap, survivors: list[Record]) -> bool:
+        """The ingest reached input records the stream pruned before it read
+        them; in its worker thread. Whether it may go on past them.
+
+        With a historian every producer reading inputs gets a repair backfill
+        over the gap's time range (a job named after the gap, recorded once),
+        and the ingest goes on; the ``stream_gap`` finding stands until the
+        repairs are done. Without one the loss is the operator's to accept:
+        the finding says how (a ``_CmdMaintain`` at :attr:`accept_gap_path`),
+        and the ingest waits until the acceptance is recorded."""
+        span = self._gap_span(gap, survivors)
+        pruned = f"offsets {gap.from_offset}..{gap.to_offset} of the metrics stream ({_iso_span(span)})"
+        if self._historian is not None:
+            job = f"{GAP_REPAIR}{gap.from_offset}-{gap.to_offset}"
+            producers = [i.name for i in self.instances if any(True for _ in declared_inputs(i))]
+            runner = self._backfill
+            for name in producers:
+                if runner is not None:
+                    runner.request(name, span[0], span[1], job_id=job)
+                else:
+                    record_backfill_request(self.buffer, self._producers[name], span[0], span[1], job=job)
+            self._publish_gap_finding(
+                f"{pruned} were pruned before this service read them; repaired from the historian ({job})",
+                "warning",
+                "None needed: the finding is retired when the repair backfills are done.",
+                {"gap": _gap_detail(gap), "repair": job, "producers": producers},
+            )
+            log.warning("Input records were pruned before they were read: %s; repair backfill %s recorded", pruned, job)
+            self._pending_gap = None
+            return True
+        if self.buffer.accepted_gap() >= gap.to_offset:
+            log.warning("Going on past %s: the loss was accepted", pruned)
+            self._pending_gap = None
+            self._retract_gap_finding()
+            return True
+        if self._pending_gap != gap:
+            self._pending_gap = gap
+            route = (ACCEPT_GAP_CONTRACT, self.accept_gap_path)
+            if route not in self._announced_commands:
+                try:
+                    self.announce_commands([*self._announced_commands, route])
+                except Exception as exc:
+                    warn_failure(log, exc, "Could not announce the accept-gap command")
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._accept_gaps)
+            self._publish_gap_finding(
+                f"{pruned} were pruned before this service read them, and there is no historian to repair them "
+                "from; its ingest waits",
+                "error",
+                f"Accept the loss with a _CmdMaintain command at {self.accept_gap_path}; the ingest then goes on.",
+                {"gap": _gap_detail(gap), "accept": {"contract": "_CmdMaintain", "path": self.accept_gap_path}},
+            )
+        return False
+
+    def _gap_span(self, gap: Gap, survivors: list[Record]) -> tuple[float, float]:
+        """The event-time range a gap may have held, generously: the node's
+        storage times with :data:`GAP_MARGIN_S` on each side."""
+        first = gap.first_ts / 1000.0 if gap.first_ts is not None else None
+        last = gap.last_ts / 1000.0 if gap.last_ts is not None else None
+        after = min((Ingest._timestamp_of(r) for r in survivors), default=None)
+        end = (last if last is not None else after if after is not None else time.time()) + GAP_MARGIN_S
+        start = (first if first is not None else end - self.retention_s) - GAP_MARGIN_S
+        return start, end
+
+    def _publish_gap_finding(self, summary: str, severity: str, remedy: str, detail: dict[str, Any]) -> None:
+        import json
+
+        payload = {
+            "reason": GAP_FINDING,
+            "summary": summary[:300],
+            "observed_at": time.time(),
+            "suggested_severity": severity,
+            "detail": detail,
+            "remedy": remedy,
+        }
+        try:
+            self.send(self._finding_topic(GAP_FINDING), json.dumps(payload), retain=True)
+        except Exception as exc:
+            warn_failure(log, exc, "Could not publish the stream_gap finding")
+
+    def _retract_gap_finding(self) -> None:
+        try:
+            self.retract(self._finding_topic(GAP_FINDING))
+        except Exception as exc:
+            warn_failure(log, exc, "Could not retire the stream_gap finding")
+
+    def _gap_repaired(self) -> None:
+        """A gap repair finished; retire the finding once none is pending."""
+        if not any(job["job"].startswith(GAP_REPAIR) for job in self.buffer.backfill_jobs(pending_only=True)):
+            self._retract_gap_finding()
+
+    async def _accept_gap(self, command: commands.Command) -> str:
+        """``_CmdMaintain`` at :attr:`accept_gap_path`: accept the loss of the
+        input records the ingest waits at, durably, and let it go on."""
+        gap = self._pending_gap
+        if gap is None:
+            raise commands.CommandRejected(409, "no pruned input records wait for acceptance")
+        await asyncio.to_thread(self.buffer.accept_gap, gap.to_offset)
+        log.warning(
+            "%s accepted the loss of input offsets %d..%d",
+            command.actor_label or command.actor_id,
+            gap.from_offset,
+            gap.to_offset,
+        )
+        if self._ingest is not None:
+            self._ingest.wake()
+        return f"accepted: offsets {gap.from_offset}..{gap.to_offset} are not read; the ingest goes on"
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1196,13 +1289,16 @@ class DataOpsService(Service):
         handlers = commands.gather(instances)
         if not handlers:
             return None
+        return self._executor(handlers, commands.CURSOR)
+
+    def _executor(self, handlers: dict[tuple[str, str], Callable], cursor: str) -> commands.CommandExecutor:
         node_id = cast(str, self._node_id)
         executor = commands.CommandExecutor(
             self.door,
             self.send,
             self.stream(
                 commands.STREAM,
-                cursor=commands.CURSOR,
+                cursor=cursor,
                 contracts=commands.stream_contracts(handlers),
                 topics=commands.stream_topics(handlers, node_id),
             ),
@@ -1215,21 +1311,37 @@ class DataOpsService(Service):
             executor.link_changed(False)
         return executor
 
+    def _accept_gaps(self) -> None:
+        """On the loop, once the ingest first waits at a gap: execute the
+        accept-gap command (announced by :meth:`_on_gap`), on a cursor of its
+        own. Nothing of it runs while no gap waits."""
+        stop = self._stop
+        if self._gap_executor is not None or stop is None or stop.is_set():
+            return
+        route = (ACCEPT_GAP_CONTRACT, self.accept_gap_path)
+        executor = self._executor({route: self._accept_gap}, ACCEPT_GAP_CURSOR)
+        self._gap_executor = executor
+        self._gap_task = asyncio.ensure_future(
+            supervise("accept gap", lambda: executor.run_forever(stop), stop, self.handler_health)
+        )
+
     def _broker_state_changed(self, connected: bool) -> None:
         """Back on the broker: commands and input metrics sent while the link
         was down only rang a bell nobody heard, so drain both once."""
         super()._broker_state_changed(connected)
-        loop, executor = self._loop, self._commands
+        loop = self._loop
         if connected and loop is not None and self._ingest is not None:
             loop.call_soon_threadsafe(self._ingest.wake)
-        if loop is not None and executor is not None:
-            loop.call_soon_threadsafe(executor.link_changed, connected)
+        for executor in (self._commands, self._gap_executor):
+            if loop is not None and executor is not None:
+                loop.call_soon_threadsafe(executor.link_changed, connected)
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Run the service on the current event loop until ``stop`` is set
         — see the module docstring for the startup order. :meth:`run` is
         the blocking wrapper with signal handling."""
         stop = stop or asyncio.Event()
+        self._stop = stop
         loop = asyncio.get_running_loop()
         self._loop = loop
 
@@ -1306,8 +1418,9 @@ class DataOpsService(Service):
             )
 
             # 6) Record and hold the first backfill of every producer that
-            #    declares one, then the on_metric dispatch table and the
-            #    declared input signal ids.
+            #    declares one, and (7) the replay of every producer whose code
+            #    changed; then the on_metric dispatch table and the declared
+            #    input signal ids.
             backfill = BackfillRunner(
                 self,
                 instances,
@@ -1320,12 +1433,7 @@ class DataOpsService(Service):
             health_state.backfill = backfill.status
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
-            # 7) Replay producers whose code changed. A failure is counted in
-            #    handler_health and the replay retried; the health door stays up.
             health_state.handlers = self.handler_health
-            await supervise("replay", lambda: replay_changed_producers(self, instances), stop, self.handler_health)
-            if stop.is_set():
-                return
 
             # 8) Retire the ingest cursors of earlier generations and build
             #    the ingest loop over this service's own consume lane.
@@ -1338,6 +1446,7 @@ class DataOpsService(Service):
                 retry_min_s=self._retry_min_s,
                 health=self.handler_health,
                 reject=self.reject,
+                on_gap=self._on_gap,
             )
             self._ingest = ingest
 
@@ -1346,6 +1455,7 @@ class DataOpsService(Service):
             health_state.last_drain_at = lambda: ingest.last_drain_at
             health_state.stall_after_s = health.STALL_AFTER_MIN_S
             health_state.waiting = lambda: ingest.waiting
+            health_state.gap = lambda: ingest.gap_waiting
             health_state.connected = self.is_broker_connected
             ingest_task: asyncio.Task | None = None
             tasks_health = self.handler_health
@@ -1422,12 +1532,14 @@ class DataOpsService(Service):
                     reresolve_task.cancel()
                 backfill_task.cancel()
                 await asyncio.gather(backfill_task, return_exceptions=True)
-                if commands_task is not None:
+                for name, running in (("Command executor", commands_task), ("Accept-gap executor", self._gap_task)):
+                    if running is None:
+                        continue
                     try:
-                        await asyncio.wait_for(commands_task, timeout=10.0)
+                        await asyncio.wait_for(running, timeout=10.0)
                     except Exception:
-                        log.exception("Command executor did not shut down cleanly")
-                    self._commands = None
+                        log.exception("%s did not shut down cleanly", name)
+                self._commands = self._gap_executor = self._gap_task = None
                 if ingest_task is not None:
                     ingest.wake()
                     try:

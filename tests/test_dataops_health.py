@@ -1,13 +1,14 @@
-"""The health door answers for the running service, from its event loop.
+"""The health door answers for the running service, from its own thread.
 
-Its 200 or 503 follows the ingest task. Being on the loop, it cannot answer at
-all while the loop is blocked; that is not timed here.
+Its 200 or 503 follows the ingest task, and it answers while the event loop
+is busy: a busy loop is degraded, a stalled one unhealthy.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,8 +25,8 @@ def _get(port: int):
         return refused.code, json.loads(refused.read())
 
 
-def _port(server: asyncio.AbstractServer) -> int:
-    return server.sockets[0].getsockname()[1]
+def _port(server) -> int:
+    return server.port
 
 
 def run_async(fn):
@@ -78,6 +79,70 @@ async def test_a_dead_ingest_loop_turns_the_probe_503():
         status, body = await asyncio.to_thread(_get, port)
         assert status == 200, body
         assert body["ingest"] == "not-started"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _probe_while_blocked(port: int, block_s: float, probe_after_s: float):
+    """Block the calling (event-loop) thread for ``block_s`` while another
+    thread probes once after ``probe_after_s``; the probe's answer and how
+    long it took."""
+    answer: dict = {}
+
+    def probe() -> None:
+        time.sleep(probe_after_s)
+        started = time.monotonic()
+        answer["status"], answer["body"] = _get(port)
+        answer["took_s"] = time.monotonic() - started
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    time.sleep(block_s)  # the loop busy: a handler waiting on a lock, a long write
+    prober.join()
+    return answer
+
+
+@run_async
+async def test_a_busy_event_loop_is_answered_at_once_as_degraded():
+    """Catching up a backlog keeps the loop busy for seconds; the probe is
+    answered from the door's own thread, and says so instead of timing out."""
+    state = HealthState(loop_busy_s=0.3, stall_after_s=30.0)
+    state.ingest_task = asyncio.ensure_future(asyncio.sleep(30))
+    server = await serve(state, port=0)
+    port = _port(server)
+    try:
+        await asyncio.sleep(0.05)  # the first beat
+        status, body = await asyncio.to_thread(_get, port)
+        assert (status, body["loop"], body["status"]) == (200, "ok", "ok"), body
+
+        answer = _probe_while_blocked(port, block_s=1.5, probe_after_s=0.8)
+        assert answer["took_s"] < 0.5, answer
+        assert answer["status"] == 200, answer
+        body = answer["body"]
+        assert body["loop"] == "busy" and body["status"] == "degraded", body
+        assert any("event loop busy" in reason for reason in body["degraded"]), body
+        assert body["loop_late_s"] >= 0.3
+    finally:
+        state.ingest_task.cancel()
+        server.close()
+        await server.wait_closed()
+
+
+@run_async
+async def test_an_event_loop_stalled_past_the_bound_turns_the_probe_503():
+    state = HealthState(loop_busy_s=0.2, stall_after_s=0.6)
+    server = await serve(state, port=0)
+    port = _port(server)
+    try:
+        await asyncio.sleep(0.05)
+        answer = _probe_while_blocked(port, block_s=1.4, probe_after_s=1.0)
+        assert answer["status"] == 503, answer
+        assert answer["body"]["loop"] == "stalled" and answer["body"]["status"] == "unhealthy", answer
+
+        await asyncio.sleep(0.6)  # the loop beats again
+        status, body = await asyncio.to_thread(_get, port)
+        assert (status, body["loop"]) == (200, "ok"), body
     finally:
         server.close()
         await server.wait_closed()

@@ -1,22 +1,34 @@
-"""A DataOps service's health door: an HTTP server on the event loop, port 8888.
+"""A DataOps service's health door: an HTTP server on port 8888.
 
-It runs on the service's own event loop on purpose. The loop schedules every
-producer tick and ingest drain, so a loop that answers in time is what the
-container wants to know, and a blocked loop fails the probe. Blocking work runs
-off the loop (see ``Ingest.run_once`` and ``service.off_loop``).
+It answers from its own thread, never from the event loop. The loop runs every
+``@on_metric`` handler, record by record, so while the ingest lane catches up
+a long backlog it is busy for seconds at a time (a handler that waits for its
+producer's lock behind a long tick, one that writes its checkpoint). A door on
+the loop could not answer then, and the container's probe (4 s) read a
+service that was working through its backlog as one that was dead.
 
-Standard library only: HTTP/1.1 with ``Connection: close`` and one route,
-``/healthz``.
+Whether the loop moves is still the door's question, asked without needing
+the loop to answer it: a beat on the loop (:func:`serve` starts it) stamps
+the time every ``LOOP_BEAT_S``. A loop late by ``loop_busy_s`` is busy, which
+the body reports as ``degraded`` (200; it is catching up); one that has not
+beaten for ``stall_after_s`` is stalled (503), as an ingest that finished no
+drain for that long is.
+
+Standard library only: HTTP/1.1 with ``Connection: close``; every path
+answers like ``/healthz``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from chaski.failures import UNHEALTHY, HandlerHealth
 
@@ -28,6 +40,10 @@ STALL_AFTER_MIN_S = 300.0
 #: How long the broker may be away before the probe fails: paho reconnects
 #: within seconds of a node restart, so this is a reconnect that never comes.
 BROKER_GRACE_S = 60.0
+#: How often the beat on the event loop stamps the time.
+LOOP_BEAT_S = 0.5
+#: A beat this late means the loop is busy: degraded, not failed.
+LOOP_BUSY_S = 2.0
 
 
 @dataclass
@@ -47,7 +63,9 @@ class HealthState:
     watched record arrives. An ingest that is busy, not waiting, and has not
     finished a drain for ``stall_after_s`` is stalled. So does
     another process running as this service (``identity_conflict``): the
-    broker hands their one session back and forth and wake-ups get lost.
+    broker hands their one session back and forth and wake-ups get lost. So
+    does an ingest waiting at input records the stream pruned before it read
+    them (``stream_gap``), until an operator accepts their loss.
 
     ``handlers`` counts failing handlers: while one is retried the answer
     says ``degraded`` and names it; once one failed ``unhealthy_after`` times
@@ -64,13 +82,18 @@ class HealthState:
     cursor, so it adds nothing to ``cursor_lag``, which stays the lag of live
     intake. One that fails is counted in ``handlers`` like any task.
 
+    ``loop`` says whether the event loop moves (see the module docstring):
+    ``ok``, ``busy`` (late by ``loop_busy_s``: degraded, with ``loop_late_s``)
+    or ``stalled`` (no beat for ``stall_after_s``: unhealthy). Before the beat
+    has started it is ``ok``.
+
     ``status`` sums the answer up in one word:
 
     * ``starting``: startup is not done (503);
     * ``unhealthy``: any of the failures above (503);
-    * ``degraded``: a handler is being retried, or a running backfill finished
-      no window for its ``stall_after`` bound; ``degraded`` lists why (200,
-      since live intake goes on);
+    * ``degraded``: a handler is being retried, the event loop is busy, or a
+      running backfill finished no window for its ``stall_after`` bound;
+      ``degraded`` lists why (200, since live intake goes on);
     * ``backfilling``: a first backfill holds the producer's live triggers on
       purpose until it reaches the live edge (200; the ingest goes on
       buffering, so its cursor does not lag);
@@ -97,9 +120,16 @@ class HealthState:
     handlers: HandlerHealth | None = None
     #: What startup waits for while not ``ready``.
     not_ready: Callable[[], str] | None = None
+    #: Why the ingest waits at input records pruned before it read them, "" while it does not.
+    gap: Callable[[], str] | None = None
     #: The running backfill and how many are pending, ``{}`` while none is.
     backfill: Callable[[], dict] | None = None
+    #: Monotonic time of the last beat on the event loop, None before the first.
+    loop_beat_at: float | None = None
+    loop_busy_s: float = LOOP_BUSY_S
     _broker_down_since: float | None = field(default=None, repr=False)
+    #: The door answers from a thread per request; _broker() keeps state.
+    _answer_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _ingest(self) -> str:
         if not self.ready:
@@ -131,11 +161,27 @@ class HealthState:
             self._broker_down_since = now
         return "reconnecting" if now - self._broker_down_since < self.broker_grace_s else "down"
 
+    def _loop_late(self) -> float:
+        if self.loop_beat_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.loop_beat_at)
+
+    def _loop(self) -> str:
+        late = self._loop_late()
+        if late > self.stall_after_s:
+            return "stalled"
+        if late > self.loop_busy_s:
+            return "busy"
+        return "ok"
+
     def _lag(self) -> str:
         return self.cursor_lag() if self.cursor_lag is not None else ""
 
     def _conflict(self) -> str:
         return self.identity_conflict() if self.identity_conflict is not None else ""
+
+    def _gap(self) -> str:
+        return self.gap() if self.gap is not None else ""
 
     def _handlers(self) -> str:
         return self.handlers.status if self.handlers is not None else "ok"
@@ -144,13 +190,17 @@ class HealthState:
         return (
             self._ingest() in ("not-started", "running")
             and self._broker() != "down"
+            and self._loop() != "stalled"
             and not self._lag()
             and not self._conflict()
+            and not self._gap()
             and self._handlers() != UNHEALTHY
         )
 
-    def _degraded(self, backfill: dict) -> list[str]:
+    def _degraded(self, backfill: dict, loop: str) -> list[str]:
         reasons: list[str] = []
+        if loop == "busy":
+            reasons.append(f"event loop busy for {self._loop_late():.0f} s (catching up)")
         if self.handlers is not None:
             reasons.extend(
                 f"{name} failed {f.failures}x, retried" for name, f in sorted(self.handlers.failing().items())
@@ -166,15 +216,20 @@ class HealthState:
         lag = self._lag()
         conflict = self._conflict()
         handlers = self._handlers()
+        loop = self._loop()
+        gap = self._gap()
         body = {
             "ok": ingest in ("not-started", "running")
             and broker != "down"
+            and loop != "stalled"
             and not lag
             and not conflict
+            and not gap
             and handlers != UNHEALTHY,
             "ingest": ingest,
             "broker": broker,
             "handlers": handlers,
+            "loop": loop,
             "producers": self.producers,
             "generation": self.generation,
             "uptime_s": round(time.time() - self.started_at, 1),
@@ -183,10 +238,12 @@ class HealthState:
             body["not_ready"] = self.not_ready()
         if self.ingest_task is not None and self.last_drain_at is not None:
             body["since_drain_s"] = round(self._since_drain(), 1)
+        if loop != "ok":
+            body["loop_late_s"] = round(self._loop_late(), 1)
         backfill = self.backfill() if self.backfill is not None else {}
         if backfill:
             body["backfill"] = backfill
-        degraded = self._degraded(backfill) if body["ok"] else []
+        degraded = self._degraded(backfill, loop) if body["ok"] else []
         if not self.ready:
             body["status"] = "starting"
         elif not body["ok"]:
@@ -202,6 +259,8 @@ class HealthState:
             body["cursor_lag"] = lag
         if conflict:
             body["identity_conflict"] = conflict
+        if gap:
+            body["stream_gap"] = gap
         if self.handlers is not None and handlers != "ok":
             body["failing"] = {
                 name: {"failures": f.failures, "error": f.error, "since": round(f.since, 3)}
@@ -209,29 +268,70 @@ class HealthState:
             }
         return body
 
+    def answer(self) -> tuple[bool, dict]:
+        """Whether the service is healthy, and the body that says so: one
+        consistent answer per request, whichever thread asks."""
+        with self._answer_lock:
+            body = self.snapshot()
+            return body["ok"], body
 
-async def serve(state: HealthState, port: int = PORT_DEFAULT) -> asyncio.AbstractServer:
-    """Start the health server on the running loop and return it."""
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            await reader.read(2048)  # one small request; the path does not matter
-            body = json.dumps(state.snapshot()).encode()
-            status = b"200 OK" if state.healthy() else b"503 Service Unavailable"
-            writer.write(
-                b"HTTP/1.1 " + status + b"\r\n"
-                b"Content-Type: application/json\r\n"
-                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                b"Connection: close\r\n\r\n" + body
-            )
-            await writer.drain()
-        except Exception:
-            log.debug("health request failed", exc_info=True)
-        finally:
-            writer.close()
+class HealthDoor:
+    """The running health door: its thread-served HTTP server and the beat on
+    the event loop. :meth:`close` stops both."""
 
+    def __init__(self, server: ThreadingHTTPServer, beat: asyncio.Task) -> None:
+        self._server = server
+        self._beat = beat
+
+    @property
+    def port(self) -> int:
+        return self._server.server_address[1]
+
+    def close(self) -> None:
+        self._beat.cancel()
+        self._server.shutdown()
+        self._server.server_close()
+
+    async def wait_closed(self) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._beat
+
+
+async def _beat(state: HealthState) -> None:
+    while True:
+        state.loop_beat_at = time.monotonic()
+        await asyncio.sleep(LOOP_BEAT_S)
+
+
+def _handler(state: HealthState) -> type[BaseHTTPRequestHandler]:
+    class HealthHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            healthy, body = state.answer()
+            payload = json.dumps(body).encode()
+            self.send_response(200 if healthy else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+    return HealthHandler
+
+
+async def serve(state: HealthState, port: int = PORT_DEFAULT) -> HealthDoor:
+    """Start the health door: the HTTP server on its own thread, and the beat
+    on the running loop that tells it whether the loop moves."""
+    beat = asyncio.ensure_future(_beat(state))
     # Binding all interfaces is the point: the probe (and an operator's
     # curl) reach a container-internal door; nothing publishes 8888.
-    server = await asyncio.start_server(handle, "0.0.0.0", port)  # noqa: S104 # nosec B104
-    log.info("Health server on :%d (served from the event loop on purpose)", port)
-    return server
+    server = ThreadingHTTPServer(("0.0.0.0", port), _handler(state))  # noqa: S104 # nosec B104
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True, name="dataops-health").start()
+    log.info("Health server on :%d (served off the event loop)", server.server_address[1])
+    return HealthDoor(server, beat)

@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("chaski.dataops.buffer")
 
+#: Rows :meth:`Buffer.trim` deletes per statement, and per hold of the lock.
+TRIM_CHUNK = 5000
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS producer_checkpoints (
     producer TEXT PRIMARY KEY, code_hash TEXT NOT NULL,
@@ -185,9 +188,12 @@ class Buffer:
                 )
             ]
 
-    def output_sent(self, source, timestamp):
+    def outputs_sent(self, source: str, timestamps: list[float]) -> None:
+        """Drop the queued samples of ``source`` the node confirmed, in one commit."""
         with self._lock, self._conn:
-            self._conn.execute("DELETE FROM pending_outputs WHERE source=? AND ts=?", (source, timestamp))
+            self._conn.executemany(
+                "DELETE FROM pending_outputs WHERE source=? AND ts=?", [(source, ts) for ts in timestamps]
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -211,6 +217,23 @@ class Buffer:
             self._conn.commit()
             log.info("Minted new buffer generation %s at %s", generation, self._path)
             return generation
+
+    def accepted_gap(self) -> int:
+        """The stream offset through which an operator accepted lost input
+        records (:meth:`accept_gap`), 0 when none was accepted."""
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'accepted_gap_through'").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def accept_gap(self, through_offset: int) -> None:
+        """Record, durably, that the input records pruned up to
+        ``through_offset`` are accepted as lost."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('accepted_gap_through', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(max(through_offset, self.accepted_gap())),),
+            )
 
     # ------------------------------------------------------------------ points
 
@@ -277,12 +300,15 @@ class Buffer:
                     self._conn.commit()
 
     def append_many(self, points: list[tuple[str, float, Any]]) -> None:
-        """Commit adjacent input-only records together, before any handler runs."""
+        """:meth:`append` for several points in one statement: committed at
+        once, or at the end of the enclosing :meth:`one_commit`."""
         values = [(signal, ts, json.dumps(value)) for signal, ts, value in points]
         if not values:
             return
-        with self._lock, self._conn:
+        with self._lock:
             self._conn.executemany("INSERT OR REPLACE INTO points (signal_id, ts, value) VALUES (?, ?, ?)", values)
+            if not self._deferred:
+                self._conn.commit()
 
     def window(self, signal_id: str, start: float, end: float) -> pd.DataFrame:
         """Points for ``signal_id`` with ``start <= ts < end``, ordered by ts.
@@ -326,13 +352,21 @@ class Buffer:
             row = self._conn.execute("SELECT MIN(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
+    def next_point(self, signal_id: str, at: float) -> float | None:
+        """The oldest ``ts >= at`` for ``signal_id``, or ``None``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts) FROM points WHERE signal_id = ? AND ts >= ?", (signal_id, at)
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def latest(self, signal_id: str) -> float | None:
         """``MAX(ts)`` for ``signal_id``, or ``None`` if the buffer holds nothing for it."""
         with self._lock:
             row = self._conn.execute("SELECT MAX(ts) FROM points WHERE signal_id = ?", (signal_id,)).fetchone()
         return row[0] if row and row[0] is not None else None
 
-    def trim(self, horizons: dict[str, float], *, now: float | None = None) -> int:
+    def trim(self, horizons: dict[str, float], *, now: float | None = None, chunk: int = TRIM_CHUNK) -> int:
         """Trim history while retaining the value in force at each window start.
 
         Keep the newest point before the cutoff as an anchor for latest-value
@@ -340,19 +374,34 @@ class Buffer:
         Only signals present as keys in ``horizons`` are touched — a
         signal absent from the dict keeps every point it has. Never
         touches ``watermarks`` or ``meta``. Returns the total rows deleted.
+
+        Deletes at most ``chunk`` rows per statement and takes the buffer's
+        lock per statement, so the ingest appending a page meanwhile waits for
+        one chunk at most, not for the whole trim.
         """
         now = time.time() if now is None else now
         deleted = 0
-        with self._lock:
-            for signal_id, horizon in horizons.items():
-                cutoff = now - horizon
-                cur = self._conn.execute(
-                    "DELETE FROM points WHERE signal_id = ? AND ts < "
-                    "(SELECT MAX(ts) FROM points WHERE signal_id = ? AND ts < ?)",
-                    (signal_id, signal_id, cutoff),
-                )
+        for signal_id, horizon in horizons.items():
+            cutoff = now - horizon
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MAX(ts) FROM points WHERE signal_id = ? AND ts < ?", (signal_id, cutoff)
+                ).fetchone()
+            anchor = row[0] if row is not None else None
+            if anchor is None:
+                continue
+            while True:
+                with self._lock:
+                    cur = self._conn.execute(
+                        "DELETE FROM points WHERE rowid IN "
+                        "(SELECT rowid FROM points WHERE signal_id = ? AND ts < ? LIMIT ?)",
+                        (signal_id, anchor, chunk),
+                    )
+                    if not self._deferred:
+                        self._conn.commit()
                 deleted += cur.rowcount
-            self._conn.commit()
+                if cur.rowcount < chunk:
+                    break
         return deleted
 
     # ------------------------------------------------------------------ watermarks
@@ -395,7 +444,9 @@ class Buffer:
                 "INSERT OR REPLACE INTO emitted_annotations (source, annotation_id, time_start) VALUES (?, ?, ?)",
                 (source, annotation_id, time_start),
             )
-            self._conn.commit()
+            # Inside an ingest page, with the page's commit.
+            if not self._deferred:
+                self._conn.commit()
 
     def emitted_annotations_in_window(self, source: str, start: float, end: float) -> list[tuple[str, float]]:
         """``(annotation_id, time_start)`` pairs ``source`` itself recorded
@@ -450,6 +501,16 @@ class Buffer:
                 (producer, job, start, end, start, code_hash, created_at, window),
             )
             return cur.rowcount > 0
+
+    def restart_backfill(self, producer: str, job: str, start: float, code_hash: str, *, created_at: float) -> None:
+        """Record ``job`` anew from ``start``, ending at the live edge: a
+        replay that starts over, whatever it was before."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                'INSERT OR REPLACE INTO backfill_jobs (producer, job, start, "end", position, windows, code_hash, '
+                "done, created_at, window_s) VALUES (?, ?, ?, NULL, ?, 0, ?, 0, ?, NULL)",
+                (producer, job, start, start, code_hash, created_at),
+            )
 
     def set_backfill_end(self, producer: str, job: str, end: float) -> None:
         """Fix the end of a job that had none: a first backfill that no longer

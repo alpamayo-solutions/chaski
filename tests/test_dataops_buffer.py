@@ -243,6 +243,81 @@ def test_trim_does_not_touch_watermarks_or_meta(buffer):
     assert buffer.generation == generation_before
 
 
+class _Holds:
+    """The buffer's lock, counting each outermost hold."""
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+        self.depth = 0
+        self.hold = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.depth += 1
+        if self.depth == 1:
+            self.hold += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.depth -= 1
+        self._lock.release()
+
+
+class _Statements:
+    """The buffer's connection, noting which hold of the lock ran each statement."""
+
+    def __init__(self, conn, holds: _Holds) -> None:
+        self._conn = conn
+        self._holds = holds
+        self.deletes: list[tuple[int, str]] = []
+
+    def execute(self, sql, params=()):
+        if sql.startswith("DELETE FROM points"):
+            self.deletes.append((self._holds.hold, params[0]))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_trim_holds_the_lock_for_one_chunk_of_one_signal_at_a_time(buffer):
+    """An ingest page appends under the same lock; a trim of many rows across
+    many signals must let it in between chunks, not after the whole trim."""
+    for signal in ("sig-1", "sig-2", "sig-3"):
+        buffer.append_many([(signal, float(ts), ts) for ts in range(25)])
+    holds = _Holds(buffer._lock)
+    statements = _Statements(buffer._conn, holds)
+    buffer._lock, buffer._conn = holds, statements
+
+    deleted = buffer.trim({"sig-1": 10.0, "sig-2": 10.0, "sig-3": 10.0}, now=35.0, chunk=10)
+
+    # The cutoff is 25; the newest point before it (24) stays as the anchor.
+    assert deleted == 3 * 24
+    assert [ts for ts, _ in buffer.points("sig-2", 0.0, 100.0)] == [24.0]
+    per_hold = {}
+    for hold, signal in statements.deletes:
+        per_hold.setdefault(hold, []).append(signal)
+    assert all(len(signals) == 1 for signals in per_hold.values()), per_hold
+    assert len(statements.deletes) == 3 * 3  # 10 + 10 + 4 rows per signal
+
+
+def test_append_many_inside_one_commit_is_committed_at_the_blocks_end(db_path):
+    import sqlite3
+
+    buffer = Buffer(db_path)
+    other = sqlite3.connect(str(db_path))
+    try:
+        with buffer.one_commit():
+            buffer.append_many([("sig-1", 1.0, 1.0), ("sig-1", 2.0, 2.0)])
+            assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 0
+        assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 2
+        buffer.append_many([("sig-1", 3.0, 3.0)])
+        assert other.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 3
+    finally:
+        other.close()
+        buffer.close()
+
+
 def test_one_commit_writes_the_block_at_its_end_and_reads_see_it_before(db_path):
     import sqlite3
 

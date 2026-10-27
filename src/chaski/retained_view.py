@@ -175,6 +175,9 @@ class RetainedView:
         #: stayed readable; None while it succeeds.
         self._failing_since: float | None = None
         self.revision = 0
+        #: ``(revision, entries)`` as of the last drain, swapped in whole and
+        #: never changed after: what readers copy, without the drain's lock.
+        self._published: tuple[int, dict[str, KvEntry]] | None = None
         self.changes = Wakeup()
         # Rung whenever a stream position moves, also without a state change
         # (records outside the scope still advance the cursor).
@@ -286,14 +289,21 @@ class RetainedView:
         batching or backoff. Use synchronize once at a causal boundary when a
         committed upstream effect must be visible before processing input.
         """
-        with self.lock:
-            if not self.initialized:
-                return self.synchronize()
-            if self._failing_since is not None and time.monotonic() - self._failing_since >= STALE_GRACE_S:
-                self._unavailable()
-            if not self.available:
-                raise ColcaUnavailable("Retained view unavailable; waiting for subscription recovery")
-            return self.revision, copy.deepcopy(list(self.entries.values()))
+        published = self._published
+        if published is None or not self.initialized:
+            with self.lock:
+                if not self.initialized:
+                    return self.synchronize()
+                published = self._published
+        failing_since = self._failing_since
+        if failing_since is not None and time.monotonic() - failing_since >= STALE_GRACE_S:
+            self._unavailable()
+        if not self.available or published is None:
+            raise ColcaUnavailable("Retained view unavailable; waiting for subscription recovery")
+        # The drain swaps in a new map and never changes a published one, so
+        # this copy needs no lock: a reader never waits for a drain's HTTP.
+        revision, entries = published
+        return revision, copy.deepcopy(list(entries.values()))
 
     def synchronize(self):
         """Drain through the current durable heads before returning state."""
@@ -425,7 +435,12 @@ class RetainedView:
                         if self.on_change is not None:
                             self.on_change()
                     self._stream_versions.update(versions)
-                    return (self.revision, copy.deepcopy(list(self.entries.values()))) if copy_result else None
+                    published = self._published
+                    if published is None or published[0] != self.revision:
+                        # Entries are replaced, never changed in place: a
+                        # shallow copy of the map is the drain's own no more.
+                        published = self._published = (self.revision, dict(self.entries))
+                    return (published[0], copy.deepcopy(list(published[1].values()))) if copy_result else None
             raise ColcaUnavailable("Retained view could not catch up; refusing stale state")
 
     def _refresh_changed(self, *, unhinted=False):
