@@ -12,9 +12,14 @@ The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name, and so its position, stays.
 
-**Crash safety.** Per page: append and run handlers, then ack. A crash before
+**Crash safety.** Per page: append and run handlers, save the checkpoints of
+the producers that keep one (once per page), commit, then ack. A crash before
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
+
+**One page, one hop.** The worker thread hands a page with handlers to the
+service's loop once; there each record is appended, then handled, in stream
+order (:meth:`Ingest._dispatch_page`).
 
 **A failed handler is not acknowledged.** The cursor moves only past the
 records before it, and :meth:`Ingest.run_forever` retries the same record
@@ -74,6 +79,7 @@ from chaski.failures import HandlerHealth, Reject, record_subject
 from chaski.outage import Outage
 from chaski.retry import Backoff
 
+from .base import PageCheckpoints, RewindFailed
 from .buffer import Buffer
 
 log = logging.getLogger("chaski.dataops.ingest")
@@ -242,14 +248,41 @@ class Ingest:
             raise StreamGapError(f"input stream has a retention gap: {page.gap}")
 
         self._failed = None
+        records = page.records
         # One commit per page: the page is acked only after it, and a crash
         # before the ack appends the page again.
         with self.page_lock, self._buffer.one_commit():
-            for record in page.records:
-                signal_id = self._append(record)
-                if signal_id is not None and self._dispatch.get(signal_id):
-                    asyncio.run_coroutine_threadsafe(self._handle(signal_id, record), loop).result()
-        return len(page.records)
+            if any(self._dispatch.get(self._signal_id_of(record) or "") for record in records):
+                # One hop to the loop per page, not per record.
+                asyncio.run_coroutine_threadsafe(self._dispatch_page(records), loop).result()
+            else:
+                for record in records:
+                    self._append(record)
+        return len(records)
+
+    async def _dispatch_page(self, records: list[Record]) -> None:
+        """Append and dispatch ``records`` in order, on the service's loop.
+
+        A record is appended right before its handlers run, so a handler sees
+        no later record of the page. Checkpointed producers save their state
+        once, when the page ends (:class:`~chaski.dataops.base.PageCheckpoints`),
+        still inside the page's commit and before its ack.
+        """
+        page = PageCheckpoints()
+        try:
+            with page.active():
+                for record in records:
+                    signal_id = self._append(record)
+                    if signal_id is not None and self._dispatch.get(signal_id):
+                        await self._handle(signal_id, record)
+        finally:
+            # A checkpoint that could not be saved puts its producer back to
+            # its first record of the page; the page is acked only before it.
+            late = page.failed
+            if late is not None and (self._failed is None or late.record.offset < self._failed[1].offset):
+                self._failed = (late.consumer, late.record)
+        if page.failed is not None:
+            raise page.failed
 
     # ------------------------------------------------------------------ read-ahead
 
@@ -378,6 +411,10 @@ class Ingest:
                         **record_subject(record),
                     }
                     await asyncio.to_thread(self._record_rejection, name, subject, rejected)
+            except RewindFailed as exc:
+                # The producer went back to its first record of the page.
+                self._failed = (exc.consumer, exc.record)
+                raise
             except Exception:
                 self._failed = (name, record)
                 raise

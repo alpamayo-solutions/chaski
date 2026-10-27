@@ -103,7 +103,7 @@ from chaski.service import Service
 from . import codehash, commands, health, resolve, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import Producer, Runtime, event_time, restore_checkpoint, save_checkpoint, state_copy
+from .base import PageCheckpoints, Producer, Runtime, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, consumer_name, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
@@ -597,13 +597,22 @@ def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -
 def make_handler(method):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
-    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`."""
+    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`.
+
+    Within an ingest page (:class:`~chaski.dataops.base.PageCheckpoints`) a
+    checkpointed producer's state is kept and saved once per page; outside
+    one, around every record."""
 
     async def _handler(record: Record) -> None:
         if record.offset >= 0 and _held(method.__self__):
             return  # buffered; its backfill handles it before live dispatch resumes
         metric = decode_metric(record)
         instance = method.__self__
+        if instance.state_version is not None and record.offset >= 0:
+            page = PageCheckpoints.current()
+            if page is not None:
+                await page.handle(instance, method, metric, record)
+                return
         with instance._lock, event_time(float(metric.timestamp)):
             checkpointed = instance.state_version is not None and record.offset >= 0
             key = method.__name__
