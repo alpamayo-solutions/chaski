@@ -732,9 +732,15 @@ def test_the_heartbeat_keeps_its_schedule_while_a_read_hangs(node, driver, monke
         driver.read = hanging_read
         polling = asyncio.ensure_future(svc._poll_iteration())
         beating = asyncio.ensure_future(svc._heartbeat_forever())
-        for _ in range(3):
-            await asyncio.sleep(0.06)
+        # Wait for the effect (two heartbeats while the read hangs) with a deadline,
+        # not for a fixed number of wall-clock sleeps: on a busy runner three 60 ms
+        # sleeps against a 50 ms interval saw one beat (CI 3.13, 2026-10-30).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
             clock.now += svc.heartbeat_interval
+            if [m.signal_id for _t, m in node.metrics()].count("s-hb") >= 2:
+                break
         hung = [m.signal_id for _t, m in node.metrics()]
         assert not polling.done(), "the read is still hanging"
         released.set()
