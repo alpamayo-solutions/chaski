@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/alpamayo-solutions/chaski/compare/v0.26.12...v0.27.0) (2026-10-31)
+
+
+### Features
+
+* **connector:** measure how far a source's clock is off ([#190](https://github.com/alpamayo-solutions/chaski/issues/190)) ([ac025d2](https://github.com/alpamayo-solutions/chaski/commit/ac025d23d7f0b6182f6005e89ea1d0ac32abe57e))
+
 ## [0.26.12](https://github.com/alpamayo-solutions/chaski/compare/v0.26.11...v0.26.12) (2026-10-30)
 
 
