@@ -83,6 +83,17 @@ signal: ``write.apply(value=...)``), or to add to the answer: return a
 :class:`~chaski.executor.CommandResult`, or raise
 :class:`~chaski.executor.CommandRejected`, with more ``result`` fields.
 
+**Source clock.** With ``timestamp_source="source"`` the loop compares each
+source timestamp with the node's wall clock when the read returned and keeps
+a bounded 15-minute estimate of how far the source's clock is off
+(:mod:`chaski.source_clock`: the delay rule, the window, the limits). Only a
+driver that declares ``source_timestamps = "live"`` is measured; a reading
+without a timestamp is still written at the poll's time and counts as
+``unstamped``. Each poll reports the estimate to
+:meth:`Telemetry.source_clock`; :meth:`ConnectorService.source_clock_status`
+reads it. With ``timestamp_source="acquisition"`` nothing is measured or
+reported: the source's clock writes nothing, so its error does not matter.
+
 **Not included.** Metrics exposition: the loop reports to a
 :class:`Telemetry`, a no-op by default. Configuration from the
 environment: the process that builds a connector reads its own.
@@ -116,6 +127,7 @@ from .executor import Command, CommandExecutor, CommandRejected, CommandResult, 
 from .failures import Reject
 from .outage import Outage, expected_failure
 from .service import Service
+from .source_clock import SourceClock, SourceClockStatus
 from .telemetry import ServiceTelemetry
 
 # Synthetic tags have stable source keys; the catalogue mints and reuses their
@@ -229,6 +241,13 @@ class Driver:
     #: (S7, Modbus) set False, so their tags can be bound before the machine is
     #: connected.
     catalogue_requires_connection: bool = True
+    #: What a :class:`Reading`'s timestamp means, for the source-clock
+    #: estimate (:mod:`chaski.source_clock`). ``"live"``: the source's clock
+    #: when it observed the value (MTConnect, a PLC's own stamp), measured.
+    #: ``"past"``: the time the data refers to, delivered later (energy
+    #: slots, batches, backfill), never measured. Unused with
+    #: ``timestamp_source="acquisition"``.
+    source_timestamps: Literal["live", "past"] = "past"
 
     def __init__(self, *, logger: logging.Logger | None = None) -> None:
         self.logger = logger or logging.getLogger(f"{__name__}.{type(self).__name__}")
@@ -311,6 +330,12 @@ class Telemetry(ServiceTelemetry):
         name one), or it was ``non_finite`` or had a ``non_finite_timestamp``."""
 
     def poll_completed(self, duration_s: float, *, overrun: bool) -> None: ...
+
+    def source_clock(self, status: SourceClockStatus) -> None:
+        """The source clock over the last 15 minutes, after every poll, only
+        with ``timestamp_source="source"``. ``status.skew_s`` and
+        ``jitter_s`` are None while there is no estimate: export no value
+        for them then (absent, not 0). Never called in ``acquisition`` mode."""
 
 
 def is_equal(a: Any, b: Any, precision: int | None) -> bool:
@@ -500,6 +525,11 @@ class ConnectorService(Service):
         if timestamp_source not in ("acquisition", "source"):
             raise ValueError("timestamp_source must be acquisition or source")
         self.timestamp_source = timestamp_source
+        if driver.source_timestamps not in ("live", "past"):
+            raise ValueError("Driver.source_timestamps must be live or past")
+        self._source_clock = (
+            SourceClock(live=driver.source_timestamps == "live") if timestamp_source == "source" else None
+        )
         self.interval = float(interval)
         self.heartbeat_interval = float(heartbeat_interval)
         if integrity_interval <= 0:
@@ -522,6 +552,7 @@ class ConnectorService(Service):
         # The loop's clocks, as attributes so a test can drive time and skip
         # backoffs without patching the interpreter's own modules.
         self._now: Callable[[], float] = time.monotonic
+        self._wall: Callable[[], float] = time.time
         self._sleep: Callable[[float], Any] = asyncio.sleep
 
         # Per-tag read handles from the last discovery, keyed by tag id once
@@ -944,7 +975,7 @@ class ConnectorService(Service):
         self._polling_since = self._now()
         backlog = False
         # One wall-clock time for every sample of this acquisition cycle.
-        cycle_timestamp = time.time()
+        cycle_timestamp = self._wall()
         try:
             if not self._discovered and self._now() >= self._next_discovery_retry:
                 await self._retry_discovery()
@@ -964,6 +995,7 @@ class ConnectorService(Service):
             protocol_targets = [t for t in targets if t.signal.data_tag not in synthetic]
 
             raw_batch: list[tuple[Topic, Any, SignalRecord] | Reading] = []
+            received_at = cycle_timestamp
             # Re-raised after publishing what was read, for the reconnect path.
             source_lost: SourceDisconnectedError | None = None
             if protocol_targets:
@@ -989,6 +1021,7 @@ class ConnectorService(Service):
                 try:
                     async with self._source_lock:
                         raw_batch = list(await self._read(protocol_targets))
+                    received_at = self._wall()
                     # The authoritative health signal: the protocol
                     # channel demonstrably answered. connect() succeeding
                     # is not — some clients background the TCP setup.
@@ -1011,6 +1044,8 @@ class ConnectorService(Service):
                     value = round_to_precision(value, precision)
                 key = str(topic)
                 timestamp = cycle_timestamp
+                if self._source_clock is not None:
+                    self._source_clock.observe(key, source_timestamp, received_at)
                 if self.timestamp_source == "source" and source_timestamp is not None:
                     if not isfinite(source_timestamp):
                         self._set_aside(
@@ -1049,6 +1084,10 @@ class ConnectorService(Service):
                 self._latest_by_topic[key] = metric
                 self._published_at[key] = self._now()
                 batch.append((topic, metric))
+
+            if self._source_clock is not None:
+                self._source_clock.forget({str(t.topic) for t in protocol_targets})
+                self.telemetry.source_clock(self._source_clock.status(self._wall()))
 
             backlog = await asyncio.to_thread(self._publish_batch, batch)
             self._summary_polls += 1
@@ -1406,6 +1445,14 @@ class ConnectorService(Service):
         """The signals whose samples are being refused, keyed by signal id
         (or topic, for a sample without one)."""
         return dict(self._refusal_spells)
+
+    def source_clock_status(self) -> SourceClockStatus | None:
+        """How far the source's clock is off over the last 15 minutes
+        (:mod:`chaski.source_clock`); None with ``timestamp_source="acquisition"``.
+        Call it from the loop's thread."""
+        if self._source_clock is None:
+            return None
+        return self._source_clock.status(self._wall())
 
     def close(self) -> None:
         super().close()

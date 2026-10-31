@@ -765,7 +765,52 @@ published.
 chaski stamps samples with the host's wall clock (`time.time()`); keep the host
 on NTP. A `Reading` can carry the source's own timestamp instead
 (`timestamp_source="source"`). Every sample of one connector poll shares the
-time taken at the top of the poll.
+time taken at the top of the poll. Under `source`, a reading without a timestamp
+is written at that time too.
+
+#### Source clock
+
+Under `timestamp_source="source"` the source's clock writes the samples, so a
+PLC two seconds ahead puts every sample two seconds into the future. The
+connector measures that clock. For every reading with a source timestamp it
+takes `skew = source_ts - received_at`, where `received_at` is the node's wall
+clock when the driver's read returned, and keeps a 15-minute window in
+one-minute buckets (fixed memory, no thread, no I/O).
+
+- **Delay is not skew.** A late reading has a lower skew, never a higher one
+  (`skew = offset - delay`, `delay >= 0`). Each minute keeps its *largest*
+  skew, the reading that arrived with the least delay. Over the minutes with a
+  measurement the highest and the lowest are dropped; `skew_s` is the largest
+  of the rest and `jitter_s` the spread of the rest (largest minus smallest).
+  Both need 3 minutes with a measurement, and are `None` until then.
+- **Only new observations count.** A repeated timestamp is a steady value
+  (MTConnect reports a value with the time it last changed), so a reading
+  counts only when its timestamp differs from the topic's previous one.
+- **Only live timestamps count.** A driver opts in with
+  `Driver.source_timestamps = "live"`: its timestamps are the source's clock at
+  the moment it saw the value. The default, `"past"`, is for timestamps that
+  name the time the data refers to and arrive later (energy slots, batches,
+  backfill); such a driver is never measured, since every reading is late.
+- **Readings without a timestamp** are written at the poll's time, as before,
+  and only counted (`unstamped`). A source that stamps none has no estimate.
+- **Implausible timestamps** are counted (`invalid`) and kept out: before
+  2000-01-01 (an unset PLC clock), more than a day ahead, or new and more than
+  a day behind.
+
+After every poll the connector calls `Telemetry.source_clock(status)` with a
+`chaski.SourceClockStatus`: `skew_s`, `jitter_s` (seconds, positive when the
+source is ahead), `stamped`, `unstamped`, `invalid`, `measured`, `minutes`,
+`live`. `ConnectorService.source_clock_status()` returns the same. Export no
+value while `skew_s` is `None`: absent, not 0. With
+`timestamp_source="acquisition"` nothing is measured, the hook is never called
+and the accessor returns `None`; the source's clock writes nothing there.
+
+The estimate can only be too low, never too high: a source whose readings all
+arrive late reads behind by its smallest delay. A source that changes several
+times per poll interval is measured to milliseconds; one that changes about
+once a minute reads up to one poll interval behind; one that does not change
+for minutes is not measured. An error of the node's own clock shifts the
+estimate by the same amount.
 
 In DataOps, `self.now` (and an input's `now`) is the event's time while a
 callback handles it: the sample's timestamp in an `@on_metric` handler, the due
