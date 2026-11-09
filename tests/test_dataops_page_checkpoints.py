@@ -12,10 +12,13 @@ the next start restores the state of the last page.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dataops_fakes import FakeDoor, FakeRuntime, run_async, signal_entry, stream_opener
 
 from chaski import Reject
@@ -23,7 +26,7 @@ from chaski.dataops.base import Producer, RewindFailed, restore_checkpoint
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.ingest import Ingest
 from chaski.dataops.inputs import SignalRangeInput
-from chaski.dataops.service import build_dispatch, off_loop
+from chaski.dataops.service import build_dispatch, off_loop, schedule_periodic, use_tick_threads
 from chaski.dataops.triggers import every, on_metric
 from chaski.door import Page, Record
 
@@ -56,6 +59,9 @@ class Counter(Producer):
         #: Holds the next ``b`` record until set; ``started`` says it is held.
         self.gate: asyncio.Event | None = None
         self.started = threading.Event()
+        #: The next ``b`` record hops to a worker thread and back, as a page
+        #: does to confirm its writes.
+        self.off_loop_step = False
 
     def snapshot_state(self):
         return {"seen": self.seen, "total": self.total}
@@ -68,6 +74,8 @@ class Counter(Producer):
         if name == "b" and self.gate is not None:
             self.started.set()
             await self.gate.wait()
+        if name == "b" and self.off_loop_step:
+            await asyncio.to_thread(lambda: None)
         self.calls += 1
         self.seen.append([name, metric.value])
         self.total += metric.value
@@ -289,6 +297,50 @@ async def test_a_tick_waits_for_the_page_so_a_rewind_keeps_what_it_did(world):
         await drain
     await ticking
     assert world.producer.seen == [["a", 1], ["b", 2], ["tick", 0]]
+
+
+@run_async
+async def test_ticks_waiting_for_the_page_leave_the_loop_threads_free(world):
+    """The stall on the chocolate plant edge (2026-11-05 and again after the
+    restart on 2026-11-08): the scheduler ran every tick on the loop's
+    default thread pool. Ticks of the producers a page held waited there for
+    their lock until the pool was full; the page then waited for a thread to
+    confirm its writes, the ticks for the page, and ingest, backfill and every
+    tick stopped for good. Ticks run on threads of their own now."""
+    threads = ThreadPoolExecutor(max_workers=2)  # the page's own thread and one more
+    asyncio.get_running_loop().set_default_executor(threads)
+    world.producer.gate = asyncio.Event()
+    world.producer.off_loop_step = True
+    world.door.queue(_page(1, _rename([("a", 1), ("b", 2)])))
+    page = asyncio.ensure_future(world.ingest.run_once())
+    while not world.producer.started.is_set():
+        await asyncio.sleep(0.001)
+    scheduler = AsyncIOScheduler()
+    schedule_periodic(scheduler, world.producer)
+    use_tick_threads(scheduler)
+    scheduler.start()
+    try:
+        for job in scheduler.get_jobs():
+            job.modify(next_run_time=datetime.datetime.now(datetime.UTC))
+        # The tick is due and waits for the producer the page holds.
+        await asyncio.sleep(0.2)
+        assert world.producer.seen == [["a", 1]]
+        world.producer.gate.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(page), 5)
+        except TimeoutError:
+            # One more thread lets the stuck page end, so the test fails instead of hanging.
+            threads._max_workers += 1
+            threads._adjust_thread_count()
+            await page
+            pytest.fail("the page waited for a thread that ticks waiting for the page held")
+        for _ in range(500):
+            if len(world.producer.seen) == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert world.producer.seen == [["a", 1], ["b", 2], ["tick", 0]]
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 @run_async

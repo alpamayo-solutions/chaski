@@ -91,6 +91,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -245,8 +246,9 @@ def off_loop(method):
 
     Tick bodies are synchronous (sqlite reads, HTTP publishes) and would block
     every timer if they ran on the loop. As a plain function APScheduler runs
-    the job in its thread pool, where this drives the coroutine on a private
-    loop; ``max_instances=1`` keeps a slow tick from overlapping itself.
+    the job on the tick threads (:func:`use_tick_threads`), where this drives
+    the coroutine on a private loop; ``max_instances=1`` keeps a slow tick
+    from overlapping itself.
 
     The tick holds the producer's lock, because the producer's ``@on_metric``
     and ``@on_constant`` handlers run on the event loop meanwhile (see
@@ -297,6 +299,25 @@ async def _in_batch(batch: PublishBatch, method: Callable[[], Awaitable[Any]]) -
     """Run ``method()`` with its writes pipelined into ``batch``."""
     with batch.active():
         return await method()
+
+
+def use_tick_threads(scheduler: AsyncIOScheduler) -> None:
+    """Run the scheduler's jobs on a thread pool of their own, one thread per
+    job. Call it after the last ``add_job`` and before ``start``.
+
+    APScheduler's asyncio executor runs a plain function on the loop's default
+    thread pool, the one ``asyncio.to_thread`` uses. A tick of a producer that
+    an ingest page holds waits there for the producer's lock
+    (:func:`off_loop`). Enough of them fill that pool, and the page, which
+    hops to it to confirm its writes, never ends: ingest, backfill and every
+    tick stop for good. On their own pool, ticks waiting for a page hold no
+    thread the page needs. With a thread per job (``max_instances=1`` each), a
+    tick waiting for a busy producer never delays another producer's tick.
+    """
+    workers = max(1, len(scheduler.get_jobs()))
+    scheduler.add_executor(
+        ThreadPoolExecutor(max_workers=workers, pool_kwargs={"thread_name_prefix": "dataops-tick"}), "default"
+    )
 
 
 def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
@@ -1518,6 +1539,7 @@ class DataOpsService(Service):
                 max_instances=1,
                 misfire_grace_time=60,
             )
+            use_tick_threads(scheduler)
             scheduler.start()
             log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
 
