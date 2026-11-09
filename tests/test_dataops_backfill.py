@@ -678,13 +678,14 @@ async def test_an_independent_backfill_leaves_live_dispatch_running_and_ends_at_
     assert not buffer.backfill_job("closer", INITIAL)["windows"], "the replay ran before the history"
 
     # Live records are dispatched while the history runs. The status can still
-    # show the finished replay (it held live dispatch) until the history's
-    # first window reports, so wait for the history job itself.
+    # show the finished replay until the history's first window reports: once
+    # handed over, it no longer holds live dispatch and ends at the live edge.
+    # So wait for the history job itself.
     live = make_handler(instance.on_state)
 
     def history_running() -> bool:
         running = runner.status().get("running") or {}
-        return running.get("holds_live") is False and running.get("windows", 0) >= 3
+        return running.get("job") == INITIAL and running.get("holds_live") is False and running.get("windows", 0) >= 3
 
     while not history_running():
         assert not task.done(), task
