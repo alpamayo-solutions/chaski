@@ -131,7 +131,7 @@ from chaski.failures import Reject
 from chaski.outage import warn_failure
 from chaski.publishing import PublishBatch
 
-from . import codehash
+from . import codehash, ticks
 from .base import Producer, checkpoint_row, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .ingest import consumer_name
 from .inputs import SignalRangeInput, declared_inputs, fetch_many
@@ -555,6 +555,8 @@ class BackfillRunner:
         cls = type(live)
         initial = job_id == INITIAL
         replay = job_id == REPLAY
+        # A catch-up of missed ticks runs only the one tick it names.
+        catch_up = _caught_up_tick(job_id)
         # A first backfill that holds live dispatch, and a replay, run on the
         # live instance up to the live edge; every other job on its own
         # instance up to its end.
@@ -600,6 +602,13 @@ class BackfillRunner:
                     # A replay runs what the live handlers would have; ticks
                     # run live from the watermark it leaves.
                     plan.ticks = []
+                if catch_up is not None:
+                    plan.metrics = []
+                    plan.ticks = [(m, spec) for m, spec in plan.ticks if m == catch_up]
+                    # Its ticks read windows that end in the past: the ingest
+                    # has to have caught up with the stream first.
+                    if not await self._caught_up(plan, stop):
+                        continue
                 if (self._service.historian is None or replay) and plan.signal_ids:
                     # Without a historian the buffer is all there is, and a
                     # replay reads only the buffer: skip to its first point,
@@ -633,6 +642,9 @@ class BackfillRunner:
                 if position >= end:
                     await asyncio.to_thread(self._buffer.finish_backfill, name, job_id)
                     log.info("%s: backfill %s done (%d window(s))", name, job_id, windows)
+                    missed = getattr(self._service, "missed_ticks", None)
+                    if catch_up is not None and missed is not None:
+                        await asyncio.to_thread(missed.refresh)
                     repaired = getattr(self._service, "_gap_repaired", None)
                     if job_id.startswith(GAP_REPAIR) and repaired is not None:
                         await asyncio.to_thread(repaired)
@@ -762,6 +774,11 @@ class BackfillRunner:
             _count, row = await self._window(instance, plan, job, position, end)
             await asyncio.to_thread(self._commit, row, job, end, windows + 1, done=True)
             await asyncio.to_thread(self._buffer.set_watermark, instance.name, edge, code_hash)
+            # The ticks held meanwhile ran here up to the edge (a replay's not
+            # at all, by design): live ticks go on from there, none missed.
+            for method_name, _spec in type(instance)._triggers:
+                if isinstance(_spec, CronSpec | IntervalSpec):
+                    await asyncio.to_thread(self._buffer.set_tick_progress, instance.name, method_name, edge)
             with self._lock:
                 self._held.discard(instance.name)
             # Done, and no longer holding: reported so until the runner
@@ -809,8 +826,16 @@ class BackfillRunner:
                 _records(rows[signal_id], order, (signal_id, handlers))
                 for order, (signal_id, _declared, handlers) in enumerate(plan.metrics)
             ]
+            catching_up = _caught_up_tick(job["job"]) is not None
             streams.extend(
-                _instants(tick_instants(spec, start, end), order, method_name)
+                _instants(
+                    # A catch-up runs the instants the live tick missed, in its time zone.
+                    [t for t in ticks.instants(spec, math.nextafter(start, -math.inf), end) if t < end]
+                    if catching_up
+                    else tick_instants(spec, start, end),
+                    order,
+                    method_name,
+                )
                 for order, (method_name, spec) in enumerate(plan.ticks)
             )
             events = heapq.merge(*streams, key=lambda event: event[:3])
@@ -858,15 +883,27 @@ class BackfillRunner:
         self, instance: Producer, job: dict[str, Any], instant: float, method_name: str, batch: PublishBatch
     ) -> None:
         """One tick at its instant: ``self.now`` is ``instant``."""
-        batch.origin = f"{instance.name}.{method_name}"
+        consumer = f"{instance.name}.{method_name}"
+        batch.origin = consumer
         with event_time(instant):
             try:
                 await getattr(instance, method_name)()
             except Reject as rejected:
                 subject = {"backfill": job["job"], "producer": instance.name, "timer": method_name, "due": instant}
-                await asyncio.to_thread(
-                    record_rejection, self._service, f"{instance.name}.{method_name}", subject, rejected
-                )
+                await asyncio.to_thread(record_rejection, self._service, consumer, subject, rejected)
+            except Exception as exc:
+                if _caught_up_tick(job["job"]) is None:
+                    raise
+                # A tick caught up fails like a live one: reported, and the
+                # next instant runs.
+                health = getattr(self._service, "handler_health", None)
+                if health is not None:
+                    health.failed(f"{consumer} (catch-up)", exc)
+                warn_failure(log, exc, f"{consumer} failed at {_iso(instant)} while catching up")
+            else:
+                health = getattr(self._service, "handler_health", None)
+                if health is not None and _caught_up_tick(job["job"]) is not None:
+                    health.succeeded(f"{consumer} (catch-up)")
 
 
 #: A backfill window yields the event loop after this many events.
@@ -971,3 +1008,10 @@ def _async(fn: Any, *args: Any) -> Any:
         return fn(*args)
 
     return call
+
+
+def _caught_up_tick(job_id: str) -> str | None:
+    """The tick a catch-up job (``ticks-<method>-<first instant>``) runs, else ``None``."""
+    if not job_id.startswith(ticks.TICKS):
+        return None
+    return job_id[len(ticks.TICKS) :].rsplit("-", 1)[0]

@@ -828,6 +828,16 @@ A buffer written by chaski 0.25 or older loses the application-time state it
 kept (the `timers` and `pending_inputs` tables, `__clock__:` watermarks) when it
 is opened; nothing else in it changes.
 
+Every `@every`/`@cron` tick records the instant it ran for. Instants a tick
+missed by more than a minute (a stalled producer, a stopped service) are
+reported in the service's retained `missed_ticks` `_Finding` and on the health
+door. A producer that sets `catch_up_ticks = True` has them run later, each at
+its instant (`self.now`), on an instance of its own, once the ingest has
+caught up with the stream. Opt in only when the tick computes from `self.now`
+and its input windows: a tick that publishes at the wall clock or keeps state
+from one tick to the next does the wrong thing for a past instant. Interval
+ticks fire on multiples of their interval since the epoch.
+
 Each producer runs on a worker of its own: one thread with one event loop, on
 which its `setup`, `on_ready`, handlers, ticks, commands and backfill windows
 run one at a time, so a slow or blocking callback holds up only its own

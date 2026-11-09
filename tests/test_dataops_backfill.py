@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import time
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ from chaski.dataops.triggers import CronSpec, IntervalSpec
 from chaski.dataops.worker import ProducerWorker
 from chaski.door import Record
 from chaski.doorbell import Doorbell
+from chaski.failures import HandlerHealth
 
 SIGNAL = "sig-state"
 DAY = 86400.0
@@ -1158,4 +1160,66 @@ async def test_the_status_never_reads_idle_while_a_job_is_pending(tmp_path):
     stop.set()
     await task
     assert idle_with_work == []
+    buffer.close()
+
+
+# ─── catching up missed ticks ─────────────────────────────────────────────
+
+
+@run_async
+async def test_a_tick_catch_up_runs_each_missed_instant_at_its_time_on_an_instance_of_its_own(tmp_path):
+    """Three days missed by a stalled edge (2026-11-05 to 11-09): the catch-up
+    runs every missed instant of the one tick it names, at that instant, over
+    the buffered input, beside the live instance. A failing instant is reported
+    and the next one runs, as live."""
+    now = time.time()
+    start = now - 3 * DAY
+    buffer = Buffer(tmp_path / "buffer.sqlite3")
+    buffer.append_many([(SIGNAL, ts, value) for ts, value in _history(start - 3600.0, 3 * 144 + 6)])
+    instances: list = []
+
+    class Oee(Producer):
+        name = "oee"
+        system_element_name = "press"
+        catch_up_ticks = True
+        state = SignalRangeInput("state", window="1h")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.ran: list[tuple[float, object]] = []
+            instances.append(self)
+
+        @every("1h")
+        async def tick(self) -> None:
+            if len(self.ran) == 5:
+                self.ran.append((self.now, "failed"))
+                raise RuntimeError("one bad instant")
+            self.ran.append((self.now, self.state.latest_value_before(self.now)))
+
+        @every("1m")
+        async def other(self) -> None:
+            raise AssertionError("a catch-up runs only the tick it names")
+
+    service = FakeService(_door(), buffer, None)
+    service._ingest = _Ingest()
+    service.handler_health = HandlerHealth()
+    live = Oee().attach(service)
+    live._worker = ProducerWorker(live.name)
+    runner = BackfillRunner(service, [live], rate=1000.0, busy=1.0)
+    service.runner = runner
+    first = math.ceil(start / 3600.0) * 3600.0
+    job = runner.request("oee", first, now - 600.0, job_id=f"ticks-tick-{int(first)}")
+    await _run_until_done(runner, "oee")
+
+    assert buffer.backfill_job("oee", job)["done"]
+    assert live.ran == []
+    (catching_up,) = (i for i in instances if i is not live)
+    expected = list(range(int(first), int(now - 600.0), 3600))
+    assert [t for t, _v in catching_up.ran] == expected
+    assert all(v is not None for _t, v in catching_up.ran)
+    assert catching_up._worker is not live._worker
+    # The failed instant was reported; the next one ran and cleared it.
+    assert (first + 5 * 3600.0, "failed") in catching_up.ran
+    assert "oee.tick (catch-up)" not in service.handler_health.failing()
+    live._worker.stop()
     buffer.close()

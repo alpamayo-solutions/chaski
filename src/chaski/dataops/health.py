@@ -123,6 +123,8 @@ class HealthState:
     gap: Callable[[], str] | None = None
     #: The running backfill and how many are pending, ``{}`` while none is.
     backfill: Callable[[], dict] | None = None
+    #: Tick instants missed lately (:mod:`chaski.dataops.ticks`), ``[]`` while none were.
+    missed_ticks: Callable[[], list] | None = None
     #: Monotonic time of the last beat on the event loop, None before the first.
     loop_beat_at: float | None = None
     loop_busy_s: float = LOOP_BUSY_S
@@ -242,6 +244,9 @@ class HealthState:
         backfill = self.backfill() if self.backfill is not None else {}
         if backfill:
             body["backfill"] = backfill
+        missed = self.missed_ticks() if self.missed_ticks is not None else []
+        if missed:
+            body["missed_ticks"] = missed
         degraded = self._degraded(backfill, loop) if body["ok"] else []
         if not self.ready:
             body["status"] = "starting"

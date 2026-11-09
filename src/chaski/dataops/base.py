@@ -147,6 +147,12 @@ class Producer(ABC):
     # See chaski.dataops.backfill.
     backfill: ClassVar[Backfill | None] = None
 
+    # Opt in to run the @every/@cron instants missed in a stall or while the
+    # service was down, later, each at its instant (self.now): only for ticks
+    # that compute from self.now and their input windows, never from the wall
+    # clock or from state kept between ticks. See chaski.dataops.ticks.
+    catch_up_ticks: ClassVar[bool] = False
+
     # Opt in for state changed by on_metric handlers. Both hooks are required.
     # Timers/commands with state need their own explicit recovery transaction.
     state_version: ClassVar[int | None] = None

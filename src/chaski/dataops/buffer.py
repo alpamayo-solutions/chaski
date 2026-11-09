@@ -649,14 +649,16 @@ class Buffer:
         )
         return row[0] if row is not None else None
 
-    def set_tick_progress(self, producer: str, tick: str, due: float) -> None:
-        """Record that ``producer``'s tick ``tick`` ran for ``due``; never moves back."""
+    def set_tick_progress(self, producer: str, tick: str, due: float, *, durable: bool = True) -> None:
+        """Record that ``producer``'s tick ``tick`` ran for ``due``; never moves
+        back. ``durable=False``: synced with the next durable write."""
         self._write(
             lambda conn: conn.execute(
                 "INSERT INTO tick_progress (producer, tick, due) VALUES (?, ?, ?) "
                 "ON CONFLICT(producer, tick) DO UPDATE SET due = MAX(due, excluded.due)",
                 (producer, tick, due),
-            )
+            ),
+            durable=durable,
         )
 
     # ------------------------------------------------------------------ annotations

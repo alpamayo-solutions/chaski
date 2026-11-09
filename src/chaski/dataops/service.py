@@ -100,7 +100,6 @@ from typing import Any, cast
 import httpx
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
@@ -111,7 +110,7 @@ from chaski.publishing import PublishBatch
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
-from . import commands, health, resolve, watch
+from . import commands, health, resolve, ticks, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
 from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
@@ -249,7 +248,7 @@ def import_directory(path: Path) -> list[str]:
 # ─── ticks: on the scheduler, off the loop ─────────────────────────────────
 
 
-def off_loop(method):
+def off_loop(method, spec: CronSpec | IntervalSpec | None = None):
     """A producer tick as a job the scheduler runs off the event loop.
 
     APScheduler runs the job on the tick threads (:func:`use_tick_threads`);
@@ -257,6 +256,10 @@ def off_loop(method):
     (:mod:`chaski.dataops.worker`) and waits for it there, so the tick runs
     after whatever the producer is doing, never beside it.
     ``max_instances=1`` keeps a slow tick from overlapping itself.
+
+    With its ``spec``, the tick records the instant it ran for and accounts for
+    the instants it missed (:mod:`chaski.dataops.ticks`), through the
+    runtime's ``missed_ticks``.
     """
 
     instance = method.__self__
@@ -284,7 +287,10 @@ def off_loop(method):
     def job() -> None:
         if _held(instance):
             return  # its backfill runs this tick at its instant
-        health = getattr(instance._runtime, "handler_health", None)
+        runtime = instance._runtime
+        health = getattr(runtime, "handler_health", None)
+        missed: ticks.MissedTicks | None = getattr(runtime, "missed_ticks", None)
+        at = ticks.due(spec, time.time()) if spec is not None else None
         try:
             call_on_worker(instance, tick)
         except Exception as exc:
@@ -293,14 +299,28 @@ def off_loop(method):
             # raised for APScheduler to log with its traceback.
             if health is not None:
                 health.failed(consumer, exc)
+            _ran(missed, instance, method.__name__, spec, at)
             if outage.failed(exc):
                 return
             raise
+        _ran(missed, instance, method.__name__, spec, at)
         if health is not None:
             health.succeeded(consumer)
         outage.recovered()
 
     return job
+
+
+def _ran(
+    missed: ticks.MissedTicks | None, instance: Producer, tick: str, spec: CronSpec | IntervalSpec | None, at: Any
+) -> None:
+    """Record that a live tick ran (or failed) for its instant ``at``."""
+    if missed is None or spec is None or at is None:
+        return
+    try:
+        missed.ran(instance, tick, spec, at)
+    except Exception as exc:
+        warn_failure(log, exc, f"Could not record the progress of {instance.name}.{tick}")
 
 
 async def _in_batch(batch: PublishBatch, method: Callable[[], Awaitable[Any]]) -> Any:
@@ -340,10 +360,10 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
     for method_name, spec in instance.__class__._triggers:
         method = getattr(instance, method_name)
         if isinstance(spec, CronSpec):
-            ap_trigger = CronTrigger.from_crontab(spec.expression)
+            ap_trigger = ticks.live_trigger(spec)
             kind = f"cron({spec.expression!r})"
         elif isinstance(spec, IntervalSpec):
-            ap_trigger = IntervalTrigger(seconds=spec.seconds)
+            ap_trigger = ticks.live_trigger(spec)
             kind = f"every({spec.seconds}s)"
         elif isinstance(spec, OnMetricSpec | OnConstantSpec | OnSignalSpec | OnCommandSpec):
             continue  # each owned and scheduled elsewhere (see docstring)
@@ -353,7 +373,7 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
 
         job_id = f"{instance.name}.{method_name}::{kind}"
         scheduler.add_job(
-            off_loop(method),
+            off_loop(method, spec),
             trigger=ap_trigger,
             id=job_id,
             name=job_id,
@@ -917,6 +937,8 @@ class DataOpsService(Service):
         self._gap_executor: commands.CommandExecutor | None = None
         self._gap_task: asyncio.Future | None = None
         self._stop: asyncio.Event | None = None
+        #: Missed tick instants: reported, and caught up where a producer does.
+        self.missed_ticks: ticks.MissedTicks | None = None
 
     def _after_connect(self) -> None:
         super()._after_connect()
@@ -1020,14 +1042,58 @@ class DataOpsService(Service):
         runner = self._backfill
         return runner is not None and runner.holds(producer)
 
+    def _catch_up_ticks(self, producer: str, start: float, end: float, tick: str) -> str:
+        """Record the catch-up of ``producer``'s tick ``tick`` over ``[start, end)``."""
+        job = f"{ticks.TICKS}{tick}-{int(start)}"
+        runner = self._backfill
+        if runner is not None:
+            return runner.request(producer, start, end, job_id=job)
+        return record_backfill_request(self.buffer, self._producers[producer], start, end, job=job)
+
+    def _publish_finding(self, reason: str, payload: dict[str, Any] | None) -> None:
+        """Publish the retained ``_Finding`` ``reason`` of this service, or retire it (``None``)."""
+        import json
+
+        topic = self._finding_topic(reason)
+        if payload is None:
+            self.retract(topic)
+        else:
+            self.send(topic, json.dumps(payload), retain=True)
+
+    def _account_missed_ticks(self, instances: list[Producer]) -> None:
+        """At start: the tick instants missed while the service was down."""
+        missed = self.missed_ticks
+        if missed is None:
+            return
+        now = time.time()
+        first_held = {
+            job["producer"]
+            for job in self.buffer.backfill_jobs(pending_only=True)
+            if job["job"] == "initial" and job["end"] is None
+        }
+        for instance in instances:
+            if instance.name in first_held:
+                continue  # its first backfill runs its ticks up to the live edge
+            for method_name, spec in type(instance)._triggers:
+                if not isinstance(spec, CronSpec | IntervalSpec):
+                    continue
+                last = self.buffer.tick_progress(instance.name, method_name)
+                if last is None:
+                    continue  # never ran: nothing it could have missed
+                at = ticks.due(spec, now)
+                if at > last:
+                    missed.account(instance, method_name, spec, last, now)
+                    self.buffer.set_tick_progress(instance.name, method_name, at)
+
     def _work_behind(self) -> dict[str, float]:
         """Per producer, how far its oldest pending work on buffered input
         lags behind the wall clock: a backfill or replay that holds its live
-        triggers (:func:`trim_buffer` keeps that much more of its inputs)."""
+        triggers, or ticks it still catches up (:func:`trim_buffer` keeps that
+        much more of its inputs)."""
         now = time.time()
         behind: dict[str, float] = {}
         for job in self.buffer.backfill_jobs(pending_only=True):
-            if job["end"] is None:
+            if job["end"] is None or job["job"].startswith(ticks.TICKS):
                 lag = now - job["position"]
                 behind[job["producer"]] = max(behind.get(job["producer"], 0.0), lag)
         return behind
@@ -1522,6 +1588,11 @@ class DataOpsService(Service):
             )
             await asyncio.to_thread(backfill.plan)
             self._backfill = backfill
+            # Ticks missed while the service was down (chaski.dataops.ticks).
+            self.missed_ticks = ticks.MissedTicks(
+                self.buffer, request=self._catch_up_ticks, publish=self._publish_finding
+            )
+            await asyncio.to_thread(self._account_missed_ticks, instances)
             health_state.backfill = backfill.status
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
@@ -1611,6 +1682,17 @@ class DataOpsService(Service):
                 max_instances=1,
                 misfire_grace_time=60,
             )
+            missed_ticks = self.missed_ticks
+            scheduler.add_job(
+                missed_ticks.refresh,
+                trigger=IntervalTrigger(seconds=60.0),
+                id=f"{self.name}.missed-ticks",
+                name=f"{self.name}.missed-ticks",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            health_state.missed_ticks = missed_ticks.status
             use_tick_threads(scheduler)
             scheduler.start()
             log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
