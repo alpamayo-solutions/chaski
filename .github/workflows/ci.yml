@@ -11,8 +11,8 @@ permissions:
 
 env:
   # The colca chaski is developed against: its data contracts and the broker of
-  # the integration tests. colca 0.44.0: a PAT person's command is authorized where it comes down.
-  COLCA_REF: bf2b55453d6384ff66fd42d684a5fe6a47b70320
+  # the integration tests. colca 0.45.0: a service's private state (_ServiceState).
+  COLCA_REF: e99114ffbb9ea60eeb5a74da73a6ddb3f4b74368
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
