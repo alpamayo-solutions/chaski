@@ -262,8 +262,9 @@ class Producer(ABC):
         here instead of retrying ``publish()`` on the ``RuntimeError`` it
         raises before binding, or racing its own first trigger.
 
-        An exception here is logged and does not stop this producer's
-        triggers from being wired; a producer whose startup compute may fail
+        An exception here is logged, reported as failing on the health door
+        (``<name>.on_ready``), and does not stop the service or this
+        producer's triggers from being wired; a producer whose startup compute may fail
         should catch what it expects to fail and complain through its own
         outputs, the way a trigger handler would.
         """

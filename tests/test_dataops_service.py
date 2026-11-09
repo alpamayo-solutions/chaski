@@ -207,6 +207,51 @@ async def test_definition_push_rebinds_without_idle_scans_and_stops(runtime):
     assert started == [1]
 
 
+@run_async
+async def test_an_input_that_resolves_late_is_handed_over_for_repair(runtime):
+    """The cursor passed the records of an input that resolved only now:
+    nothing would read them again (B5 of the 2026-11-09 review)."""
+    from types import SimpleNamespace
+
+    import chaski.dataops.service as service_module
+    from chaski._wakeup import Wakeup
+
+    changes = Wakeup()
+    runtime.door._dataops_definitions = SimpleNamespace(changes=changes)
+    late: list[list[str]] = []
+    rebound = asyncio.Event()
+    stop = asyncio.Event()
+    calls = []
+
+    def build(*_):
+        calls.append(1)
+        return ({}, ["sig-a"], 1) if len(calls) == 1 else ({"sig-b": ["handler"]}, ["sig-a", "sig-b"], 0)
+
+    def rebind(dispatch, ids):
+        if "sig-b" in ids:
+            rebound.set()
+
+    with patch.object(service_module, "build_dispatch", build):
+        task = asyncio.create_task(
+            service_module.reresolve_loop(
+                runtime,
+                [],
+                SimpleNamespace(rebind=rebind),
+                stop,
+                lambda: None,
+                known=["sig-a"],
+                resolved_late=late.append,
+            )
+        )
+        await asyncio.sleep(0.03)
+        changes.notify()
+        await asyncio.wait_for(rebound.wait(), 1)
+        await asyncio.sleep(0.03)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+    assert late == [["sig-b"]]
+
+
 # ─── trim horizons and the periodic trim ─────────────────────────────────
 #
 # The horizon per signal is the larger of its widest declared window and the
@@ -957,3 +1002,31 @@ def test_dispatch_pass_logs_one_info_summary_and_per_handler_lines_at_debug(runt
     assert per_handler and all(r.levelno == logging.DEBUG for r in per_handler)
     assert len(summaries) == 1 and summaries[0].levelno == logging.INFO
     assert "1 handler(s) on 1 signal(s) for 2 producer(s)" in summaries[0].getMessage()
+
+
+def test_a_producer_reading_a_late_input_gets_a_repair_over_its_window(tmp_path):
+    class Late(Producer):
+        name = "late_reader"
+        system_element_name = "SE"
+        early = SignalRangeInput("early", window="10m")
+        late = SignalRangeInput("late", window="2h")
+
+        @on_metric("late")
+        async def on_late(self, metric) -> None:
+            pass
+
+    from chaski.dataops import DataOpsService
+
+    svc = DataOpsService("dataops", mount="site1", data_dir=tmp_path, historian=object())
+    producer = Late()
+    producer.early._resolved_id = "sig-early"
+    producer.late._resolved_id = "sig-late"
+    svc.instances = [producer]
+    requested = []
+    svc.request_backfill = lambda name, start, end, **kw: requested.append((name, end - start)) or "repair-1"
+    svc._inputs_resolved_late(["sig-late"])
+    assert requested == [("late_reader", pytest.approx(7200.0, abs=1.0))]
+    svc._historian = None
+    requested.clear()
+    svc._inputs_resolved_late(["sig-late"])
+    assert requested == []

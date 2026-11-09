@@ -225,10 +225,10 @@ class Ingest:
         Producers often start before the signals they read are commissioned.
         Only the table and the filter change; the cursor keeps its position.
         Records of a newly resolved signal that the cursor passed while the
-        filter left it out are not read again: nothing recovers them on its
-        own. A producer that needs them repairs the range
-        (:meth:`~chaski.dataops.DataOpsService.request_backfill`, from the
-        historian).
+        filter left it out are not read again here; the service repairs the
+        windows of the producers that read it from the historian, or reports
+        the loss where there is none
+        (:meth:`~chaski.dataops.DataOpsService._inputs_resolved_late`).
         """
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None

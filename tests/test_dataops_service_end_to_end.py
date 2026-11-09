@@ -561,6 +561,54 @@ async def test_on_ready_runs_after_outputs_are_bound_with_no_retry_needed(tmp_pa
     assert ready_metric[1]["value"] is True
 
 
+@run_async
+async def test_a_failing_on_ready_is_reported_and_the_service_runs_on(tmp_path: Path, monkeypatch):
+    """chaski 0.27 stopped the whole service when one producer's on_ready
+    raised. The failure is now reported as failing on the health door, and
+    the producer's triggers run."""
+
+    class BrokenReady(ReadyAndWatched):
+        name = "broken_ready"
+
+        async def on_ready(self) -> None:
+            raise RuntimeError("startup compute failed")
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(BrokenReady)
+    topic = f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint"
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: topic in client.subscriptions)
+        assert "broken_ready.on_ready" in svc.handler_health.failing()
+        assert not task.done()
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+
+@run_async
+async def test_a_module_that_fails_to_import_is_reported_as_failing(tmp_path: Path, monkeypatch):
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    (modules / "broken_module_for_health.py").write_text("raise ImportError('a typo in the producer')\n")
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(ReadyAndWatched)
+    svc.discover_directory(modules)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: "module broken_module_for_health" in svc.handler_health.failing())
+        assert svc.handler_health.status == "degraded"
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+
 # ─── @on_constant / @on_signal: MQTT-driven, no stream involved ────────────
 
 

@@ -215,14 +215,15 @@ def _held_by_own_module(cls: type) -> bool:
     return obj is cls
 
 
-def import_directory(path: Path) -> list[str]:
+def import_directory(path: Path, failed: dict[str, BaseException] | None = None) -> list[str]:
     """Import every top-level ``*.py`` under ``path`` so its ``Producer``
     subclasses register. Returns the imported module names.
 
     The directory goes on ``sys.path`` and each file is imported by its stem,
     so the modules can import each other (``from machine_base import
     MachineBase``). Files starting with ``_`` and subdirectories are skipped.
-    A module that fails to import is logged and skipped.
+    A module that fails to import is logged and skipped, and its error put in
+    ``failed`` under the module's name.
     """
     path = Path(path)
     if not path.is_dir():
@@ -240,8 +241,10 @@ def import_directory(path: Path) -> list[str]:
             importlib.import_module(py.stem)
             log.info("Imported producer module %s", py.stem)
             imported.append(py.stem)
-        except Exception:
+        except Exception as exc:
             log.exception("Producer module %s failed to import — skipping", py.stem)
+            if failed is not None:
+                failed[py.stem] = exc
     return imported
 
 
@@ -589,8 +592,14 @@ async def supervise(
                 return
 
 
-async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> None:
+async def reresolve_loop(
+    runtime, instances, ingest, stop, ensure_running, *, known: Iterable[str] = (), resolved_late=None
+) -> None:
     """Rebind on definition updates, including reconnect and late commissioning.
+
+    The ingest's cursor has passed the records of an input that resolves only
+    now; ``resolved_late(signal_ids)`` is told which inputs did (``known``: the
+    ones read from the start), to repair what they missed.
 
     A pass that fails while the definition view is unavailable (Colca away)
     waits for the view to become available again and retries at once: the
@@ -606,6 +615,7 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
     retry = Backoff()
     outage = Outage(log, "Definition bindings")
     active_dispatch = None
+    read = set(known)
     while not stop.is_set():
         version = cache.changes.version
         try:
@@ -613,6 +623,13 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             if dispatch is not active_dispatch:
                 ingest.rebind(dispatch, signal_ids or [])
                 active_dispatch = dispatch
+                late = [signal_id for signal_id in signal_ids if signal_id not in read]
+                read.update(signal_ids)
+                if late and resolved_late is not None:
+                    try:
+                        await asyncio.to_thread(resolved_late, late)
+                    except Exception as exc:
+                        warn_failure(log, exc, "Could not repair the inputs that resolved late")
                 if signal_ids:
                     ensure_running()
             retry.reset()
@@ -937,6 +954,10 @@ class DataOpsService(Service):
         self._gap_executor: commands.CommandExecutor | None = None
         self._gap_task: asyncio.Future | None = None
         self._stop: asyncio.Event | None = None
+        #: Producer modules that failed to import, and producers that could
+        #: not be built: reported as failing on the health door at start.
+        self._failed_modules: dict[str, BaseException] = {}
+        self._failed_producers: dict[str, BaseException] = {}
         #: Missed tick instants: reported, and caught up where a producer does.
         self.missed_ticks: ticks.MissedTicks | None = None
 
@@ -991,7 +1012,7 @@ class DataOpsService(Service):
         """Import every top-level ``*.py`` under ``path`` (see
         :func:`import_directory`) and run every concrete producer those
         files define. Returns how many were added."""
-        modules = set(import_directory(path))
+        modules = set(import_directory(path, self._failed_modules))
         _claim_producers_built_in(modules)
         return self._adopt(lambda cls: cls.__module__ in modules)
 
@@ -1084,6 +1105,36 @@ class DataOpsService(Service):
                 if at > last:
                     missed.account(instance, method_name, spec, last, now)
                     self.buffer.set_tick_progress(instance.name, method_name, at)
+
+    def _inputs_resolved_late(self, signal_ids: list[str]) -> None:
+        """Inputs resolved after the ingest's cursor passed their records
+        (commissioned late, or bound anew): nothing read them. With a
+        historian, each producer reading one gets a repair over its widest
+        window of them, up to now; without one, the loss is reported."""
+        late = set(signal_ids)
+        now = time.time()
+        reach: dict[str, float] = {}
+        for instance in self.instances:
+            for _attr, declared in declared_inputs(instance):
+                with contextlib.suppress(Exception):  # unresolved: not one of these
+                    if declared.signal_id in late:
+                        reach[instance.name] = max(reach.get(instance.name, 0.0), declared.window_s)
+        if not reach:
+            return
+        if self._historian is None:
+            log.warning(
+                "%d input(s) resolved after the ingest passed their records (%s); without a historian the "
+                "windows of %s fill from now on",
+                len(late),
+                ", ".join(sorted(late)),
+                ", ".join(sorted(reach)),
+            )
+            return
+        for name, window in sorted(reach.items()):
+            job = self.request_backfill(name, now - window, now)
+            log.warning(
+                "%s: inputs resolved late; repairing the last %.0f s from the historian (%s)", name, window, job
+            )
 
     def _work_behind(self) -> dict[str, float]:
         """Per producer, how far its oldest pending work on buffered input
@@ -1273,8 +1324,9 @@ class DataOpsService(Service):
         for cls in self.producers:
             try:
                 instance = cls().attach(self)
-            except Exception:
+            except Exception as exc:
                 log.exception("Producer %s could not be instantiated — skipping", cls.name)
+                self._failed_producers[cls.name] = exc
                 continue
             instances.append(instance)
         return instances
@@ -1513,6 +1565,7 @@ class DataOpsService(Service):
             return f"waiting for {waiting_for[0]}"
 
         health_state = health.HealthState(
+            handlers=self.handler_health,
             ready=False,
             broker_connected=self.is_broker_connected,
             cursor_lag=self._live_cursor_lag,
@@ -1552,6 +1605,12 @@ class DataOpsService(Service):
                 instance._worker = ProducerWorker(instance.name)
                 instances.append(instance)
                 await on_worker(instance, instance.setup)
+            # What could not even start stays visible: failing on the health
+            # door and in the service's status, until it is fixed and restarted.
+            for module, exc in self._failed_modules.items():
+                self.handler_health.failed(f"module {module}", exc)
+            for producer, exc in self._failed_producers.items():
+                self.handler_health.failed(f"producer {producer}", exc)
 
             # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
             #    after opening the live resolution index so the bindings the
@@ -1565,8 +1624,14 @@ class DataOpsService(Service):
             # 4) Outputs are bound and no trigger has fired yet: producers do
             #    startup compute here instead of retrying publish() on the
             #    RuntimeError it raises before binding.
+            # One that fails is reported and does not stop the service: its
+            # triggers are wired like every other producer's.
             for instance in instances:
-                await on_worker(instance, instance.on_ready)
+                try:
+                    await on_worker(instance, instance.on_ready)
+                except Exception as exc:
+                    log.error("%s.on_ready failed; its triggers run anyway", instance.name, exc_info=exc)
+                    self.handler_health.failed(f"{instance.name}.on_ready", exc)
 
             # 5) Refuse windows longer than the broker's retention without a historian.
             validate_windows(
@@ -1645,7 +1710,16 @@ class DataOpsService(Service):
             if unresolved or self._definition_cache is not None:
                 log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
                 reresolve_task = supervised(
-                    "re-resolve", lambda: reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
+                    "re-resolve",
+                    lambda: reresolve_loop(
+                        self,
+                        instances,
+                        ingest,
+                        stop,
+                        _ensure_ingest_running,
+                        known=signal_ids,
+                        resolved_late=self._inputs_resolved_late,
+                    ),
                 )
                 if unresolved:
                     log.info(
