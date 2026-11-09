@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.2](https://github.com/alpamayo-solutions/chaski/compare/v0.27.1...v0.27.2) (2026-11-09)
+
+
+### Fixes
+
+* **dataops:** run ticks on threads of their own, not the loop's pool ([#194](https://github.com/alpamayo-solutions/chaski/issues/194)) ([e22f271](https://github.com/alpamayo-solutions/chaski/commit/e22f271bdc57dac70e4234670b67aedd1903d927))
+
 ## [0.27.1](https://github.com/alpamayo-solutions/chaski/compare/v0.27.0...v0.27.1) (2026-11-04)
 
 
