@@ -327,7 +327,8 @@ class Ingest:
             signal_id = self._signal_id_of(record)
             for handler in self._dispatch.get(signal_id, ()) if signal_id is not None else ():
                 producer = getattr(handler, "producer", None)
-                if record.offset <= self._handled_through.get(id(producer), 0):
+                through = self._handled_through.get(id(producer))
+                if through is not None and record.offset <= through:
                     continue
                 slices.setdefault(id(producer), (producer, []))[1].append((handler, record))
         if not slices:
@@ -344,10 +345,10 @@ class Ingest:
                 failed, through = done.result()
             except BaseException as exc:  # the worker stopped under it
                 failed, through = (consumer_name(items[0][0]), items[0][1], exc), items[0][1].offset - 1
-            if through > self._handled_through.get(key, 0):
+            known = self._handled_through.get(key)
+            # A failure, or a rewind, puts the producer back to before it.
+            if failed is not None or known is None or through > known:
                 self._handled_through[key] = through
-            elif failed is not None:
-                self._handled_through[key] = min(self._handled_through.get(key, 0), through)
             if failed is not None and (earliest is None or failed[1].offset < earliest[1].offset):
                 earliest = failed
         if earliest is not None:

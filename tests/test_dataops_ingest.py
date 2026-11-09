@@ -681,3 +681,16 @@ async def test_a_page_is_appended_in_one_statement(door, buffer):
     assert await _ingest(door, buffer, signal_ids=["sig-1"]).run_once() == 500
 
     assert statements == [500]
+
+
+@run_async
+async def test_a_record_at_offset_zero_is_handled(door, buffer):
+    """Offsets of a fake or a fresh stream may start at 0: nothing is skipped as handled before."""
+    handled: list[float] = []
+
+    async def handler(record):
+        handled.append(record.payload["value"])
+
+    door.queue(Page(records=[_record(0, "sig-1", 1.0, 10.0)], next=1))
+    await _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"]).run_once()
+    assert handled == [1.0]
