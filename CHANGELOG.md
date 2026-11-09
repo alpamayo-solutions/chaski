@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.3](https://github.com/alpamayo-solutions/chaski/compare/v0.27.2...v0.27.3) (2026-11-09)
+
+
+### Fixes
+
+* **deps:** allow colca 0.45 ([#196](https://github.com/alpamayo-solutions/chaski/issues/196)) ([f39a5a6](https://github.com/alpamayo-solutions/chaski/commit/f39a5a652d8b3e253ab635c5aef7aa37c92f9834))
+
 ## [0.27.2](https://github.com/alpamayo-solutions/chaski/compare/v0.27.1...v0.27.2) (2026-11-09)
 
 
