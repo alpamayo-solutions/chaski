@@ -243,27 +243,50 @@ def test_horizon_is_the_largest_declared_window_across_producers_sharing_a_signa
     horizon must be the larger of the two, not whichever producer happened
     to be walked last."""
     instances = _instantiate(runtime, ShortWindowProducer, LongWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=1.0)
+    horizons = compute_trim_horizons(instances, 1.0, margin_s=0.0)
     assert horizons == {"sig-event": 2 * 3600.0}
 
 
-def test_horizon_falls_back_to_broker_retention_when_it_exceeds_every_declared_window(runtime):
-    """A short window never trims tighter than the broker's retention, which
-    replay needs."""
+def test_horizon_falls_back_to_the_floor_when_it_exceeds_every_declared_window(runtime):
+    """A short window never trims tighter than the floor (by default the
+    broker's retention), which a code-change replay reads."""
     instances = _instantiate(runtime, ShortWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=999_999.0)
+    horizons = compute_trim_horizons(instances, 999_999.0, margin_s=0.0)
     assert horizons == {"sig-event": 999_999.0}
 
 
 def test_horizon_uses_the_declared_window_when_it_exceeds_retention(runtime):
     instances = _instantiate(runtime, ShortWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=1.0)
+    horizons = compute_trim_horizons(instances, 1.0, margin_s=0.0)
     assert horizons == {"sig-event": 10.0}
+
+
+def test_horizon_is_the_widest_window_plus_the_margin(runtime):
+    instances = _instantiate(runtime, ShortWindowProducer, LongWindowProducer)
+    assert compute_trim_horizons(instances, 0.0, margin_s=600.0) == {"sig-event": 2 * 3600.0 + 600.0}
+
+
+def test_horizon_keeps_what_pending_work_of_a_producer_still_reads(runtime):
+    """A replay or backfill on the live instance reads windows that end in the
+    past: its inputs keep its lag on top of the window."""
+    instances = _instantiate(runtime, ShortWindowProducer)
+    behind = {"short_window": 3 * 86400.0}
+    assert compute_trim_horizons(instances, 0.0, margin_s=0.0, behind=behind) == {"sig-event": 10.0 + 3 * 86400.0}
+
+
+def test_trim_buffer_waits_while_the_ingest_catches_up(buffer, runtime):
+    now = time.time()
+    buffer.append("sig-event", now - 30.0, "obsolete")
+    buffer.append("sig-event", now - 20.0, "old")
+    instances = _instantiate(runtime, ShortWindowProducer)
+    assert trim_buffer(buffer, instances, 1.0, margin_s=0.0, caught_up=lambda: False) == 0
+    assert len(buffer.points("sig-event", 0.0, now)) == 2
+    assert trim_buffer(buffer, instances, 1.0, margin_s=0.0, caught_up=lambda: True) == 1
 
 
 def test_horizon_skips_an_unresolved_input_rather_than_raising(runtime):
     instances = _instantiate(runtime, UnresolvableProducer)
-    horizons = compute_trim_horizons(instances, retention_s=3600.0)  # must not raise
+    horizons = compute_trim_horizons(instances, 3600.0)  # must not raise
     assert horizons == {}
 
 
@@ -279,7 +302,7 @@ def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runti
 
     # retention_s shorter than the declared window; trim_buffer computes
     # its own horizons from the live instances on every call.
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
 
     df = buffer.window("sig-event", 0.0, now + 1.0)
     assert list(df["value"]) == ["old", "recent"], "retain the boundary anchor and recent history"
@@ -309,7 +332,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
 
     # At "startup" the signal is not commissioned in KV yet — unresolved,
     # so nothing can be trimmed for it.
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
     assert list(df["value"]) == ["obsolete", "old"], "an unresolved input must not be trimmed"
 
@@ -317,7 +340,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
     # a commissioning while the service keeps running).
     door.entries.append(signal_entry("sig-late", "late_signal"))
 
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
     assert list(df["value"]) == ["old"], "late resolution trims obsolete rows but keeps the boundary value"
 

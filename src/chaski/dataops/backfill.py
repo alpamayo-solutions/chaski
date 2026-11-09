@@ -134,7 +134,7 @@ from chaski.outage import warn_failure
 from chaski.publishing import PublishBatch
 
 from . import codehash
-from .base import Producer, event_time, restore_checkpoint, save_checkpoint, state_copy
+from .base import Producer, checkpoint_row, event_time, restore_checkpoint, save_checkpoint, state_copy
 from .ingest import consumer_name
 from .inputs import SignalRangeInput, declared_inputs, fetch_many
 from .outputs import AnnotationOutput, SignalOutput, resolved_outputs
@@ -715,12 +715,19 @@ class BackfillRunner:
         self, instance: Producer, job: dict[str, Any], position: float, windows: int, *, done: bool = False
     ) -> None:
         code_hash = job["code_hash"]
-        with self._buffer.one_commit():
-            if _holds_live(job):
-                save_checkpoint(instance)
-            self._buffer.backfill_progress(job["producer"], job["job"], position, windows, code_hash)
+        buffer = self._buffer
+        # The state is taken here, by the producer's own thread of control;
+        # the writer only commits it, with the job's position.
+        row = checkpoint_row(instance) if _holds_live(job) else None
+
+        def commit() -> None:
+            if row is not None:
+                buffer.save_checkpoint(*row)
+            buffer.backfill_progress(job["producer"], job["job"], position, windows, code_hash)
             if done:
-                self._buffer.finish_backfill(job["producer"], job["job"])
+                buffer.finish_backfill(job["producer"], job["job"])
+
+        buffer.atomically(commit)
 
     async def _hand_over(
         self,

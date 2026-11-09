@@ -12,10 +12,10 @@ The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name, and so its position, stays.
 
-**Crash safety.** Per page: append and run handlers, wait until the node
-confirmed what they published (their writes are pipelined,
-:mod:`chaski.publishing`), save the checkpoints of the producers that keep one
-(once per page), commit, then ack. A crash before
+**Crash safety.** Per page: commit each record's point, run its handlers, wait
+until the node confirmed what they published (their writes are pipelined,
+:mod:`chaski.publishing`), commit the checkpoints of the producers that keep
+one (once per page), sync the buffer to disk, then ack. A crash before
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
 
@@ -284,21 +284,22 @@ class Ingest:
 
         self._failed = None
         records = page.records
-        # One commit per page: the page is acked only after it, and a crash
-        # before the ack appends the page again.
-        with self.page_lock, self._buffer.one_commit():
+        with self.page_lock:
             if any(self._dispatch.get(self._signal_id_of(record) or "") for record in records):
                 # One hop to the loop per page, not per record.
                 asyncio.run_coroutine_threadsafe(self._dispatch_page(records), loop).result()
             else:
                 self._append_many(records)
+            # What the page wrote is on disk before it is acked.
+            self._buffer.sync()
         return len(records)
 
     async def _dispatch_page(self, records: list[Record]) -> None:
-        """Append and dispatch ``records`` in order, on the service's loop.
+        """Dispatch ``records`` in order, on the service's loop.
 
-        A record is appended right before its handlers run, so a handler sees
-        no later record of the page. What the handlers publish is pipelined
+        Each record is committed to the buffer right before its handlers run,
+        so a handler sees no later record of the page. What the handlers
+        publish is pipelined
         (:class:`~chaski.publishing.PublishBatch`) and confirmed when the page
         ends, before checkpointed producers save their state once
         (:class:`~chaski.dataops.base.PageCheckpoints`), still inside the
@@ -313,21 +314,22 @@ class Ingest:
             with page.active():
                 try:
                     with batch.active():
-                        # Records nobody handles are appended together, right
-                        # before the next record that is handled (or the page's end).
-                        quiet: list[Record] = []
+                        # Records nobody handles are appended together with the
+                        # next record that is handled (or at the page's end),
+                        # and committed before its handlers run.
+                        segment: list[Record] = []
                         for record in records:
+                            segment.append(record)
                             signal_id = self._signal_id_of(record)
                             if signal_id is None or not self._dispatch.get(signal_id):
-                                quiet.append(record)
                                 continue
-                            self._append_many(quiet)
-                            quiet.clear()
-                            self._append(record)
+                            self._append_many(segment)
+                            segment = []
                             if first_handled is None:
                                 first_handled = record
                             await self._handle(signal_id, record)
-                        self._append_many(quiet)
+                        if segment:
+                            self._append_many(segment)
                 finally:
                     # Confirmed also when a handler failed: the records before
                     # it are acked, and their writes with them.
@@ -457,22 +459,13 @@ class Ingest:
                 self._no_signal_id(record)
                 continue
             points.append((signal_id, self._timestamp_of(record), self._value_of(record)))
-        self._buffer.append_many(points)
+        self._buffer.append_many(points, durable=False)
 
     @staticmethod
     def _no_signal_id(record: Record) -> None:
         log.warning(
             "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
         )
-
-    def _append(self, record: Record) -> str | None:
-        """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
-        signal_id = self._signal_id_of(record)
-        if signal_id is None:
-            self._no_signal_id(record)
-            return None
-        self._buffer.append(signal_id, self._timestamp_of(record), self._value_of(record))
-        return signal_id
 
     async def _handle(self, signal_id: str, record: Record) -> None:
         for handler in self._dispatch.get(signal_id, []):

@@ -617,16 +617,33 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             await cache.changes.wait_async(version, delay, stop=stop)
 
 
-def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict[str, float]:
-    """Per-signal trim horizon: the larger of the signal's widest declared
-    window and the broker's metrics retention.
+#: What the buffer keeps beyond a signal's widest declared window.
+TRIM_MARGIN_S = 3600.0
 
-    Keeping the broker's whole retention locally lets a replay start from the
-    earliest buffered point without reading the stream again. Unresolved
-    inputs are skipped; nothing lands in the buffer for them yet.
+
+def compute_trim_horizons(
+    instances: list[Producer],
+    floor_s: float,
+    *,
+    margin_s: float = TRIM_MARGIN_S,
+    behind: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Per-signal trim horizon: the widest window any producer declares on the
+    signal plus ``margin_s``, at least ``floor_s``.
+
+    ``floor_s`` is what a code-change replay can reach back (:mod:`.backfill`,
+    "Replay": it reads the buffer from its earliest point); by default it is
+    the broker's metrics retention, as before (see ``buffer_floor`` on
+    :class:`DataOpsService`). ``behind`` names, per producer, how many seconds
+    of pending work (a backfill or replay on the live instance, ticks to catch
+    up) lag behind the wall clock: its inputs keep that much more, so a trim
+    never deletes what that work still reads. Unresolved inputs are skipped;
+    nothing lands in the buffer for them yet.
     """
+    behind = behind or {}
     horizons: dict[str, float] = {}
     for instance in instances:
+        lag = max(0.0, behind.get(instance.name, 0.0))
         for attr_name, input_attr in declared_inputs(instance):
             try:
                 signal_id = input_attr.signal_id
@@ -640,24 +657,46 @@ def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict
                     exc,
                 )
                 continue
-            horizon = max(input_attr.window_s, retention_s)
+            horizon = max(input_attr.window_s + margin_s + lag, floor_s)
             if horizon > horizons.get(signal_id, 0.0):
                 horizons[signal_id] = horizon
     return horizons
 
 
-def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -> None:
+def trim_buffer(
+    buffer: Buffer,
+    instances: list[Producer],
+    floor_s: float,
+    *,
+    margin_s: float = TRIM_MARGIN_S,
+    behind: Callable[[], dict[str, float]] | None = None,
+    caught_up: Callable[[], bool] | None = None,
+) -> int:
     """Periodic job: drop buffered points older than each signal's horizon.
 
     Horizons are recomputed from the currently resolved inputs on every run,
     so a signal that resolves late is trimmed too; resolved ids are held in
-    memory, so this needs no KV scan. A plain function, so APScheduler runs
-    the sqlite work off the loop."""
-    deleted = buffer.trim(compute_trim_horizons(instances, retention_s))
+    memory, so this needs no KV scan. While the ingest has not caught up with
+    the stream (``caught_up``), nothing is trimmed: the records it still
+    handles read windows that end in the past. The trim runs in short
+    statements on the buffer's writer (:meth:`Buffer.trim`), so it never holds
+    up ingest. A plain function, run on a thread of its own. Returns the rows
+    deleted."""
+    if caught_up is not None and not caught_up():
+        log.info("Buffer trim skipped: the ingest is still catching up with the stream")
+        return 0
+    began = time.monotonic()
+    horizons = compute_trim_horizons(instances, floor_s, margin_s=margin_s, behind=behind() if behind else None)
+    deleted = buffer.trim(horizons)
     if deleted:
-        log.info("Buffer trim: deleted %d point(s) past their per-signal horizon", deleted)
+        log.info(
+            "Buffer trim: deleted %d point(s) past their per-signal horizon in %.1f s",
+            deleted,
+            time.monotonic() - began,
+        )
     else:
         log.debug("Buffer trim: nothing past its per-signal horizon")
+    return deleted
 
 
 def make_handler(method):
@@ -790,6 +829,10 @@ class DataOpsService(Service):
     ``PREKIT_URL``, ``PREKIT_CLIENT_ID`` and ``PREKIT_CLIENT_SECRET`` are set
     (:meth:`NodeHistorian.from_env`); ``retry_min``/
     ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
+    ``buffer_floor`` the least history (seconds) the buffer keeps of every
+    input, beyond each input's declared window plus a margin
+    (:func:`compute_trim_horizons`): what a code-change replay can reach
+    back. Without it, ``DATAOPS_BUFFER_FLOOR_S``, else ``retention``;
     ``health_port`` the health door (``0`` for an ephemeral port);
     ``backfill_rate`` (windows per second) and ``backfill_busy`` (share of
     wall time) the most a backfill may take, and ``backfill_stall_after``
@@ -809,6 +852,7 @@ class DataOpsService(Service):
         historian: Historian | None = None,
         retry_min: float = 1.0,
         trim_interval: float = 3600.0,
+        buffer_floor: float | None = None,
         health_port: int = health.PORT_DEFAULT,
         backfill_rate: float = DEFAULT_RATE,
         backfill_busy: float = DEFAULT_BUSY,
@@ -835,6 +879,12 @@ class DataOpsService(Service):
         self._historian = historian
         self._retry_min_s = retry_min
         self._trim_interval_s = trim_interval
+        if buffer_floor is None:
+            from decouple import config
+
+            buffer_floor = config("DATAOPS_BUFFER_FLOOR_S", default=self.retention_s, cast=float)
+        #: The least history the buffer keeps of every input (:func:`compute_trim_horizons`).
+        self.buffer_floor_s = float(buffer_floor)
         self._health_port = health_port
         self._backfill_rate = backfill_rate
         self._backfill_busy = backfill_busy
@@ -962,6 +1012,18 @@ class DataOpsService(Service):
         backfill runs (:mod:`chaski.dataops.backfill`)."""
         runner = self._backfill
         return runner is not None and runner.holds(producer)
+
+    def _work_behind(self) -> dict[str, float]:
+        """Per producer, how far its oldest pending work on buffered input
+        lags behind the wall clock: a backfill or replay that holds its live
+        triggers (:func:`trim_buffer` keeps that much more of its inputs)."""
+        now = time.time()
+        behind: dict[str, float] = {}
+        for job in self.buffer.backfill_jobs(pending_only=True):
+            if job["end"] is None:
+                lag = now - job["position"]
+                behind[job["producer"]] = max(behind.get(job["producer"], 0.0), lag)
+        return behind
 
     def request_backfill(self, producer: str, start: Any, end: Any, *, window: Any = None) -> str:
         """Run ``producer`` again over ``[start, end)`` (unix seconds or
@@ -1530,7 +1592,8 @@ class DataOpsService(Service):
                 schedule_periodic(scheduler, instance)
             scheduler.add_job(
                 trim_buffer,
-                args=(self.buffer, instances, self.retention_s),
+                args=(self.buffer, instances, self.buffer_floor_s),
+                kwargs={"behind": self._work_behind, "caught_up": lambda: ingest.waiting},
                 trigger=IntervalTrigger(seconds=self._trim_interval_s),
                 id=f"{self.name}.buffer-trim",
                 name=f"{self.name}.buffer-trim",

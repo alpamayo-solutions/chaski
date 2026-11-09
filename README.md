@@ -828,6 +828,19 @@ A buffer written by chaski 0.25 or older loses the application-time state it
 kept (the `timers` and `pending_inputs` tables, `__clock__:` watermarks) when it
 is opened; nothing else in it changes.
 
+The buffer has one writer thread: every write is a transaction of its own,
+committed before the call returns, and an ingest page is synced to disk before
+it is acked. Readers (handlers, ticks) read on connections of their own and do
+not wait for the writer. Each input keeps its widest declared window plus an
+hour, and at least `buffer_floor` seconds (`DATAOPS_BUFFER_FLOOR_S`; default:
+`retention`, the broker's metrics retention, 14 days). The floor is what a
+code-change replay reaches back, and what a checkpointed producer's state is
+rebuilt from when its checkpoint does not match the new code; lower it only
+where producers rebuild their state from their declared windows. The trim runs
+while the ingest is caught up, in short statements that never hold up a page,
+and keeps what a running replay or backfill still reads. A buffer from chaski
+0.27 or older drops its duplicate index on `points` when it is opened.
+
 
 ### Durable publication and build compatibility
 

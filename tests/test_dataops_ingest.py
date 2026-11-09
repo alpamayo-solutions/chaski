@@ -624,7 +624,7 @@ async def test_hint_during_empty_fetch_is_not_lost(door, buffer):
 @run_async
 async def test_adjacent_input_only_records_batch_without_future_visibility(door, buffer):
     commits = []
-    buffer._conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+    buffer._writer.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
     seen = []
 
     async def handler(record):
@@ -646,14 +646,15 @@ async def test_adjacent_input_only_records_batch_without_future_visibility(door,
     await ingest.run_once()
     assert seen == [[1, 2]]
     assert buffer.window("input", 0, 100)["value"].tolist() == [1, 2, 4, 5]
-    assert len(commits) == 1
+    # The run up to the trigger, the rest, and the page's sync before its ack.
+    assert len(commits) == 3
 
 
 @run_async
 async def test_records_nobody_handles_are_appended_together_and_before_the_next_handled_one(door, buffer):
-    """A page is appended on the service's loop: one statement per run of
-    unhandled records, not one per record, and a handler still sees every
-    record before its own."""
+    """One statement per run of unhandled records with the handled record that
+    ends it, not one per record, and a handler sees every record before its
+    own."""
     seen: list[list[float]] = []
 
     async def handler(record):
@@ -665,13 +666,13 @@ async def test_records_nobody_handles_are_appended_together_and_before_the_next_
     door.queue(Page(records=records, next=600))
     statements: list[int] = []
     append_many, append = buffer.append_many, buffer.append
-    buffer.append_many = lambda points: (statements.append(len(points)), append_many(points))[-1]
+    buffer.append_many = lambda points, **kw: (statements.append(len(points)), append_many(points, **kw))[-1]
     buffer.append = lambda *a: (statements.append(1), append(*a))[-1]
 
     ingest = _ingest(door, buffer, dispatch={"sig-handled": [handler]}, signal_ids=["sig-quiet", "sig-handled"])
     assert await ingest.run_once() == 599
 
-    assert statements == [399, 1, 199]
+    assert statements == [400, 199]
     assert seen == [[float(i) for i in range(1, 400)]]
     assert len(buffer.points("sig-quiet", 0.0, 1000.0)) == 598
 
@@ -681,7 +682,7 @@ async def test_a_page_nobody_handles_is_appended_in_one_statement(door, buffer):
     door.queue(Page(records=[_record(i, "sig-1", float(i), float(i)) for i in range(1, 501)], next=501))
     statements: list[int] = []
     append_many = buffer.append_many
-    buffer.append_many = lambda points: (statements.append(len(points)), append_many(points))[-1]
+    buffer.append_many = lambda points, **kw: (statements.append(len(points)), append_many(points, **kw))[-1]
     buffer.append = lambda *a: statements.append(1)
 
     assert await _ingest(door, buffer, signal_ids=["sig-1"]).run_once() == 500

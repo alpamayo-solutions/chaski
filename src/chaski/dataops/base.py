@@ -580,14 +580,25 @@ def save_checkpoint(producer: Producer) -> None:
         return
     # The state saved must not run ahead of what the node confirmed.
     settle_current()
+    row = checkpoint_row(producer)
+    if row is not None:
+        producer.runtime.buffer.save_checkpoint(*row)
+
+
+def checkpoint_row(producer: Producer) -> tuple[str, str, int, Any, dict[str, int]] | None:
+    """What :func:`save_checkpoint` writes for ``producer``, taken now: ``(name,
+    code_hash, state_version, state, handled_offsets)``; ``None`` without
+    ``state_version``."""
+    if producer.state_version is None:
+        return None
     if producer._checkpoint_hash is None:
         from .codehash import compute_code_hash
 
         producer._checkpoint_hash = compute_code_hash(type(producer))
-    producer.runtime.buffer.save_checkpoint(
+    return (
         producer.name,
         producer._checkpoint_hash,
         producer.state_version,
-        producer.snapshot_state(),
-        producer._handled_offsets,
+        state_copy(producer),
+        dict(producer._handled_offsets),
     )

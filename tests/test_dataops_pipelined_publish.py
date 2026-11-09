@@ -210,16 +210,3 @@ class Outputs(Producer):
     @every("1h")
     async def tick(self) -> None:
         pass
-
-
-def test_an_emitted_annotation_inside_a_page_is_committed_with_the_page(world, tmp_path):
-    import sqlite3
-
-    other = sqlite3.connect(str(tmp_path / "buffer.sqlite3"))
-    try:
-        with world.buffer.one_commit():
-            world.buffer.record_emitted_annotation("dataops/x", "ann-1", 1.0)
-            assert other.execute("SELECT COUNT(*) FROM emitted_annotations").fetchone()[0] == 0
-        assert other.execute("SELECT COUNT(*) FROM emitted_annotations").fetchone()[0] == 1
-    finally:
-        other.close()
