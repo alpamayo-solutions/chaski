@@ -112,8 +112,9 @@ from chaski.executor import (
 )
 
 from . import resolve
-from .base import Producer, turn
+from .base import Producer
 from .triggers import OnCommandSpec
+from .worker import on_worker
 
 __all__ = [
     "ACK_BUSY",
@@ -193,7 +194,8 @@ def declared_routes(producer_classes: Iterable[type[Producer]]) -> list[tuple[st
 
 class CommandExecutor(executor.CommandExecutor):
     """The executor for ``@on_command`` handlers of DataOps producers. A
-    handler runs under its producer's lock, and its resolutions share one KV
+    handler runs on its producer's worker (:mod:`chaski.dataops.worker`;
+    directly where the producer has none), and its resolutions share one KV
     read taken only when the first of them needs it: a full read per command
     ran into the node's rate limit when commands came fast."""
 
@@ -201,6 +203,10 @@ class CommandExecutor(executor.CommandExecutor):
         producer = getattr(handler, "__self__", None)
         if not isinstance(producer, Producer):
             return await handler(command)  # the service's own command
-        with resolve.lazy_pass(resolve.Snapshot(self._door)):
-            async with turn(producer):
+        snapshot = resolve.Snapshot(self._door)
+
+        async def run() -> Any:
+            with resolve.lazy_pass(snapshot):
                 return await handler(command)
+
+        return await on_worker(producer, run)

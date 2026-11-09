@@ -68,6 +68,13 @@ Startup order inside :meth:`DataOpsService.serve`:
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 
+Every producer runs on a worker of its own from step 2 on
+(:mod:`chaski.dataops.worker`): one thread with one event loop, on which its
+``setup``/``on_ready``/``teardown``, handlers, ticks, commands and backfill
+windows run one at a time. The service's loop only routes work to the workers
+and awaits the results; it never runs producer code and never waits on a
+thread lock.
+
 Every background task of steps 9 to 11, the backfill runner with the
 replays of step 7 included, runs under :func:`supervise`: a task
 that raises is logged at once, counted in ``handler_health`` (degraded, then
@@ -107,13 +114,14 @@ from chaski.service import Service
 from . import commands, health, resolve, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy, turn
+from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import record_rejection
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
+from .worker import ProducerWorker, call_on_worker, on_worker
 
 log = logging.getLogger("chaski.dataops")
 
@@ -244,20 +252,33 @@ def import_directory(path: Path) -> list[str]:
 def off_loop(method):
     """A producer tick as a job the scheduler runs off the event loop.
 
-    Tick bodies are synchronous (sqlite reads, HTTP publishes) and would block
-    every timer if they ran on the loop. As a plain function APScheduler runs
-    the job on the tick threads (:func:`use_tick_threads`), where this drives
-    the coroutine on a private loop; ``max_instances=1`` keeps a slow tick
-    from overlapping itself.
-
-    The tick holds the producer's lock, because the producer's ``@on_metric``
-    and ``@on_constant`` handlers run on the event loop meanwhile (see
-    :func:`make_handler`).
+    APScheduler runs the job on the tick threads (:func:`use_tick_threads`);
+    the job hands the tick to the producer's worker
+    (:mod:`chaski.dataops.worker`) and waits for it there, so the tick runs
+    after whatever the producer is doing, never beside it.
+    ``max_instances=1`` keeps a slow tick from overlapping itself.
     """
 
     instance = method.__self__
     consumer = f"{instance.name}.{method.__name__}"
     outage = Outage(log, consumer, recovered_as="succeeded again")
+
+    async def tick() -> None:
+        batch = PublishBatch()
+        try:
+            await _in_batch(batch, method)
+        except Reject as rejected:
+            await asyncio.to_thread(batch.settle)
+            await asyncio.to_thread(
+                record_rejection, instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(batch.settle)
+            raise
+        else:
+            # A tick ends when the node confirmed what it published.
+            await asyncio.to_thread(batch.settle)
 
     @functools.wraps(method)
     def job() -> None:
@@ -265,20 +286,7 @@ def off_loop(method):
             return  # its backfill runs this tick at its instant
         health = getattr(instance._runtime, "handler_health", None)
         try:
-            with instance._lock:
-                batch = PublishBatch()
-                try:
-                    asyncio.run(_in_batch(batch, method))
-                except Reject as rejected:
-                    batch.settle()
-                    record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        batch.settle()
-                    raise
-                else:
-                    # A tick ends when the node confirmed what it published.
-                    batch.settle()
+            call_on_worker(instance, tick)
         except Exception as exc:
             # The next tick runs the method again. An expected failure (Colca
             # away) is logged here without a traceback; anything else is
@@ -306,13 +314,11 @@ def use_tick_threads(scheduler: AsyncIOScheduler) -> None:
     job. Call it after the last ``add_job`` and before ``start``.
 
     APScheduler's asyncio executor runs a plain function on the loop's default
-    thread pool, the one ``asyncio.to_thread`` uses. A tick of a producer that
-    an ingest page holds waits there for the producer's lock
-    (:func:`off_loop`). Enough of them fill that pool, and the page, which
-    hops to it to confirm its writes, never ends: ingest, backfill and every
-    tick stop for good. On their own pool, ticks waiting for a page hold no
-    thread the page needs. With a thread per job (``max_instances=1`` each), a
-    tick waiting for a busy producer never delays another producer's tick.
+    thread pool, the one ``asyncio.to_thread`` uses. A tick waits for its
+    producer's worker (:func:`off_loop`); on that pool, enough waiting ticks
+    would starve everything else that uses it (chaski 0.26.11 to 0.27.1 stopped
+    an edge that way). With a thread per job (``max_instances=1`` each), a tick
+    waiting for a busy producer never delays another producer's tick.
     """
     workers = max(1, len(scheduler.get_jobs()))
     scheduler.add_executor(
@@ -702,7 +708,8 @@ def trim_buffer(
 def make_handler(method):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
-    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`.
+    into a ``Metric``. It runs on the producer's worker; its ``producer``
+    names the instance for the ingest to route it to.
 
     Within an ingest page (:class:`~chaski.dataops.base.PageCheckpoints`) a
     checkpointed producer's state is kept and saved once per page; outside
@@ -718,10 +725,10 @@ def make_handler(method):
             if page is not None:
                 await page.handle(instance, method, metric, record)
                 return
-        async with turn(instance):
-            await _handle_one(instance, method, metric, record)
+        await _handle_one(instance, method, metric, record)
 
     _handler.consumer = f"{method.__self__.name}.{method.__name__}"
+    _handler.producer = method.__self__
     return _handler
 
 
@@ -1473,10 +1480,12 @@ class DataOpsService(Service):
 
             # Every configured producer must initialize before intake can advance.
             instances: list[Producer] = []
-            for instance in self.instantiate():
-                await instance.setup()
-                instances.append(instance)
             self.instances = instances
+            for instance in self.instantiate():
+                # Everything of a producer runs on its own worker from here on.
+                instance._worker = ProducerWorker(instance.name)
+                instances.append(instance)
+                await on_worker(instance, instance.setup)
 
             # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
             #    after opening the live resolution index so the bindings the
@@ -1491,7 +1500,7 @@ class DataOpsService(Service):
             #    startup compute here instead of retrying publish() on the
             #    RuntimeError it raises before binding.
             for instance in instances:
-                await instance.on_ready()
+                await on_worker(instance, instance.on_ready)
 
             # 5) Refuse windows longer than the broker's retention without a historian.
             validate_windows(
@@ -1635,7 +1644,7 @@ class DataOpsService(Service):
                         log.exception("Ingest loop did not shut down cleanly")
                 for instance in instances:
                     try:
-                        await instance.teardown()
+                        await on_worker(instance, instance.teardown)
                     except Exception as exc:
                         reason = expected_failure(exc)
                         if reason is None:
@@ -1646,6 +1655,10 @@ class DataOpsService(Service):
                 self._backfill = None
 
         finally:
+            for instance in self.instances:
+                worker = instance._worker
+                if worker is not None:
+                    await asyncio.to_thread(worker.stop)
             if health_server is not None:
                 health_server.close()
                 await health_server.wait_closed()

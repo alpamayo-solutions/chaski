@@ -15,14 +15,14 @@ restart neither runs a command twice nor answers it twice).
 processed again after a crash rewrites the same row. Cold start, recovery and
 replay are therefore the same code path.
 
-**One writer, explicit transactions.** Every write runs on the buffer's own
-writer thread, on the one write connection, as a transaction of its own
+**One writer, explicit transactions.** Every write runs on the one write
+connection, held by one thread at a time, as a transaction of its own
 (``BEGIN IMMEDIATE`` ... ``COMMIT``) that is committed before the call
 returns. Writes that belong together go in one call (:meth:`Buffer.atomically`).
 No write ever lands in a transaction someone else opened, and nothing is
-acknowledged before its write is committed. Jobs run in the order they were
-submitted, so a long maintenance task (:meth:`Buffer.trim`) is cut into short
-jobs that other writes queue between.
+acknowledged before its write is committed. A long maintenance task
+(:meth:`Buffer.trim`) is cut into short transactions with pauses between,
+which other writes take turns with.
 
 **Readers do not wait for the writer.** The file is in WAL mode; every thread
 reads on a read-only connection of its own and sees the last committed state.
@@ -30,17 +30,15 @@ reads on a read-only connection of its own and sees the last committed state.
 
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import json
 import logging
-import queue
 import sqlite3
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import ulid
 
@@ -50,8 +48,6 @@ if TYPE_CHECKING:
 log = logging.getLogger("chaski.dataops.buffer")
 
 T = TypeVar("T")
-#: A writer job: ``(fn, future, bare, durable)``.
-_Job = tuple[Callable[[sqlite3.Connection], Any], "concurrent.futures.Future[Any]", bool, bool]
 
 #: Rows the first statement of a :meth:`Buffer.trim` deletes; later
 #: statements size themselves to :data:`TRIM_BATCH_S`.
@@ -135,83 +131,59 @@ CREATE INDEX IF NOT EXISTS idx_emitted_annotations_source_start
 
 
 class _Writer:
-    """The buffer's one writer: a thread that owns the write connection and
-    runs every job as one explicit transaction, in submission order.
+    """The buffer's one writer: the write connection, used by one thread at a
+    time, one explicit transaction at a time.
 
-    A job submitted from the writer thread itself (a write inside
-    :meth:`Buffer.atomically`) runs at once, inside the transaction already
-    open."""
+    The calling thread runs its transaction itself while it holds the writer
+    (no hop to another thread). A write made while the same thread already
+    holds it (inside :meth:`Buffer.atomically`) runs inside the transaction
+    already open."""
 
     def __init__(self, path: Path) -> None:
-        self._jobs: queue.SimpleQueue[_Job | None] = queue.SimpleQueue()
+        self._lock = threading.RLock()
+        self._owner: threading.Thread | None = None
         self._depth = 0
         self._closed = False
-        self.conn: sqlite3.Connection | None = None
-        opened: concurrent.futures.Future[None] = concurrent.futures.Future()
-        self.thread = threading.Thread(target=self._run, args=(path, opened), name="dataops-buffer-writer", daemon=True)
-        self.thread.start()
-        opened.result()
-
-    def _run(self, path: Path, opened: concurrent.futures.Future[None]) -> None:
+        conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         try:
-            conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT}")
             conn.execute(f"PRAGMA cache_size=-{WRITE_CACHE_KIB}")
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA synchronous=NORMAL")
-        except BaseException as exc:
-            opened.set_exception(exc)
-            return
-        self.conn = conn
-        opened.set_result(None)
-        try:
-            while True:
-                job = self._jobs.get()
-                if job is None:
-                    return
-                fn, future, bare, durable = job
-                if not future.set_running_or_notify_cancel():
-                    continue
-                try:
-                    result = fn(conn) if bare else self._transaction(fn, durable=durable)
-                except BaseException as exc:
-                    future.set_exception(exc)
-                else:
-                    future.set_result(result)
-        finally:
+        except BaseException:
             conn.close()
+            raise
+        self.conn = conn
 
-    def _transaction(self, fn: Callable[[sqlite3.Connection], T], *, durable: bool = True) -> T:
-        conn = cast(sqlite3.Connection, self.conn)  # set before the first job runs
+    def _transaction(self, fn: Callable[[sqlite3.Connection], T], *, durable: bool) -> T:
+        conn = self.conn
         if self._depth:
             return fn(conn)
         if durable:
-            return self._durably(conn, fn)
-        conn.execute("BEGIN IMMEDIATE")
-        self._depth = 1
+            # synchronous=FULL syncs the WAL at this commit, with every frame
+            # committed before it under NORMAL.
+            conn.execute("PRAGMA synchronous=FULL")
         try:
-            result = fn(conn)
-            conn.execute("COMMIT")
-        except BaseException:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
+            conn.execute("BEGIN IMMEDIATE")
+            self._depth = 1
+            try:
+                result = fn(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._depth = 0
         finally:
-            self._depth = 0
+            if durable:
+                conn.execute("PRAGMA synchronous=NORMAL")
         return result
 
-    def _durably(self, conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], T]) -> T:
-        # synchronous=FULL syncs the WAL at this commit, with every frame
-        # committed before it under NORMAL.
-        conn.execute("PRAGMA synchronous=FULL")
-        try:
-            return self._transaction(fn, durable=False)
-        finally:
-            conn.execute("PRAGMA synchronous=NORMAL")
-
     def on_thread(self) -> bool:
-        return threading.current_thread() is self.thread
+        """Whether the calling thread holds the writer (inside a write)."""
+        return self._owner is threading.current_thread()
 
     def call(self, fn: Callable[[sqlite3.Connection], T], *, bare: bool = False, durable: bool = True) -> T:
         """Run ``fn(conn)`` as one committed transaction and return its result.
@@ -221,22 +193,24 @@ class _Writer:
         process but may be lost with the machine's power until the next
         durable one. ``bare`` runs ``fn`` with no transaction around it, for
         statements that commit on their own."""
-        if self.on_thread():
-            conn = cast(sqlite3.Connection, self.conn)
-            return fn(conn) if bare and not self._depth else self._transaction(fn, durable=durable)
-        if self._closed:
-            raise sqlite3.ProgrammingError("Cannot write to a closed buffer.")
-        future: concurrent.futures.Future[T] = concurrent.futures.Future()
-        self._jobs.put((fn, future, bare, durable))
-        return future.result()
+        with self._lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot write to a closed buffer.")
+            outer = self._owner
+            self._owner = threading.current_thread()
+            try:
+                if bare and not self._depth:
+                    return fn(self.conn)
+                return self._transaction(fn, durable=durable)
+            finally:
+                self._owner = outer
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._jobs.put(None)
-        if not self.on_thread():
-            self.thread.join(timeout=10.0)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.conn.close()
 
 
 class Buffer:
@@ -311,7 +285,7 @@ class Buffer:
         """This thread's read connection (the write connection on the writer
         thread, so a read inside :meth:`atomically` sees its own writes)."""
         if self._writer.on_thread():
-            return cast(sqlite3.Connection, self._writer.conn)  # open while the writer runs
+            return self._writer.conn
         conn = getattr(self._local, "conn", None)
         if conn is None:
             if self._closed:
@@ -334,9 +308,10 @@ class Buffer:
         self._write(lambda conn: conn.execute("UPDATE meta SET value = value WHERE key = 'generation'"))
 
     def atomically(self, fn: Callable[[], T]) -> T:
-        """Run ``fn()`` on the writer thread as one transaction: every write
-        it makes through this buffer commits together, or none does. ``fn``
-        must not wait for anything but the buffer."""
+        """Run ``fn()`` holding the writer, as one transaction: every write it
+        makes through this buffer commits together, or none does, and its
+        reads see its own writes. ``fn`` must not wait for anything but the
+        buffer."""
         return self._writer.call(lambda _conn: fn())
 
     def close(self) -> None:
@@ -368,12 +343,15 @@ class Buffer:
         )
         return (row[0], row[1], json.loads(row[2]), json.loads(row[3])) if row else None
 
-    def save_checkpoint(self, producer, code_hash, version, state, positions):
-        """Persist a producer's state and handled offsets, committed when this returns."""
-        self.save_checkpoints([(producer, code_hash, version, state, positions)])
+    def save_checkpoint(self, producer, code_hash, version, state, positions, *, durable: bool = True):
+        """Persist a producer's state and handled offsets, committed when this
+        returns (``durable=False``: within an ingest page, which syncs before
+        its ack)."""
+        self.save_checkpoints([(producer, code_hash, version, state, positions)], durable=durable)
 
-    def save_checkpoints(self, rows: list[tuple[str, str, int, Any, Any]]) -> None:
-        """:meth:`save_checkpoint` for several producers in one transaction."""
+    def save_checkpoints(self, rows: list[tuple[str, str, int, Any, Any]], *, durable: bool = True) -> None:
+        """:meth:`save_checkpoint` for several producers in one transaction.
+        ``durable=False`` within an ingest page, which syncs before its ack."""
         encoded = [
             (producer, code_hash, version, json.dumps(state, allow_nan=False), json.dumps(positions, allow_nan=False))
             for producer, code_hash, version, state, positions in rows
@@ -381,7 +359,8 @@ class Buffer:
         if not encoded:
             return
         self._write(
-            lambda conn: conn.executemany("INSERT OR REPLACE INTO producer_checkpoints VALUES (?,?,?,?,?)", encoded)
+            lambda conn: conn.executemany("INSERT OR REPLACE INTO producer_checkpoints VALUES (?,?,?,?,?)", encoded),
+            durable=durable,
         )
 
     def queue_output(self, source, timestamp, value, *, limit=10000):

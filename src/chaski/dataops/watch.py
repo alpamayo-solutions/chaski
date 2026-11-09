@@ -22,8 +22,9 @@ by :func:`chaski.service.tolerate_undecodable`.
 
 Delivery happens on franzmq's own callback thread (:class:`franzmq.Client`
 runs a message's registered callbacks off the network thread already); each
-match is handed to the producer's event loop with ``call_soon_threadsafe``
-and run under the producer's lock and a pinned KV snapshot, as
+match is handed to the service's loop with ``call_soon_threadsafe``, and from
+there to the producer's worker (:mod:`chaski.dataops.worker`), where it runs
+with a pinned KV snapshot, as
 :func:`chaski.dataops.service.make_handler` does for ``@on_metric``. Every
 message handed over before the loop gets to run them is one burst, and a burst
 shares one lazy :class:`chaski.dataops.resolve.Snapshot`: one ``/kv`` read for
@@ -40,6 +41,7 @@ current state, so only the newest one matters). A handler that raises
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import threading
 from collections.abc import Callable, Iterable
@@ -53,8 +55,9 @@ from chaski.outage import Outage
 from chaski.retry import Backoff
 
 from . import resolve
-from .base import Producer, turn
+from .base import Producer
 from .triggers import OnConstantSpec, OnSignalSpec
+from .worker import on_worker
 
 log = logging.getLogger("chaski.dataops.watch")
 
@@ -206,15 +209,13 @@ async def _dispatch(
     retry = Backoff(minimum=RETRY_MIN_S)
     while True:
         try:
-            with resolve.lazy_pass(snapshot):
-                try:
-                    async with turn(producer):
-                        await handler(record)
-                except Reject as rejected:
-                    if bursts._reject is None:
-                        raise RuntimeError(f"{name} rejected a record, but there is nowhere to record it") from rejected
-                    subject = {"topic": topic, "retired": record is None}
-                    await asyncio.to_thread(bursts._reject, name, subject, rejected)
+            try:
+                await on_worker(producer, functools.partial(_call, handler, record, snapshot))
+            except Reject as rejected:
+                if bursts._reject is None:
+                    raise RuntimeError(f"{name} rejected a record, but there is nowhere to record it") from rejected
+                subject = {"topic": topic, "retired": record is None}
+                await asyncio.to_thread(bursts._reject, name, subject, rejected)
         except Exception as exc:
             count = bursts._health.failed(name, exc)
             delay = retry.delay(exc)
@@ -237,3 +238,8 @@ async def _dispatch(
         bursts._health.succeeded(name)
         bursts.outage(name).recovered()
         return
+
+
+async def _call(handler: Any, record: Any, snapshot: resolve.Snapshot) -> None:
+    with resolve.lazy_pass(snapshot):
+        await handler(record)

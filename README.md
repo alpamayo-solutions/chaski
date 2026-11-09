@@ -828,7 +828,15 @@ A buffer written by chaski 0.25 or older loses the application-time state it
 kept (the `timers` and `pending_inputs` tables, `__clock__:` watermarks) when it
 is opened; nothing else in it changes.
 
-The buffer has one writer thread: every write is a transaction of its own,
+Each producer runs on a worker of its own: one thread with one event loop, on
+which its `setup`, `on_ready`, handlers, ticks, commands and backfill windows
+run one at a time, so a slow or blocking callback holds up only its own
+producer and never the service's loop. What a callback starts (a trailing run,
+a `call_later`) keeps running on that loop between callbacks. An ingest page
+commits its points once, then hands each producer its records of the page; a
+handler's window that ends at `self.now` sees the page up to its record.
+
+The buffer has one writer connection: every write is a transaction of its own,
 committed before the call returns, and an ingest page is synced to disk before
 it is acked. Readers (handlers, ticks) read on connections of their own and do
 not wait for the writer. Each input keeps its widest declared window plus an

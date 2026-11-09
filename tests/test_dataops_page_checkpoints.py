@@ -28,6 +28,7 @@ from chaski.dataops.ingest import Ingest
 from chaski.dataops.inputs import SignalRangeInput
 from chaski.dataops.service import build_dispatch, off_loop, schedule_periodic, use_tick_threads
 from chaski.dataops.triggers import every, on_metric
+from chaski.dataops.worker import ProducerWorker, on_worker
 from chaski.door import Page, Record
 
 
@@ -130,6 +131,8 @@ class World:
         self.buffer = Buffer(self.path)
         self.runtime = FakeRuntime(self.door, self.buffer)
         self.producer = Counter().attach(self.runtime)
+        # As in a DataOpsService: everything of the producer runs on its worker.
+        self.producer._worker = ProducerWorker(self.producer.name)
         restore_checkpoint(self.producer)
         dispatch, signal_ids, _ = build_dispatch(self.runtime, [self.producer])
         self.ingest = Ingest(
@@ -141,11 +144,16 @@ class World:
         )
 
     def restart(self) -> None:
-        self.buffer.close()
+        self.close()
         self.start()
 
     def close(self) -> None:
+        self.producer._worker.stop()
         self.buffer.close()
+
+    def release(self) -> None:
+        """Let the held ``b`` record go on, on the producer's own loop."""
+        self.producer._worker.loop.call_soon_threadsafe(self.producer.gate.set)
 
 
 def _rename(values: list[tuple[str, float]]) -> list[tuple[str, float]]:
@@ -175,7 +183,7 @@ async def test_every_handler_sees_every_record_in_stream_order_across_pages(worl
 async def test_the_checkpoint_is_saved_once_per_page_before_the_ack(world, monkeypatch):
     events: list[str] = []
     save = world.buffer.save_checkpoint
-    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a: (events.append("save"), save(*a))[1])
+    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a, **k: (events.append("save"), save(*a, **k))[1])
     ack = world.door.ack
     world.door.ack = lambda *a: (events.append("ack"), ack(*a))[1]
     world.door.queue(_page(1, _rename([("a", float(i)) for i in range(50)])))
@@ -212,7 +220,7 @@ async def test_a_page_whose_checkpoint_was_not_saved_is_applied_once_after_a_res
     world.door.queue(_page(1, _rename([("a", 1)])))
     await world.ingest.run_once()
 
-    def gone(*args):
+    def gone(*args, **kwargs):
         raise OSError("process gone")
 
     monkeypatch.setattr(world.buffer, "save_checkpoint", gone)
@@ -263,7 +271,7 @@ async def test_a_checkpoint_that_cannot_be_saved_puts_the_producer_back_to_the_p
     world.door.queue(_page(1, _rename([("a", 1)])))
     await world.ingest.run_once()
 
-    def full(*args):
+    def full(*args, **kwargs):
         raise OSError("disk full")
 
     monkeypatch.setattr(world.buffer, "save_checkpoint", full)
@@ -280,11 +288,10 @@ async def test_a_checkpoint_that_cannot_be_saved_puts_the_producer_back_to_the_p
 
 @run_async
 async def test_a_tick_waits_for_the_page_so_a_rewind_keeps_what_it_did(world):
-    """The producer is locked for the page: a tick runs before or after it,
-    never between two of its records."""
-    release = asyncio.Event()
+    """The page's records run in one piece of work on the producer's worker:
+    a tick runs before or after it, never between two of its records."""
     tick = off_loop(world.producer.tick)
-    world.producer.gate = release
+    world.producer.gate = asyncio.Event()
     world.producer.fail_at = {3}
     world.door.queue(_page(1, _rename([("a", 1), ("b", 2), ("a", 3)])))
     drain = asyncio.ensure_future(world.ingest.run_once())
@@ -292,7 +299,7 @@ async def test_a_tick_waits_for_the_page_so_a_rewind_keeps_what_it_did(world):
     ticking = asyncio.ensure_future(asyncio.to_thread(tick))
     await asyncio.sleep(0.05)
     assert not ticking.done(), "the tick ran while the page held the producer"
-    release.set()
+    world.release()
     with pytest.raises(RuntimeError, match="boom at 3"):
         await drain
     await ticking
@@ -325,7 +332,7 @@ async def test_ticks_waiting_for_the_page_leave_the_loop_threads_free(world):
         # The tick is due and waits for the producer the page holds.
         await asyncio.sleep(0.2)
         assert world.producer.seen == [["a", 1]]
-        world.producer.gate.set()
+        world.release()
         try:
             await asyncio.wait_for(asyncio.shield(page), 5)
         except TimeoutError:
@@ -344,11 +351,11 @@ async def test_ticks_waiting_for_the_page_leave_the_loop_threads_free(world):
 
 
 @run_async
-async def test_a_command_on_the_loop_waits_for_the_page_that_holds_the_producer(world):
-    """The producer's lock is a thread lock, and a command handler runs on the
-    same loop thread as the page: it entered the lock while the page awaited
-    between two records, and changed the state the page was keeping."""
-    from chaski.dataops.base import turn
+async def test_a_command_waits_for_the_page_that_holds_the_producer(world):
+    """A command handler entered the producer's lock while the page awaited
+    between two records (they shared the loop thread), and changed the state
+    the page was keeping. Both now run on the producer's worker, one after
+    the other."""
 
     world.producer.gate = asyncio.Event()
     world.door.queue(_page(1, _rename([("a", 1), ("b", 2)])))
@@ -357,13 +364,12 @@ async def test_a_command_on_the_loop_waits_for_the_page_that_holds_the_producer(
         await asyncio.sleep(0.001)
 
     async def command() -> None:
-        async with turn(world.producer):
-            world.producer.seen.append(["command", 0])
+        world.producer.seen.append(["command", 0])
 
-    running = asyncio.ensure_future(command())
+    running = asyncio.ensure_future(on_worker(world.producer, command))
     await asyncio.sleep(0.05)
     assert not running.done(), "the command ran inside the page"
-    world.producer.gate.set()
+    world.release()
     await page
     await running
     assert world.producer.seen == [["a", 1], ["b", 2], ["command", 0]]

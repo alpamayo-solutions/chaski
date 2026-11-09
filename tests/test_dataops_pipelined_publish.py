@@ -117,7 +117,7 @@ async def test_a_pages_writes_are_not_waited_for_one_by_one_and_all_are_confirme
     on_publish = world.client.on_publish
     world.client.on_publish = lambda *a: (events.append("puback"), on_publish(*a))[1]
     save = world.buffer.save_checkpoint
-    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a: (events.append("save"), save(*a))[1])
+    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a, **k: (events.append("save"), save(*a, **k))[1])
     ack = world.door.ack
     world.door.ack = lambda *a: (events.append("ack"), ack(*a))[1]
     world.door.queue(_page(1, [float(i) for i in range(20)]))

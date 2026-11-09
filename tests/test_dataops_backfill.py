@@ -30,6 +30,7 @@ from chaski.dataops.buffer import Buffer
 from chaski.dataops.outputs import bind_annotation_outputs
 from chaski.dataops.service import make_handler, synthetic_record
 from chaski.dataops.triggers import CronSpec, IntervalSpec
+from chaski.dataops.worker import ProducerWorker
 from chaski.door import Record
 from chaski.doorbell import Doorbell
 
@@ -1096,7 +1097,10 @@ async def test_a_window_with_many_records_lets_the_loop_run_between_them(tmp_pat
 
 
 @run_async
-async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
+async def test_a_backfills_ticks_run_on_the_producers_worker(tmp_path):
+    """Every tick of every window runs on the producer's worker: one thread
+    and one event loop, not the runner's loop and not a loop per tick."""
+
     class Minutely(Producer):
         name = "minutely"
         system_element_name = "press"
@@ -1114,6 +1118,7 @@ async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
     service = FakeService(_door(), buffer, FakeHistorian({}))
     service._ingest = _Ingest()
     instance = Minutely().attach(service)
+    instance._worker = ProducerWorker(instance.name)
     runner = BackfillRunner(service, [instance], rate=1000.0, busy=1.0)
     service.runner = runner
     runner.plan()
@@ -1123,10 +1128,9 @@ async def test_a_windows_ticks_run_on_one_thread_and_one_event_loop(tmp_path):
     assert [due for due, _t, _l in instance.ran] == tick_instants(
         IntervalSpec(seconds=60.0), job["start"], job["position"]
     )
-    # One loop per window, not one per tick.
-    loops = {loop for _d, _t, loop in instance.ran}
-    assert len(loops) <= job["windows"] < len(instance.ran)
-    assert threading.get_ident() not in {thread for _d, thread, _l in instance.ran}
+    assert {loop for _d, _t, loop in instance.ran} == {id(instance._worker.loop)}
+    assert {thread for _d, thread, _l in instance.ran} == {instance._worker._thread.ident}
+    instance._worker.stop()
     buffer.close()
 
 

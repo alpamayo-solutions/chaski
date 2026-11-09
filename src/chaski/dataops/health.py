@@ -1,11 +1,10 @@
 """A DataOps service's health door: an HTTP server on port 8888.
 
-It answers from its own thread, never from the event loop. The loop runs every
-``@on_metric`` handler, record by record, so while the ingest lane catches up
-a long backlog it is busy for seconds at a time (a handler that waits for its
-producer's lock behind a long tick, one that writes its checkpoint). A door on
-the loop could not answer then, and the container's probe (4 s) read a
-service that was working through its backlog as one that was dead.
+It answers from its own thread, never from the event loop. Producers run on
+workers of their own (:mod:`chaski.dataops.worker`), but a door on the loop
+would still answer only as fast as the loop gets to it, and the container's
+probe (4 s) once read a service that was working through its backlog as one
+that was dead.
 
 Whether the loop moves is still the door's question, asked without needing
 the loop to answer it: a beat on the loop (:func:`serve` starts it) stamps

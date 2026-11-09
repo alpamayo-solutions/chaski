@@ -34,6 +34,7 @@ from chaski.dataops.service import (
     trim_buffer,
 )
 from chaski.dataops.triggers import every, on_constant, on_metric, on_signal
+from chaski.dataops.worker import ProducerWorker, call_on_worker
 from chaski.door import Record
 
 
@@ -755,10 +756,10 @@ def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
 # ─── handlers and ticks serialize on the producer's lock ─────────────────
 
 
-def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
+def test_handler_and_tick_on_the_same_producer_never_overlap(runtime):
     """A handler (through `make_handler`) and a tick (through `off_loop`) on the
-    same producer never overlap. The producer overrides `__init__` without
-    calling super(); the lock exists anyway."""
+    same producer never overlap: both run on its worker. The producer
+    overrides `__init__` without calling super(); it still has its slot."""
 
     class _LockedProducer(Producer):
         name = "locked_producer_test"
@@ -785,6 +786,8 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
             self._critical_section()
 
     inst = _LockedProducer().attach(runtime)
+    assert inst._worker is None
+    inst._worker = ProducerWorker(inst.name)
     handler = make_handler(inst.on_event)
     tick_job = off_loop(inst.tick)
     record = _metric_record({"signal_id": "s", "value": 1.0, "timestamp": 1.0}, ts=1000.0)
@@ -793,7 +796,7 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
 
     def run_handler():
         barrier.wait()
-        asyncio.run(handler(record))
+        call_on_worker(inst, lambda: handler(record))
 
     def run_tick():
         barrier.wait()
@@ -808,7 +811,8 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
 
     assert not t1.is_alive() and not t2.is_alive()
     assert inst.completed == 2, "both the metric handler and timer must execute"
-    assert inst.max_active == 1, "handler and tick ran concurrently — the producer's lock did not serialize them"
+    assert inst.max_active == 1, "handler and tick ran concurrently on the same producer"
+    inst._worker.stop()
 
 
 def test_an_on_metric_handler_sees_its_sample_time_as_now(runtime):
