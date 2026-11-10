@@ -12,7 +12,7 @@ from chaski.dataops.base import Producer
 from chaski.dataops.buffer import Buffer
 from chaski.dataops.service import off_loop
 from chaski.dataops.ticks import GRACE_S, MissedTicks, due, instants, live_trigger
-from chaski.dataops.triggers import CronSpec, IntervalSpec, every
+from chaski.dataops.triggers import CronSpec, IntervalSpec, cron, every
 from chaski.dataops.worker import ProducerWorker
 
 
@@ -72,7 +72,25 @@ class Oee(Producer):
 
 class CatchingUp(Oee):
     name = "oee_catching_up"
-    catch_up_ticks = True
+
+    @every("30s", catch_up=True)
+    async def tick(self) -> None:
+        self.ran.append(self.now)
+
+
+class Derived(Oee):
+    """Inherits ``tick`` (no catch-up) and flags only a tick of its own."""
+
+    name = "oee_derived"
+
+    @every("1m", catch_up=True)
+    async def own(self) -> None:
+        self.ran.append(self.now)
+
+
+def _spec(cls: type[Producer], method: str) -> IntervalSpec | CronSpec:
+    (spec,) = [spec for name, spec in cls._triggers if name == method]
+    return spec
 
 
 def _missed(buffer, requests, findings):
@@ -88,7 +106,7 @@ def test_a_tick_records_its_instant_and_coalesces_a_short_delay(buffer):
     requests, findings = [], []
     missed = _missed(buffer, requests, findings)
     producer = CatchingUp()
-    spec = IntervalSpec(seconds=30.0)
+    spec = _spec(CatchingUp, "tick")
     missed.ran(producer, "tick", spec, 1_000_020.0)
     # One instant late, within the grace: coalesced, as before.
     missed.ran(producer, "tick", spec, 1_000_080.0)
@@ -96,10 +114,10 @@ def test_a_tick_records_its_instant_and_coalesces_a_short_delay(buffer):
     assert requests == [] and missed.status() == []
 
 
-def test_a_stall_is_reported_and_caught_up_by_a_producer_that_opts_in(buffer):
+def test_a_stall_is_reported_and_caught_up_for_a_tick_that_opts_in(buffer):
     requests, findings = [], []
     missed = _missed(buffer, requests, findings)
-    spec = IntervalSpec(seconds=30.0)
+    spec = _spec(CatchingUp, "tick")
     producer = CatchingUp()
     missed.ran(producer, "tick", spec, 1_000_020.0)
     missed.ran(producer, "tick", spec, 1_000_020.0 + 3600.0)
@@ -113,10 +131,10 @@ def test_a_stall_is_reported_and_caught_up_by_a_producer_that_opts_in(buffer):
     assert findings[-1][0] == "missed_ticks" and findings[-1][1]["suggested_severity"] == "warning"
 
 
-def test_a_producer_that_does_not_opt_in_is_reported_and_not_run_again(buffer):
+def test_a_tick_that_does_not_opt_in_is_reported_and_not_run_again(buffer):
     requests, findings = [], []
     missed = _missed(buffer, requests, findings)
-    spec = IntervalSpec(seconds=30.0)
+    spec = _spec(Oee, "tick")
     producer = Oee()
     missed.ran(producer, "tick", spec, 1_000_020.0)
     missed.ran(producer, "tick", spec, 1_000_020.0 + 3 * 86400.0)
@@ -125,10 +143,46 @@ def test_a_producer_that_does_not_opt_in_is_reported_and_not_run_again(buffer):
     assert "not run again" in findings[-1][1]["summary"]
 
 
+def test_a_subclass_catches_up_only_the_ticks_it_flags_not_the_ones_it_inherits(buffer):
+    """A producer built on another (a machine on MachineState) flags its own
+    ticks; the inherited tick that keeps state between ticks stays live-only,
+    as declared where it is written."""
+    assert not _spec(Derived, "tick").catch_up
+    assert _spec(Derived, "own").catch_up
+    requests, findings = [], []
+    missed = _missed(buffer, requests, findings)
+    producer = Derived()
+    for tick in ("tick", "own"):
+        spec = _spec(Derived, tick)
+        missed.ran(producer, tick, spec, 1_000_020.0)
+        missed.ran(producer, tick, spec, 1_000_020.0 + 3600.0)
+    assert [tick for _, _, _, tick in requests] == ["own"]
+    assert missed.uncaught() == ["oee_derived.tick"]
+    caught = {span["tick"]: span["catch_up"] for span in missed.status()}
+    assert caught == {"tick": None, "own": "ticks-own"}
+
+
+def test_catch_up_is_declared_on_cron_ticks_too():
+    class Nightly(Producer):
+        name = "nightly"
+        system_element_name = "press"
+
+        @cron("0 2 * * *", catch_up=True)
+        async def report(self) -> None:
+            pass
+
+        @cron("0 3 * * *")
+        async def cleanup(self) -> None:
+            pass
+
+    assert _spec(Nightly, "report") == CronSpec("0 2 * * *", catch_up=True)
+    assert not _spec(Nightly, "cleanup").catch_up
+
+
 def test_the_finding_is_retired_when_the_catch_up_is_done(buffer):
     requests, findings = [], []
     missed = _missed(buffer, requests, findings)
-    spec = IntervalSpec(seconds=30.0)
+    spec = _spec(CatchingUp, "tick")
     producer = CatchingUp()
     missed.ran(producer, "tick", spec, 1_000_020.0)
     missed.ran(producer, "tick", spec, 1_000_020.0 + 3600.0)

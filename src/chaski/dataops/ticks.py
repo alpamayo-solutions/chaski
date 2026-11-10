@@ -11,8 +11,9 @@ that runs late does (APScheduler's ``coalesce`` and ``misfire_grace_time``):
 nothing is reported and nothing runs again. Older ones are reported as the
 service's retained ``missed_ticks`` ``_Finding`` and on the health door.
 
-**Catch-up is the producer's choice.** A producer that sets
-``catch_up_ticks = True`` has its missed instants run later, each at its
+**Catch-up is the tick's choice.** A tick declared with ``catch_up=True``
+(``@every("30s", catch_up=True)``, ``@cron(..., catch_up=True)``) has its
+missed instants run later, each at its
 instant (``self.now`` is the instant), through the backfill runner: a job
 ``ticks-<method>-<first instant>`` over the missed range, on an instance of
 its own (like a repair, :mod:`chaski.dataops.backfill`), after the ingest has
@@ -118,12 +119,6 @@ def due(spec: Spec, now: float) -> float:
     return found[-1] if found else now
 
 
-def catches_up(producer: Producer | type[Producer]) -> bool:
-    """Whether ``producer`` runs its missed tick instants later."""
-    cls = producer if isinstance(producer, type) else type(producer)
-    return bool(getattr(cls, "catch_up_ticks", False))
-
-
 class MissedTicks:
     """The service's account of missed tick instants: what it reports (the
     ``missed_ticks`` finding, the health door) and the catch-up jobs it
@@ -164,7 +159,7 @@ class MissedTicks:
             return 0
         name = producer.name
         job = None
-        if catches_up(producer) and self._request is not None:
+        if spec.catch_up and self._request is not None:
             try:
                 job = self._request(name, missed[0], math.nextafter(missed[-1], math.inf), tick)
             except Exception as exc:
@@ -176,7 +171,7 @@ class MissedTicks:
             len(missed),
             _iso(missed[0]),
             _iso(missed[-1]),
-            f"catching up ({job})" if job else "not run again (the producer does not catch up ticks)",
+            f"catching up ({job})" if job else "not run again (the tick does not catch up)",
         )
         with self._lock:
             self._spans[(name, tick)] = {
@@ -232,7 +227,7 @@ class MissedTicks:
                 "suggested_severity": "warning",
                 "detail": {"missed": spans},
                 "remedy": (
-                    "None needed for the ones being caught up. The others: set catch_up_ticks = True on a "
+                    "None needed for the ones being caught up. The others: declare catch_up=True on a tick "
                     "producer whose ticks compute from self.now and their windows, or repair the range with "
                     "a backfill request."
                 ),
@@ -251,4 +246,4 @@ def _iso(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat(timespec="seconds")
 
 
-__all__ = ["FINDING", "GRACE_S", "TICKS", "MissedTicks", "catches_up", "due", "instants", "live_trigger"]
+__all__ = ["FINDING", "GRACE_S", "TICKS", "MissedTicks", "due", "instants", "live_trigger"]

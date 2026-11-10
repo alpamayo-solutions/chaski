@@ -29,6 +29,9 @@ class CronSpec:
     """Cron-style trigger spec. Five fields: min hour dom month dow."""
 
     expression: str
+    #: Run the instants this tick missed later, each at its instant (see
+    #: :func:`every`).
+    catch_up: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,9 @@ class IntervalSpec:
     """Fixed-interval trigger spec, e.g. every 30 seconds."""
 
     seconds: float
+    #: Run the instants this tick missed later, each at its instant (see
+    #: :func:`every`).
+    catch_up: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,8 +125,10 @@ def _attach(method: Callable, spec: TriggerSpec) -> Callable:
     return method
 
 
-def cron(expression: str) -> Callable[[Callable], Callable]:
+def cron(expression: str, *, catch_up: bool = False) -> Callable[[Callable], Callable]:
     """Schedule a method on a cron expression. Five fields: ``min hour dom month dow``.
+
+    ``catch_up`` as for :func:`every`.
 
     Example:
         ``@cron("*/15 * * * *")`` — every quarter hour, on the quarter
@@ -131,7 +139,7 @@ def cron(expression: str) -> Callable[[Callable], Callable]:
         raise ValueError(f"Cron expression must have 5 fields, got {expression!r}")
 
     def decorator(fn: Callable) -> Callable:
-        return _attach(fn, CronSpec(expression=expression))
+        return _attach(fn, CronSpec(expression=expression, catch_up=catch_up))
 
     return decorator
 
@@ -166,16 +174,24 @@ def parse_duration(duration: str | float | int) -> float:
     return seconds
 
 
-def every(duration: str | float | int) -> Callable[[Callable], Callable]:
+def every(duration: str | float | int, *, catch_up: bool = False) -> Callable[[Callable], Callable]:
     """Schedule a method at a fixed interval.
 
     ``duration`` accepts a numeric seconds value or a string like ``"30s"``,
     ``"15m"``, ``"2h"``, ``"500ms"``.
+
+    ``catch_up=True`` runs the instants this tick missed (a stall, a stopped
+    service) later, each at its instant (``self.now``), on an instance of its
+    own (:mod:`chaski.dataops.ticks`). Set it only on a tick that computes
+    from ``self.now`` and its input windows: one that publishes at the wall
+    clock or keeps state from tick to tick does the wrong thing for a past
+    instant. The choice is the tick's, so a subclass's own ticks never opt in
+    the ticks it inherits.
     """
     seconds = parse_duration(duration)
 
     def decorator(fn: Callable) -> Callable:
-        return _attach(fn, IntervalSpec(seconds=seconds))
+        return _attach(fn, IntervalSpec(seconds=seconds, catch_up=catch_up))
 
     return decorator
 

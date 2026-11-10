@@ -604,7 +604,7 @@ class BackfillRunner:
                     plan.ticks = []
                 if catch_up is not None:
                     plan.metrics = []
-                    plan.ticks = [(m, spec) for m, spec in plan.ticks if m == catch_up]
+                    plan.ticks = [(m, spec) for m, spec in plan.ticks if m == catch_up and spec.catch_up]
                     # Its ticks read windows that end in the past: the ingest
                     # has to have caught up with the stream first.
                     if not await self._caught_up(plan, stop):
