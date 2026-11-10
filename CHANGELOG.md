@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.2](https://github.com/alpamayo-solutions/chaski/compare/v0.28.1...v0.28.2) (2026-11-10)
+
+
+### Fixes
+
+* **dataops:** opening an old buffer keeps its duplicate index ([#202](https://github.com/alpamayo-solutions/chaski/issues/202)) ([2965f16](https://github.com/alpamayo-solutions/chaski/commit/2965f16dfe14ea2ea36bd6bfcc0f50d07975dfad))
+
 ## [0.28.1](https://github.com/alpamayo-solutions/chaski/compare/v0.28.0...v0.28.1) (2026-11-10)
 
 
