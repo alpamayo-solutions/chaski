@@ -34,6 +34,7 @@ from chaski.dataops.inputs import SignalRangeInput
 from chaski.dataops.outputs import SignalOutput
 from chaski.dataops.service import build_dispatch
 from chaski.dataops.triggers import on_metric
+from chaski.dataops.worker import ProducerWorker
 from chaski.door import Page, Record
 from chaski.publishing import Pubacks
 from chaski.service import Service
@@ -139,6 +140,8 @@ def build(tmp_path, signals: int = SIGNALS, *, client: AckingClient | None = Non
     producer = meter_class(signals, publishes=client is not None)().attach(runtime)
     if client is not None:
         producer.out.bind("bench_meter.out", "tag-out")
+    # As in a DataOpsService: the producer's handlers run on its own worker.
+    producer._worker = ProducerWorker(producer.name)
     dispatch, signal_ids, _ = build_dispatch(runtime, [producer])
     ingest = Ingest(stream_opener(door), buffer, dispatch=dispatch, signal_ids=signal_ids)
     return door, buffer, producer, ingest
@@ -163,6 +166,7 @@ def test_catch_up_keeps_the_minimum_rate(tmp_path):
         print(f"ingest catch-up: {rate:,.0f} records/s ({elapsed / PAGES * 1000:.0f} ms per page of {PAGE})")
         assert rate >= MIN_RECORDS_PER_S, f"{rate:,.0f} records/s"
     finally:
+        producer._worker.stop()
         buffer.close()
 
 
@@ -178,5 +182,6 @@ def test_catch_up_with_a_publishing_producer_keeps_the_minimum_rate(tmp_path):
         print(f"ingest catch-up publishing one value per record: {rate:,.0f} values/s")
         assert rate >= MIN_PUBLISHED_PER_S, f"{rate:,.0f} values/s"
     finally:
+        producer._worker.stop()
         client.close()
         buffer.close()

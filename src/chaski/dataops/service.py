@@ -68,6 +68,13 @@ Startup order inside :meth:`DataOpsService.serve`:
  12. open the health door and block until ``stop``, then unwind in reverse
      and ``close()``
 
+Every producer runs on a worker of its own from step 2 on
+(:mod:`chaski.dataops.worker`): one thread with one event loop, on which its
+``setup``/``on_ready``/``teardown``, handlers, ticks, commands and backfill
+windows run one at a time. The service's loop only routes work to the workers
+and awaits the results; it never runs producer code and never waits on a
+thread lock.
+
 Every background task of steps 9 to 11, the backfill runner with the
 replays of step 7 included, runs under :func:`supervise`: a task
 that raises is logged at once, counted in ``handler_health`` (degraded, then
@@ -93,7 +100,6 @@ from typing import Any, cast
 import httpx
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from colca_data_contracts import Metric
 
@@ -104,16 +110,17 @@ from chaski.publishing import PublishBatch
 from chaski.retained_view import ViewScope
 from chaski.service import Service
 
-from . import commands, health, resolve, watch
+from . import commands, health, resolve, ticks, watch
 from .backfill import DEFAULT_BUSY, DEFAULT_RATE, DEFAULT_STALL_AFTER_S, GAP_REPAIR, BackfillRunner
 from .backfill import request as record_backfill_request
-from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy, turn
+from .base import PageCheckpoints, Producer, Runtime, event_time, save_checkpoint, state_copy
 from .buffer import Buffer
 from .ingest import Ingest, cursor_name
 from .inputs import Historian, declared_inputs, validate_windows
 from .outputs import SignalOutput, bind_annotation_outputs, build_catalogue, declared_outputs, resolved_outputs
 from .scheduling import record_rejection
 from .triggers import CronSpec, IntervalSpec, OnCommandSpec, OnConstantSpec, OnMetricSpec, OnSignalSpec
+from .worker import ProducerWorker, call_on_worker, on_worker
 
 log = logging.getLogger("chaski.dataops")
 
@@ -208,14 +215,15 @@ def _held_by_own_module(cls: type) -> bool:
     return obj is cls
 
 
-def import_directory(path: Path) -> list[str]:
+def import_directory(path: Path, failed: dict[str, BaseException] | None = None) -> list[str]:
     """Import every top-level ``*.py`` under ``path`` so its ``Producer``
     subclasses register. Returns the imported module names.
 
     The directory goes on ``sys.path`` and each file is imported by its stem,
     so the modules can import each other (``from machine_base import
     MachineBase``). Files starting with ``_`` and subdirectories are skipped.
-    A module that fails to import is logged and skipped.
+    A module that fails to import is logged and skipped, and its error put in
+    ``failed`` under the module's name.
     """
     path = Path(path)
     if not path.is_dir():
@@ -233,66 +241,89 @@ def import_directory(path: Path) -> list[str]:
             importlib.import_module(py.stem)
             log.info("Imported producer module %s", py.stem)
             imported.append(py.stem)
-        except Exception:
+        except Exception as exc:
             log.exception("Producer module %s failed to import — skipping", py.stem)
+            if failed is not None:
+                failed[py.stem] = exc
     return imported
 
 
 # ─── ticks: on the scheduler, off the loop ─────────────────────────────────
 
 
-def off_loop(method):
+def off_loop(method, spec: CronSpec | IntervalSpec | None = None):
     """A producer tick as a job the scheduler runs off the event loop.
 
-    Tick bodies are synchronous (sqlite reads, HTTP publishes) and would block
-    every timer if they ran on the loop. As a plain function APScheduler runs
-    the job on the tick threads (:func:`use_tick_threads`), where this drives
-    the coroutine on a private loop; ``max_instances=1`` keeps a slow tick
-    from overlapping itself.
+    APScheduler runs the job on the tick threads (:func:`use_tick_threads`);
+    the job hands the tick to the producer's worker
+    (:mod:`chaski.dataops.worker`) and waits for it there, so the tick runs
+    after whatever the producer is doing, never beside it.
+    ``max_instances=1`` keeps a slow tick from overlapping itself.
 
-    The tick holds the producer's lock, because the producer's ``@on_metric``
-    and ``@on_constant`` handlers run on the event loop meanwhile (see
-    :func:`make_handler`).
+    With its ``spec``, the tick records the instant it ran for and accounts for
+    the instants it missed (:mod:`chaski.dataops.ticks`), through the
+    runtime's ``missed_ticks``.
     """
 
     instance = method.__self__
     consumer = f"{instance.name}.{method.__name__}"
     outage = Outage(log, consumer, recovered_as="succeeded again")
 
+    async def tick() -> None:
+        batch = PublishBatch()
+        try:
+            await _in_batch(batch, method)
+        except Reject as rejected:
+            await asyncio.to_thread(batch.settle)
+            await asyncio.to_thread(
+                record_rejection, instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(batch.settle)
+            raise
+        else:
+            # A tick ends when the node confirmed what it published.
+            await asyncio.to_thread(batch.settle)
+
     @functools.wraps(method)
     def job() -> None:
         if _held(instance):
             return  # its backfill runs this tick at its instant
-        health = getattr(instance._runtime, "handler_health", None)
+        runtime = instance._runtime
+        health = getattr(runtime, "handler_health", None)
+        missed: ticks.MissedTicks | None = getattr(runtime, "missed_ticks", None)
+        at = ticks.due(spec, time.time()) if spec is not None else None
         try:
-            with instance._lock:
-                batch = PublishBatch()
-                try:
-                    asyncio.run(_in_batch(batch, method))
-                except Reject as rejected:
-                    batch.settle()
-                    record_rejection(instance._runtime, consumer, {"timer": consumer, "at": time.time()}, rejected)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        batch.settle()
-                    raise
-                else:
-                    # A tick ends when the node confirmed what it published.
-                    batch.settle()
+            call_on_worker(instance, tick)
         except Exception as exc:
             # The next tick runs the method again. An expected failure (Colca
             # away) is logged here without a traceback; anything else is
             # raised for APScheduler to log with its traceback.
             if health is not None:
                 health.failed(consumer, exc)
+            _ran(missed, instance, method.__name__, spec, at)
             if outage.failed(exc):
                 return
             raise
+        _ran(missed, instance, method.__name__, spec, at)
         if health is not None:
             health.succeeded(consumer)
         outage.recovered()
 
     return job
+
+
+def _ran(
+    missed: ticks.MissedTicks | None, instance: Producer, tick: str, spec: CronSpec | IntervalSpec | None, at: Any
+) -> None:
+    """Record that a live tick ran (or failed) for its instant ``at``."""
+    if missed is None or spec is None or at is None:
+        return
+    try:
+        missed.ran(instance, tick, spec, at)
+    except Exception as exc:
+        warn_failure(log, exc, f"Could not record the progress of {instance.name}.{tick}")
 
 
 async def _in_batch(batch: PublishBatch, method: Callable[[], Awaitable[Any]]) -> Any:
@@ -306,13 +337,11 @@ def use_tick_threads(scheduler: AsyncIOScheduler) -> None:
     job. Call it after the last ``add_job`` and before ``start``.
 
     APScheduler's asyncio executor runs a plain function on the loop's default
-    thread pool, the one ``asyncio.to_thread`` uses. A tick of a producer that
-    an ingest page holds waits there for the producer's lock
-    (:func:`off_loop`). Enough of them fill that pool, and the page, which
-    hops to it to confirm its writes, never ends: ingest, backfill and every
-    tick stop for good. On their own pool, ticks waiting for a page hold no
-    thread the page needs. With a thread per job (``max_instances=1`` each), a
-    tick waiting for a busy producer never delays another producer's tick.
+    thread pool, the one ``asyncio.to_thread`` uses. A tick waits for its
+    producer's worker (:func:`off_loop`); on that pool, enough waiting ticks
+    would starve everything else that uses it (chaski 0.26.11 to 0.27.1 stopped
+    an edge that way). With a thread per job (``max_instances=1`` each), a tick
+    waiting for a busy producer never delays another producer's tick.
     """
     workers = max(1, len(scheduler.get_jobs()))
     scheduler.add_executor(
@@ -334,10 +363,10 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
     for method_name, spec in instance.__class__._triggers:
         method = getattr(instance, method_name)
         if isinstance(spec, CronSpec):
-            ap_trigger = CronTrigger.from_crontab(spec.expression)
+            ap_trigger = ticks.live_trigger(spec)
             kind = f"cron({spec.expression!r})"
         elif isinstance(spec, IntervalSpec):
-            ap_trigger = IntervalTrigger(seconds=spec.seconds)
+            ap_trigger = ticks.live_trigger(spec)
             kind = f"every({spec.seconds}s)"
         elif isinstance(spec, OnMetricSpec | OnConstantSpec | OnSignalSpec | OnCommandSpec):
             continue  # each owned and scheduled elsewhere (see docstring)
@@ -347,7 +376,7 @@ def schedule_periodic(scheduler: AsyncIOScheduler, instance: Producer) -> int:
 
         job_id = f"{instance.name}.{method_name}::{kind}"
         scheduler.add_job(
-            off_loop(method),
+            off_loop(method, spec),
             trigger=ap_trigger,
             id=job_id,
             name=job_id,
@@ -563,8 +592,14 @@ async def supervise(
                 return
 
 
-async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> None:
+async def reresolve_loop(
+    runtime, instances, ingest, stop, ensure_running, *, known: Iterable[str] = (), resolved_late=None
+) -> None:
     """Rebind on definition updates, including reconnect and late commissioning.
+
+    The ingest's cursor has passed the records of an input that resolves only
+    now; ``resolved_late(signal_ids)`` is told which inputs did (``known``: the
+    ones read from the start), to repair what they missed.
 
     A pass that fails while the definition view is unavailable (Colca away)
     waits for the view to become available again and retries at once: the
@@ -580,6 +615,7 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
     retry = Backoff()
     outage = Outage(log, "Definition bindings")
     active_dispatch = None
+    read = set(known)
     while not stop.is_set():
         version = cache.changes.version
         try:
@@ -587,6 +623,13 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             if dispatch is not active_dispatch:
                 ingest.rebind(dispatch, signal_ids or [])
                 active_dispatch = dispatch
+                late = [signal_id for signal_id in signal_ids if signal_id not in read]
+                read.update(signal_ids)
+                if late and resolved_late is not None:
+                    try:
+                        await asyncio.to_thread(resolved_late, late)
+                    except Exception as exc:
+                        warn_failure(log, exc, "Could not repair the inputs that resolved late")
                 if signal_ids:
                     ensure_running()
             retry.reset()
@@ -617,16 +660,33 @@ async def reresolve_loop(runtime, instances, ingest, stop, ensure_running) -> No
             await cache.changes.wait_async(version, delay, stop=stop)
 
 
-def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict[str, float]:
-    """Per-signal trim horizon: the larger of the signal's widest declared
-    window and the broker's metrics retention.
+#: What the buffer keeps beyond a signal's widest declared window.
+TRIM_MARGIN_S = 3600.0
 
-    Keeping the broker's whole retention locally lets a replay start from the
-    earliest buffered point without reading the stream again. Unresolved
-    inputs are skipped; nothing lands in the buffer for them yet.
+
+def compute_trim_horizons(
+    instances: list[Producer],
+    floor_s: float,
+    *,
+    margin_s: float = TRIM_MARGIN_S,
+    behind: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Per-signal trim horizon: the widest window any producer declares on the
+    signal plus ``margin_s``, at least ``floor_s``.
+
+    ``floor_s`` is what a code-change replay can reach back (:mod:`.backfill`,
+    "Replay": it reads the buffer from its earliest point); by default it is
+    the broker's metrics retention, as before (see ``buffer_floor`` on
+    :class:`DataOpsService`). ``behind`` names, per producer, how many seconds
+    of pending work (a backfill or replay on the live instance, ticks to catch
+    up) lag behind the wall clock: its inputs keep that much more, so a trim
+    never deletes what that work still reads. Unresolved inputs are skipped;
+    nothing lands in the buffer for them yet.
     """
+    behind = behind or {}
     horizons: dict[str, float] = {}
     for instance in instances:
+        lag = max(0.0, behind.get(instance.name, 0.0))
         for attr_name, input_attr in declared_inputs(instance):
             try:
                 signal_id = input_attr.signal_id
@@ -640,30 +700,53 @@ def compute_trim_horizons(instances: list[Producer], retention_s: float) -> dict
                     exc,
                 )
                 continue
-            horizon = max(input_attr.window_s, retention_s)
+            horizon = max(input_attr.window_s + margin_s + lag, floor_s)
             if horizon > horizons.get(signal_id, 0.0):
                 horizons[signal_id] = horizon
     return horizons
 
 
-def trim_buffer(buffer: Buffer, instances: list[Producer], retention_s: float) -> None:
+def trim_buffer(
+    buffer: Buffer,
+    instances: list[Producer],
+    floor_s: float,
+    *,
+    margin_s: float = TRIM_MARGIN_S,
+    behind: Callable[[], dict[str, float]] | None = None,
+    caught_up: Callable[[], bool] | None = None,
+) -> int:
     """Periodic job: drop buffered points older than each signal's horizon.
 
     Horizons are recomputed from the currently resolved inputs on every run,
     so a signal that resolves late is trimmed too; resolved ids are held in
-    memory, so this needs no KV scan. A plain function, so APScheduler runs
-    the sqlite work off the loop."""
-    deleted = buffer.trim(compute_trim_horizons(instances, retention_s))
+    memory, so this needs no KV scan. While the ingest has not caught up with
+    the stream (``caught_up``), nothing is trimmed: the records it still
+    handles read windows that end in the past. The trim runs in short
+    statements on the buffer's writer (:meth:`Buffer.trim`), so it never holds
+    up ingest. A plain function, run on a thread of its own. Returns the rows
+    deleted."""
+    if caught_up is not None and not caught_up():
+        log.info("Buffer trim skipped: the ingest is still catching up with the stream")
+        return 0
+    began = time.monotonic()
+    horizons = compute_trim_horizons(instances, floor_s, margin_s=margin_s, behind=behind() if behind else None)
+    deleted = buffer.trim(horizons)
     if deleted:
-        log.info("Buffer trim: deleted %d point(s) past their per-signal horizon", deleted)
+        log.info(
+            "Buffer trim: deleted %d point(s) past their per-signal horizon in %.1f s",
+            deleted,
+            time.monotonic() - began,
+        )
     else:
         log.debug("Buffer trim: nothing past its per-signal horizon")
+    return deleted
 
 
 def make_handler(method):
     """Adapt a producer's ``@on_metric`` method (``async def f(self, metric)``)
     into an Ingest handler (``async def h(record)``) that decodes the payload
-    into a ``Metric``. Holds the producer's lock, like :func:`off_loop`.
+    into a ``Metric``. It runs on the producer's worker; its ``producer``
+    names the instance for the ingest to route it to.
 
     Within an ingest page (:class:`~chaski.dataops.base.PageCheckpoints`) a
     checkpointed producer's state is kept and saved once per page; outside
@@ -679,10 +762,10 @@ def make_handler(method):
             if page is not None:
                 await page.handle(instance, method, metric, record)
                 return
-        async with turn(instance):
-            await _handle_one(instance, method, metric, record)
+        await _handle_one(instance, method, metric, record)
 
     _handler.consumer = f"{method.__self__.name}.{method.__name__}"
+    _handler.producer = method.__self__
     return _handler
 
 
@@ -790,6 +873,10 @@ class DataOpsService(Service):
     ``PREKIT_URL``, ``PREKIT_CLIENT_ID`` and ``PREKIT_CLIENT_SECRET`` are set
     (:meth:`NodeHistorian.from_env`); ``retry_min``/
     ``trim_interval`` the failure backoff minimum and buffer-trim cadence;
+    ``buffer_floor`` the least history (seconds) the buffer keeps of every
+    input, beyond each input's declared window plus a margin
+    (:func:`compute_trim_horizons`): what a code-change replay can reach
+    back. Without it, ``DATAOPS_BUFFER_FLOOR_S``, else ``retention``;
     ``health_port`` the health door (``0`` for an ephemeral port);
     ``backfill_rate`` (windows per second) and ``backfill_busy`` (share of
     wall time) the most a backfill may take, and ``backfill_stall_after``
@@ -809,6 +896,7 @@ class DataOpsService(Service):
         historian: Historian | None = None,
         retry_min: float = 1.0,
         trim_interval: float = 3600.0,
+        buffer_floor: float | None = None,
         health_port: int = health.PORT_DEFAULT,
         backfill_rate: float = DEFAULT_RATE,
         backfill_busy: float = DEFAULT_BUSY,
@@ -835,6 +923,12 @@ class DataOpsService(Service):
         self._historian = historian
         self._retry_min_s = retry_min
         self._trim_interval_s = trim_interval
+        if buffer_floor is None:
+            from decouple import config
+
+            buffer_floor = config("DATAOPS_BUFFER_FLOOR_S", default=self.retention_s, cast=float)
+        #: The least history the buffer keeps of every input (:func:`compute_trim_horizons`).
+        self.buffer_floor_s = float(buffer_floor)
         self._health_port = health_port
         self._backfill_rate = backfill_rate
         self._backfill_busy = backfill_busy
@@ -860,6 +954,12 @@ class DataOpsService(Service):
         self._gap_executor: commands.CommandExecutor | None = None
         self._gap_task: asyncio.Future | None = None
         self._stop: asyncio.Event | None = None
+        #: Producer modules that failed to import, and producers that could
+        #: not be built: reported as failing on the health door at start.
+        self._failed_modules: dict[str, BaseException] = {}
+        self._failed_producers: dict[str, BaseException] = {}
+        #: Missed tick instants: reported, and caught up where a producer does.
+        self.missed_ticks: ticks.MissedTicks | None = None
 
     def _after_connect(self) -> None:
         super()._after_connect()
@@ -912,7 +1012,7 @@ class DataOpsService(Service):
         """Import every top-level ``*.py`` under ``path`` (see
         :func:`import_directory`) and run every concrete producer those
         files define. Returns how many were added."""
-        modules = set(import_directory(path))
+        modules = set(import_directory(path, self._failed_modules))
         _claim_producers_built_in(modules)
         return self._adopt(lambda cls: cls.__module__ in modules)
 
@@ -962,6 +1062,92 @@ class DataOpsService(Service):
         backfill runs (:mod:`chaski.dataops.backfill`)."""
         runner = self._backfill
         return runner is not None and runner.holds(producer)
+
+    def _catch_up_ticks(self, producer: str, start: float, end: float, tick: str) -> str:
+        """Record the catch-up of ``producer``'s tick ``tick`` over ``[start, end)``."""
+        job = f"{ticks.TICKS}{tick}-{int(start)}"
+        runner = self._backfill
+        if runner is not None:
+            return runner.request(producer, start, end, job_id=job)
+        return record_backfill_request(self.buffer, self._producers[producer], start, end, job=job)
+
+    def _publish_finding(self, reason: str, payload: dict[str, Any] | None) -> None:
+        """Publish the retained ``_Finding`` ``reason`` of this service, or retire it (``None``)."""
+        import json
+
+        topic = self._finding_topic(reason)
+        if payload is None:
+            self.retract(topic)
+        else:
+            self.send(topic, json.dumps(payload), retain=True)
+
+    def _account_missed_ticks(self, instances: list[Producer]) -> None:
+        """At start: the tick instants missed while the service was down."""
+        missed = self.missed_ticks
+        if missed is None:
+            return
+        now = time.time()
+        first_held = {
+            job["producer"]
+            for job in self.buffer.backfill_jobs(pending_only=True)
+            if job["job"] == "initial" and job["end"] is None
+        }
+        for instance in instances:
+            if instance.name in first_held:
+                continue  # its first backfill runs its ticks up to the live edge
+            for method_name, spec in type(instance)._triggers:
+                if not isinstance(spec, CronSpec | IntervalSpec):
+                    continue
+                last = self.buffer.tick_progress(instance.name, method_name)
+                if last is None:
+                    continue  # never ran: nothing it could have missed
+                at = ticks.due(spec, now)
+                if at > last:
+                    missed.account(instance, method_name, spec, last, now)
+                    self.buffer.set_tick_progress(instance.name, method_name, at)
+
+    def _inputs_resolved_late(self, signal_ids: list[str]) -> None:
+        """Inputs resolved after the ingest's cursor passed their records
+        (commissioned late, or bound anew): nothing read them. With a
+        historian, each producer reading one gets a repair over its widest
+        window of them, up to now; without one, the loss is reported."""
+        late = set(signal_ids)
+        now = time.time()
+        reach: dict[str, float] = {}
+        for instance in self.instances:
+            for _attr, declared in declared_inputs(instance):
+                with contextlib.suppress(Exception):  # unresolved: not one of these
+                    if declared.signal_id in late:
+                        reach[instance.name] = max(reach.get(instance.name, 0.0), declared.window_s)
+        if not reach:
+            return
+        if self._historian is None:
+            log.warning(
+                "%d input(s) resolved after the ingest passed their records (%s); without a historian the "
+                "windows of %s fill from now on",
+                len(late),
+                ", ".join(sorted(late)),
+                ", ".join(sorted(reach)),
+            )
+            return
+        for name, window in sorted(reach.items()):
+            job = self.request_backfill(name, now - window, now)
+            log.warning(
+                "%s: inputs resolved late; repairing the last %.0f s from the historian (%s)", name, window, job
+            )
+
+    def _work_behind(self) -> dict[str, float]:
+        """Per producer, how far its oldest pending work on buffered input
+        lags behind the wall clock: a backfill or replay that holds its live
+        triggers, or ticks it still catches up (:func:`trim_buffer` keeps that
+        much more of its inputs)."""
+        now = time.time()
+        behind: dict[str, float] = {}
+        for job in self.buffer.backfill_jobs(pending_only=True):
+            if job["end"] is None or job["job"].startswith(ticks.TICKS):
+                lag = now - job["position"]
+                behind[job["producer"]] = max(behind.get(job["producer"], 0.0), lag)
+        return behind
 
     def request_backfill(self, producer: str, start: Any, end: Any, *, window: Any = None) -> str:
         """Run ``producer`` again over ``[start, end)`` (unix seconds or
@@ -1138,8 +1324,9 @@ class DataOpsService(Service):
         for cls in self.producers:
             try:
                 instance = cls().attach(self)
-            except Exception:
+            except Exception as exc:
                 log.exception("Producer %s could not be instantiated — skipping", cls.name)
+                self._failed_producers[cls.name] = exc
                 continue
             instances.append(instance)
         return instances
@@ -1378,6 +1565,7 @@ class DataOpsService(Service):
             return f"waiting for {waiting_for[0]}"
 
         health_state = health.HealthState(
+            handlers=self.handler_health,
             ready=False,
             broker_connected=self.is_broker_connected,
             cursor_lag=self._live_cursor_lag,
@@ -1411,10 +1599,18 @@ class DataOpsService(Service):
 
             # Every configured producer must initialize before intake can advance.
             instances: list[Producer] = []
-            for instance in self.instantiate():
-                await instance.setup()
-                instances.append(instance)
             self.instances = instances
+            for instance in self.instantiate():
+                # Everything of a producer runs on its own worker from here on.
+                instance._worker = ProducerWorker(instance.name)
+                instances.append(instance)
+                await on_worker(instance, instance.setup)
+            # What could not even start stays visible: failing on the health
+            # door and in the service's status, until it is fixed and restarted.
+            for module, exc in self._failed_modules.items():
+                self.handler_health.failed(f"module {module}", exc)
+            for producer, exc in self._failed_producers.items():
+                self.handler_health.failed(f"producer {producer}", exc)
 
             # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
             #    after opening the live resolution index so the bindings the
@@ -1428,8 +1624,14 @@ class DataOpsService(Service):
             # 4) Outputs are bound and no trigger has fired yet: producers do
             #    startup compute here instead of retrying publish() on the
             #    RuntimeError it raises before binding.
+            # One that fails is reported and does not stop the service: its
+            # triggers are wired like every other producer's.
             for instance in instances:
-                await instance.on_ready()
+                try:
+                    await on_worker(instance, instance.on_ready)
+                except Exception as exc:
+                    log.error("%s.on_ready failed; its triggers run anyway", instance.name, exc_info=exc)
+                    self.handler_health.failed(f"{instance.name}.on_ready", exc)
 
             # 5) Refuse windows longer than the broker's retention without a historian.
             validate_windows(
@@ -1451,6 +1653,11 @@ class DataOpsService(Service):
             )
             await asyncio.to_thread(backfill.plan)
             self._backfill = backfill
+            # Ticks missed while the service was down (chaski.dataops.ticks).
+            self.missed_ticks = ticks.MissedTicks(
+                self.buffer, request=self._catch_up_ticks, publish=self._publish_finding
+            )
+            await asyncio.to_thread(self._account_missed_ticks, instances)
             health_state.backfill = backfill.status
             dispatch, signal_ids, unresolved = build_dispatch(self, instances)
 
@@ -1503,7 +1710,16 @@ class DataOpsService(Service):
             if unresolved or self._definition_cache is not None:
                 log.info("%d declared input(s) unresolved — retrying until they are commissioned.", unresolved)
                 reresolve_task = supervised(
-                    "re-resolve", lambda: reresolve_loop(self, instances, ingest, stop, _ensure_ingest_running)
+                    "re-resolve",
+                    lambda: reresolve_loop(
+                        self,
+                        instances,
+                        ingest,
+                        stop,
+                        _ensure_ingest_running,
+                        known=signal_ids,
+                        resolved_late=self._inputs_resolved_late,
+                    ),
                 )
                 if unresolved:
                     log.info(
@@ -1530,7 +1746,8 @@ class DataOpsService(Service):
                 schedule_periodic(scheduler, instance)
             scheduler.add_job(
                 trim_buffer,
-                args=(self.buffer, instances, self.retention_s),
+                args=(self.buffer, instances, self.buffer_floor_s),
+                kwargs={"behind": self._work_behind, "caught_up": lambda: ingest.waiting},
                 trigger=IntervalTrigger(seconds=self._trim_interval_s),
                 id=f"{self.name}.buffer-trim",
                 name=f"{self.name}.buffer-trim",
@@ -1539,6 +1756,17 @@ class DataOpsService(Service):
                 max_instances=1,
                 misfire_grace_time=60,
             )
+            missed_ticks = self.missed_ticks
+            scheduler.add_job(
+                missed_ticks.refresh,
+                trigger=IntervalTrigger(seconds=60.0),
+                id=f"{self.name}.missed-ticks",
+                name=f"{self.name}.missed-ticks",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            health_state.missed_ticks = missed_ticks.status
             use_tick_threads(scheduler)
             scheduler.start()
             log.info("Scheduler started (buffer trim every %.0fs).", self._trim_interval_s)
@@ -1572,7 +1800,7 @@ class DataOpsService(Service):
                         log.exception("Ingest loop did not shut down cleanly")
                 for instance in instances:
                     try:
-                        await instance.teardown()
+                        await on_worker(instance, instance.teardown)
                     except Exception as exc:
                         reason = expected_failure(exc)
                         if reason is None:
@@ -1583,6 +1811,10 @@ class DataOpsService(Service):
                 self._backfill = None
 
         finally:
+            for instance in self.instances:
+                worker = instance._worker
+                if worker is not None:
+                    await asyncio.to_thread(worker.stop)
             if health_server is not None:
                 health_server.close()
                 await health_server.wait_closed()

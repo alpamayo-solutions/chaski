@@ -516,6 +516,24 @@ async def test_ingest_honors_retry_after_without_acknowledging(door, buffer):
 
 
 @run_async
+async def test_a_page_read_again_by_the_same_ingest_skips_what_was_handled(door, buffer):
+    """A page whose ack did not land, or whose later record failed, is read
+    again; the records a producer already handled are not handled twice."""
+    handled: list[float] = []
+
+    async def handler(record):
+        handled.append(record.payload["value"])
+
+    page = Page(records=[_record(5, "sig-1", 1.0, 10.0), _record(6, "sig-1", 2.0, 11.0)], next=7)
+    door.queue(page)
+    door.queue(page)
+    ingest = _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"])
+    await ingest.run_once()
+    await ingest.run_once()
+    assert handled == [1.0, 2.0]
+
+
+@run_async
 async def test_reprocessing_a_page_after_a_crash_does_not_duplicate_buffer_rows(door, buffer):
     """Simulates a crash between processing and ack: the SAME page is
     fetched twice (the un-acked cursor position never moved). Buffer
@@ -530,13 +548,12 @@ async def test_reprocessing_a_page_after_a_crash_does_not_duplicate_buffer_rows(
     door.queue(page)
     door.queue(page)  # same page delivered again, as if the ack never landed
 
-    ingest = _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"])
+    await _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"]).run_once()
+    # The restarted process reads the page again.
+    await _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"]).run_once()
 
-    await ingest.run_once()
-    await ingest.run_once()
-
-    # dispatch re-ran both times (handlers are expected to be idempotent
-    # themselves; ingest does not dedup)...
+    # dispatch re-ran after the restart (handlers are expected to be idempotent
+    # themselves; the ingest remembers what it handled only in memory)...
     assert handled == [1.0, 1.0]
     # ...but the buffer row is not duplicated: exactly one point survives.
     df = buffer.window("sig-1", 0.0, 100.0)
@@ -622,13 +639,17 @@ async def test_hint_during_empty_fetch_is_not_lost(door, buffer):
 
 
 @run_async
-async def test_adjacent_input_only_records_batch_without_future_visibility(door, buffer):
+async def test_a_page_is_committed_once_and_handlers_read_it_up_to_their_event_time(door, buffer):
+    """The page's points are committed in one statement before its handlers
+    run. A handler reads windows ending at its record's event time, so a later
+    sample of the page does not reach it; an unbounded read sees the page."""
     commits = []
-    buffer._conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
+    buffer._writer.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == "COMMIT" else None)
     seen = []
 
     async def handler(record):
-        seen.append(buffer.window("input", 0, 100)["value"].tolist())
+        now = record.payload["timestamp"]
+        seen.append((buffer.window("input", 0, now)["value"].tolist(), len(buffer.window("input", 0, 100))))
 
     door.queue(
         Page(
@@ -644,46 +665,32 @@ async def test_adjacent_input_only_records_batch_without_future_visibility(door,
     )
     ingest = _ingest(door, buffer, dispatch={"trigger": [handler]})
     await ingest.run_once()
-    assert seen == [[1, 2]]
-    assert buffer.window("input", 0, 100)["value"].tolist() == [1, 2, 4, 5]
-    assert len(commits) == 1
+    assert seen == [([1, 2], 4)]
+    # The page's points, and the page's sync before its ack.
+    assert len(commits) == 2
 
 
 @run_async
-async def test_records_nobody_handles_are_appended_together_and_before_the_next_handled_one(door, buffer):
-    """A page is appended on the service's loop: one statement per run of
-    unhandled records, not one per record, and a handler still sees every
-    record before its own."""
-    seen: list[list[float]] = []
-
-    async def handler(record):
-        seen.append([ts for ts, _ in buffer.points("sig-quiet", 0.0, 1000.0)])
-
-    records = [_record(i, "sig-quiet", float(i), float(i)) for i in range(1, 400)]
-    records.append(_record(400, "sig-handled", 1.0, 400.0))
-    records.extend(_record(i, "sig-quiet", float(i), float(i)) for i in range(401, 600))
-    door.queue(Page(records=records, next=600))
-    statements: list[int] = []
-    append_many, append = buffer.append_many, buffer.append
-    buffer.append_many = lambda points: (statements.append(len(points)), append_many(points))[-1]
-    buffer.append = lambda *a: (statements.append(1), append(*a))[-1]
-
-    ingest = _ingest(door, buffer, dispatch={"sig-handled": [handler]}, signal_ids=["sig-quiet", "sig-handled"])
-    assert await ingest.run_once() == 599
-
-    assert statements == [399, 1, 199]
-    assert seen == [[float(i) for i in range(1, 400)]]
-    assert len(buffer.points("sig-quiet", 0.0, 1000.0)) == 598
-
-
-@run_async
-async def test_a_page_nobody_handles_is_appended_in_one_statement(door, buffer):
+async def test_a_page_is_appended_in_one_statement(door, buffer):
     door.queue(Page(records=[_record(i, "sig-1", float(i), float(i)) for i in range(1, 501)], next=501))
     statements: list[int] = []
     append_many = buffer.append_many
-    buffer.append_many = lambda points: (statements.append(len(points)), append_many(points))[-1]
+    buffer.append_many = lambda points, **kw: (statements.append(len(points)), append_many(points, **kw))[-1]
     buffer.append = lambda *a: statements.append(1)
 
     assert await _ingest(door, buffer, signal_ids=["sig-1"]).run_once() == 500
 
     assert statements == [500]
+
+
+@run_async
+async def test_a_record_at_offset_zero_is_handled(door, buffer):
+    """Offsets of a fake or a fresh stream may start at 0: nothing is skipped as handled before."""
+    handled: list[float] = []
+
+    async def handler(record):
+        handled.append(record.payload["value"])
+
+    door.queue(Page(records=[_record(0, "sig-1", 1.0, 10.0)], next=1))
+    await _ingest(door, buffer, dispatch={"sig-1": [handler]}, signal_ids=["sig-1"]).run_once()
+    assert handled == [1.0]

@@ -34,6 +34,7 @@ from chaski.dataops.service import (
     trim_buffer,
 )
 from chaski.dataops.triggers import every, on_constant, on_metric, on_signal
+from chaski.dataops.worker import ProducerWorker, call_on_worker
 from chaski.door import Record
 
 
@@ -206,6 +207,51 @@ async def test_definition_push_rebinds_without_idle_scans_and_stops(runtime):
     assert started == [1]
 
 
+@run_async
+async def test_an_input_that_resolves_late_is_handed_over_for_repair(runtime):
+    """The cursor passed the records of an input that resolved only now:
+    nothing would read them again (B5 of the 2026-11-09 review)."""
+    from types import SimpleNamespace
+
+    import chaski.dataops.service as service_module
+    from chaski._wakeup import Wakeup
+
+    changes = Wakeup()
+    runtime.door._dataops_definitions = SimpleNamespace(changes=changes)
+    late: list[list[str]] = []
+    rebound = asyncio.Event()
+    stop = asyncio.Event()
+    calls = []
+
+    def build(*_):
+        calls.append(1)
+        return ({}, ["sig-a"], 1) if len(calls) == 1 else ({"sig-b": ["handler"]}, ["sig-a", "sig-b"], 0)
+
+    def rebind(dispatch, ids):
+        if "sig-b" in ids:
+            rebound.set()
+
+    with patch.object(service_module, "build_dispatch", build):
+        task = asyncio.create_task(
+            service_module.reresolve_loop(
+                runtime,
+                [],
+                SimpleNamespace(rebind=rebind),
+                stop,
+                lambda: None,
+                known=["sig-a"],
+                resolved_late=late.append,
+            )
+        )
+        await asyncio.sleep(0.03)
+        changes.notify()
+        await asyncio.wait_for(rebound.wait(), 1)
+        await asyncio.sleep(0.03)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+    assert late == [["sig-b"]]
+
+
 # ─── trim horizons and the periodic trim ─────────────────────────────────
 #
 # The horizon per signal is the larger of its widest declared window and the
@@ -243,27 +289,50 @@ def test_horizon_is_the_largest_declared_window_across_producers_sharing_a_signa
     horizon must be the larger of the two, not whichever producer happened
     to be walked last."""
     instances = _instantiate(runtime, ShortWindowProducer, LongWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=1.0)
+    horizons = compute_trim_horizons(instances, 1.0, margin_s=0.0)
     assert horizons == {"sig-event": 2 * 3600.0}
 
 
-def test_horizon_falls_back_to_broker_retention_when_it_exceeds_every_declared_window(runtime):
-    """A short window never trims tighter than the broker's retention, which
-    replay needs."""
+def test_horizon_falls_back_to_the_floor_when_it_exceeds_every_declared_window(runtime):
+    """A short window never trims tighter than the floor (by default the
+    broker's retention), which a code-change replay reads."""
     instances = _instantiate(runtime, ShortWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=999_999.0)
+    horizons = compute_trim_horizons(instances, 999_999.0, margin_s=0.0)
     assert horizons == {"sig-event": 999_999.0}
 
 
 def test_horizon_uses_the_declared_window_when_it_exceeds_retention(runtime):
     instances = _instantiate(runtime, ShortWindowProducer)
-    horizons = compute_trim_horizons(instances, retention_s=1.0)
+    horizons = compute_trim_horizons(instances, 1.0, margin_s=0.0)
     assert horizons == {"sig-event": 10.0}
+
+
+def test_horizon_is_the_widest_window_plus_the_margin(runtime):
+    instances = _instantiate(runtime, ShortWindowProducer, LongWindowProducer)
+    assert compute_trim_horizons(instances, 0.0, margin_s=600.0) == {"sig-event": 2 * 3600.0 + 600.0}
+
+
+def test_horizon_keeps_what_pending_work_of_a_producer_still_reads(runtime):
+    """A replay or backfill on the live instance reads windows that end in the
+    past: its inputs keep its lag on top of the window."""
+    instances = _instantiate(runtime, ShortWindowProducer)
+    behind = {"short_window": 3 * 86400.0}
+    assert compute_trim_horizons(instances, 0.0, margin_s=0.0, behind=behind) == {"sig-event": 10.0 + 3 * 86400.0}
+
+
+def test_trim_buffer_waits_while_the_ingest_catches_up(buffer, runtime):
+    now = time.time()
+    buffer.append("sig-event", now - 30.0, "obsolete")
+    buffer.append("sig-event", now - 20.0, "old")
+    instances = _instantiate(runtime, ShortWindowProducer)
+    assert trim_buffer(buffer, instances, 1.0, margin_s=0.0, caught_up=lambda: False) == 0
+    assert len(buffer.points("sig-event", 0.0, now)) == 2
+    assert trim_buffer(buffer, instances, 1.0, margin_s=0.0, caught_up=lambda: True) == 1
 
 
 def test_horizon_skips_an_unresolved_input_rather_than_raising(runtime):
     instances = _instantiate(runtime, UnresolvableProducer)
-    horizons = compute_trim_horizons(instances, retention_s=3600.0)  # must not raise
+    horizons = compute_trim_horizons(instances, 3600.0)  # must not raise
     assert horizons == {}
 
 
@@ -279,7 +348,7 @@ def test_trim_buffer_deletes_only_points_past_the_computed_horizon(buffer, runti
 
     # retention_s shorter than the declared window; trim_buffer computes
     # its own horizons from the live instances on every call.
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
 
     df = buffer.window("sig-event", 0.0, now + 1.0)
     assert list(df["value"]) == ["old", "recent"], "retain the boundary anchor and recent history"
@@ -309,7 +378,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
 
     # At "startup" the signal is not commissioned in KV yet — unresolved,
     # so nothing can be trimmed for it.
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
     assert list(df["value"]) == ["obsolete", "old"], "an unresolved input must not be trimmed"
 
@@ -317,7 +386,7 @@ def test_trim_buffer_recomputes_horizons_so_a_late_resolved_input_gets_trimmed(b
     # a commissioning while the service keeps running).
     door.entries.append(signal_entry("sig-late", "late_signal"))
 
-    trim_buffer(buffer, instances, retention_s=1.0)
+    trim_buffer(buffer, instances, 1.0, margin_s=0.0)
     df = buffer.window("sig-late", 0.0, now + 1.0)
     assert list(df["value"]) == ["old"], "late resolution trims obsolete rows but keeps the boundary value"
 
@@ -732,10 +801,10 @@ def test_a_failed_pinned_read_keeps_previously_resolved_ids_bound(buffer):
 # ─── handlers and ticks serialize on the producer's lock ─────────────────
 
 
-def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
+def test_handler_and_tick_on_the_same_producer_never_overlap(runtime):
     """A handler (through `make_handler`) and a tick (through `off_loop`) on the
-    same producer never overlap. The producer overrides `__init__` without
-    calling super(); the lock exists anyway."""
+    same producer never overlap: both run on its worker. The producer
+    overrides `__init__` without calling super(); it still has its slot."""
 
     class _LockedProducer(Producer):
         name = "locked_producer_test"
@@ -762,6 +831,8 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
             self._critical_section()
 
     inst = _LockedProducer().attach(runtime)
+    assert inst._worker is None
+    inst._worker = ProducerWorker(inst.name)
     handler = make_handler(inst.on_event)
     tick_job = off_loop(inst.tick)
     record = _metric_record({"signal_id": "s", "value": 1.0, "timestamp": 1.0}, ts=1000.0)
@@ -770,7 +841,7 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
 
     def run_handler():
         barrier.wait()
-        asyncio.run(handler(record))
+        call_on_worker(inst, lambda: handler(record))
 
     def run_tick():
         barrier.wait()
@@ -785,7 +856,8 @@ def test_handler_and_tick_on_the_same_producer_serialize_on_its_lock(runtime):
 
     assert not t1.is_alive() and not t2.is_alive()
     assert inst.completed == 2, "both the metric handler and timer must execute"
-    assert inst.max_active == 1, "handler and tick ran concurrently — the producer's lock did not serialize them"
+    assert inst.max_active == 1, "handler and tick ran concurrently on the same producer"
+    inst._worker.stop()
 
 
 def test_an_on_metric_handler_sees_its_sample_time_as_now(runtime):
@@ -930,3 +1002,31 @@ def test_dispatch_pass_logs_one_info_summary_and_per_handler_lines_at_debug(runt
     assert per_handler and all(r.levelno == logging.DEBUG for r in per_handler)
     assert len(summaries) == 1 and summaries[0].levelno == logging.INFO
     assert "1 handler(s) on 1 signal(s) for 2 producer(s)" in summaries[0].getMessage()
+
+
+def test_a_producer_reading_a_late_input_gets_a_repair_over_its_window(tmp_path):
+    class Late(Producer):
+        name = "late_reader"
+        system_element_name = "SE"
+        early = SignalRangeInput("early", window="10m")
+        late = SignalRangeInput("late", window="2h")
+
+        @on_metric("late")
+        async def on_late(self, metric) -> None:
+            pass
+
+    from chaski.dataops import DataOpsService
+
+    svc = DataOpsService("dataops", mount="site1", data_dir=tmp_path, historian=object())
+    producer = Late()
+    producer.early._resolved_id = "sig-early"
+    producer.late._resolved_id = "sig-late"
+    svc.instances = [producer]
+    requested = []
+    svc.request_backfill = lambda name, start, end, **kw: requested.append((name, end - start)) or "repair-1"
+    svc._inputs_resolved_late(["sig-late"])
+    assert requested == [("late_reader", pytest.approx(7200.0, abs=1.0))]
+    svc._historian = None
+    requested.clear()
+    svc._inputs_resolved_late(["sig-late"])
+    assert requested == []

@@ -17,16 +17,14 @@ import asyncio
 import json
 import logging
 import math
-import threading
 import time
 from abc import ABC
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
-from chaski.doorbell import Doorbell
 from chaski.failures import Reject
 from chaski.publishing import settle_current
 
@@ -36,6 +34,7 @@ if TYPE_CHECKING:
     from .backfill import Backfill
     from .buffer import Buffer
     from .inputs import Historian
+    from .worker import ProducerWorker
 
 log = logging.getLogger("chaski.dataops")
 
@@ -148,6 +147,12 @@ class Producer(ABC):
     # See chaski.dataops.backfill.
     backfill: ClassVar[Backfill | None] = None
 
+    # Opt in to run the @every/@cron instants missed in a stall or while the
+    # service was down, later, each at its instant (self.now): only for ticks
+    # that compute from self.now and their input windows, never from the wall
+    # clock or from state kept between ticks. See chaski.dataops.ticks.
+    catch_up_ticks: ClassVar[bool] = False
+
     # Opt in for state changed by on_metric handlers. Both hooks are required.
     # Timers/commands with state need their own explicit recovery transaction.
     state_version: ClassVar[int | None] = None
@@ -161,10 +166,7 @@ class Producer(ABC):
     _registry: ClassVar[dict[str, type[Producer]]] = {}
 
     # Set on every instance in __new__.
-    _lock: threading.RLock
-    _turn_owner: asyncio.Task | None
-    _turn_depth: int
-    _turn_bell: Doorbell
+    _worker: ProducerWorker | None
     _runtime: Runtime | None
     _handled_offsets: dict[str, int]
     _checkpoint_hash: str | None
@@ -215,16 +217,12 @@ class Producer(ABC):
         Producer._registry[cls.name] = cls
 
     def __new__(cls, *args, **kwargs) -> Producer:
-        # Handlers run on the ingest thread and ticks in APScheduler's pool; the
-        # service's wrappers take this lock around every call, so a producer's
-        # handlers and ticks never overlap. Set in __new__, like the runtime
-        # slot, so a subclass that overrides __init__ without super() has both.
+        # The service runs every callback of the instance on its own worker
+        # (chaski.dataops.worker), one at a time, so handlers, ticks and
+        # commands never overlap. Set in __new__, like the runtime slot, so a
+        # subclass that overrides __init__ without super() has both.
         self = super().__new__(cls)
-        self._lock = threading.RLock()
-        # Which task on the service's loop holds the lock (see take_turn).
-        self._turn_owner = None
-        self._turn_depth = 0
-        self._turn_bell = Doorbell()
+        self._worker = None
         self._runtime = None
         self._handled_offsets = {}
         self._checkpoint_hash = None
@@ -264,8 +262,9 @@ class Producer(ABC):
         here instead of retrying ``publish()`` on the ``RuntimeError`` it
         raises before binding, or racing its own first trigger.
 
-        An exception here is logged and does not stop this producer's
-        triggers from being wired; a producer whose startup compute may fail
+        An exception here is logged, reported as failing on the health door
+        (``<name>.on_ready``), and does not stop the service or this
+        producer's triggers from being wired; a producer whose startup compute may fail
         should catch what it expects to fail and complain through its own
         outputs, the way a trigger handler would.
         """
@@ -329,49 +328,6 @@ class Producer(ABC):
         buffer.set_watermark(self.name, position, existing_hash)
 
 
-# ─── a producer's turn on the service's loop ──────────────────────────────
-
-
-async def take_turn(producer: Producer) -> None:
-    """Take ``producer``'s lock from a coroutine on the service's loop.
-
-    The lock is a thread lock (ticks run in threads), and every coroutine on
-    the loop runs on the same thread: a command or ``@on_constant`` handler
-    would enter it while an ingest page holds it and awaits between two
-    records, and the page could enter it while the handler awaits. So the
-    task holding the turn is kept, and another task waits for it here, without
-    blocking the loop. Re-entrant within one task; :func:`give_turn` releases."""
-    task = _current_task()
-    while producer._turn_owner is not None and producer._turn_owner is not task:
-        seen = producer._turn_bell.generation
-        if producer._turn_owner is None or producer._turn_owner is task:
-            break
-        await producer._turn_bell.after(seen)
-    producer._lock.acquire()
-    producer._turn_owner = task
-    producer._turn_depth += 1
-
-
-def give_turn(producer: Producer) -> None:
-    """Release a :func:`take_turn` of the current task."""
-    producer._turn_depth -= 1
-    if producer._turn_depth == 0:
-        producer._turn_owner = None
-    producer._lock.release()
-    if producer._turn_depth == 0:
-        producer._turn_bell.ring()
-
-
-@asynccontextmanager
-async def turn(producer: Producer) -> AsyncIterator[None]:
-    """``async with turn(producer):`` — :func:`take_turn` for a block."""
-    await take_turn(producer)
-    try:
-        yield
-    finally:
-        give_turn(producer)
-
-
 # The checkpoint machinery is chaski's, not the producer's: module functions,
 # so a producer's own method of the same name never replaces it.
 
@@ -415,8 +371,7 @@ class RewindFailed(Exception):
 class _PageEntry:
     """One checkpointed producer within one page."""
 
-    #: State and handled offsets at the page's start, held while the
-    #: producer's lock is.
+    #: State and handled offsets at the page's start.
     start_state: Any
     start_offsets: dict[str, int]
     #: The first record the producer handled in the page.
@@ -435,11 +390,12 @@ class PageCheckpoints:
     """The checkpoints of the producers one ingest page reaches, saved once
     when the page ends instead of after every record.
 
-    A checkpointed producer (``state_version``) is locked from its first
-    record in the page to the page's end, so no tick or command changes its
-    state between two of its records. Its state at that first record is kept;
-    the checkpoint and handled offsets are saved once, in the page's commit,
-    before the page is acknowledged.
+    The page's records reach a producer in one piece of work on its worker
+    (:mod:`chaski.dataops.worker`), so no tick or command changes its state
+    between two of its records. A checkpointed producer's (``state_version``)
+    state at its first record is kept; the checkpoint and handled offsets are
+    saved once, when the page ends, and synced to disk with the page before it
+    is acknowledged.
 
     A handler that fails or rejects a record must leave the producer as it
     was before that record. The producer is put back to the kept state and
@@ -476,7 +432,7 @@ class PageCheckpoints:
 
     async def handle(self, producer: Producer, method: Any, metric: Any, record: Any) -> None:
         """Run one ``@on_metric`` call of a checkpointed producer at ``record``."""
-        entry = await self._enter(producer)
+        entry = self._enter(producer)
         key = method.__name__
         if record.offset <= producer._handled_offsets.get(key, -1):
             return
@@ -499,16 +455,11 @@ class PageCheckpoints:
         producer._handled_offsets[key] = record.offset
         entry.since.append((method, metric, key, record))
 
-    async def _enter(self, producer: Producer) -> _PageEntry:
+    def _enter(self, producer: Producer) -> _PageEntry:
         held = self._entries.get(id(producer))
         if held is not None:
             return held[1]
-        await take_turn(producer)
-        try:
-            state = state_copy(producer)
-        except BaseException:
-            give_turn(producer)
-            raise
+        state = state_copy(producer)
         offsets = dict(producer._handled_offsets)
         entry = _PageEntry(state, offsets, base_state=state, base_offsets=dict(offsets))
         self._entries[id(producer)] = (producer, entry)
@@ -549,25 +500,23 @@ class PageCheckpoints:
             self.failed = failed
 
     def finish(self) -> None:
-        """Save each producer's checkpoint and release it. A producer whose
-        checkpoint cannot be saved goes back to the page's start, and
-        :attr:`failed` keeps the earliest such failure."""
+        """Save each producer's checkpoint (made durable with the page, before
+        its ack). A producer whose checkpoint cannot be saved goes back to the
+        page's start, and :attr:`failed` keeps the earliest such failure."""
         entries, self._entries = list(self._entries.values()), {}
         for producer, entry in entries:
             try:
                 if entry.first is not None:
-                    save_checkpoint(producer)
+                    save_checkpoint(producer, durable=False)
             except Exception as exc:
                 self._to_start(producer, entry)
                 failed = RewindFailed(producer.name, entry.first)
                 failed.__cause__ = exc
                 if self.failed is None or entry.first.offset < self.failed.record.offset:
                     self.failed = failed
-            finally:
-                give_turn(producer)
 
 
-def save_checkpoint(producer: Producer) -> None:
+def save_checkpoint(producer: Producer, *, durable: bool = True) -> None:
     """Save the state of ``producer`` and its handled offsets; nothing for a
     producer without ``state_version``.
 
@@ -580,14 +529,25 @@ def save_checkpoint(producer: Producer) -> None:
         return
     # The state saved must not run ahead of what the node confirmed.
     settle_current()
+    row = checkpoint_row(producer)
+    if row is not None:
+        producer.runtime.buffer.save_checkpoint(*row, durable=durable)
+
+
+def checkpoint_row(producer: Producer) -> tuple[str, str, int, Any, dict[str, int]] | None:
+    """What :func:`save_checkpoint` writes for ``producer``, taken now: ``(name,
+    code_hash, state_version, state, handled_offsets)``; ``None`` without
+    ``state_version``."""
+    if producer.state_version is None:
+        return None
     if producer._checkpoint_hash is None:
         from .codehash import compute_code_hash
 
         producer._checkpoint_hash = compute_code_hash(type(producer))
-    producer.runtime.buffer.save_checkpoint(
+    return (
         producer.name,
         producer._checkpoint_hash,
         producer.state_version,
-        producer.snapshot_state(),
-        producer._handled_offsets,
+        state_copy(producer),
+        dict(producer._handled_offsets),
     )

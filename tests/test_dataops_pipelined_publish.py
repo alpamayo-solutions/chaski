@@ -117,7 +117,7 @@ async def test_a_pages_writes_are_not_waited_for_one_by_one_and_all_are_confirme
     on_publish = world.client.on_publish
     world.client.on_publish = lambda *a: (events.append("puback"), on_publish(*a))[1]
     save = world.buffer.save_checkpoint
-    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a: (events.append("save"), save(*a))[1])
+    monkeypatch.setattr(world.buffer, "save_checkpoint", lambda *a, **k: (events.append("save"), save(*a, **k))[1])
     ack = world.door.ack
     world.door.ack = lambda *a: (events.append("ack"), ack(*a))[1]
     world.door.queue(_page(1, [float(i) for i in range(20)]))
@@ -210,16 +210,3 @@ class Outputs(Producer):
     @every("1h")
     async def tick(self) -> None:
         pass
-
-
-def test_an_emitted_annotation_inside_a_page_is_committed_with_the_page(world, tmp_path):
-    import sqlite3
-
-    other = sqlite3.connect(str(tmp_path / "buffer.sqlite3"))
-    try:
-        with world.buffer.one_commit():
-            world.buffer.record_emitted_annotation("dataops/x", "ann-1", 1.0)
-            assert other.execute("SELECT COUNT(*) FROM emitted_annotations").fetchone()[0] == 0
-        assert other.execute("SELECT COUNT(*) FROM emitted_annotations").fetchone()[0] == 1
-    finally:
-        other.close()

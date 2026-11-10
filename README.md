@@ -828,6 +828,37 @@ A buffer written by chaski 0.25 or older loses the application-time state it
 kept (the `timers` and `pending_inputs` tables, `__clock__:` watermarks) when it
 is opened; nothing else in it changes.
 
+Every `@every`/`@cron` tick records the instant it ran for. Instants a tick
+missed by more than a minute (a stalled producer, a stopped service) are
+reported in the service's retained `missed_ticks` `_Finding` and on the health
+door. A producer that sets `catch_up_ticks = True` has them run later, each at
+its instant (`self.now`), on an instance of its own, once the ingest has
+caught up with the stream. Opt in only when the tick computes from `self.now`
+and its input windows: a tick that publishes at the wall clock or keeps state
+from one tick to the next does the wrong thing for a past instant. Interval
+ticks fire on multiples of their interval since the epoch.
+
+Each producer runs on a worker of its own: one thread with one event loop, on
+which its `setup`, `on_ready`, handlers, ticks, commands and backfill windows
+run one at a time, so a slow or blocking callback holds up only its own
+producer and never the service's loop. What a callback starts (a trailing run,
+a `call_later`) keeps running on that loop between callbacks. An ingest page
+commits its points once, then hands each producer its records of the page; a
+handler's window that ends at `self.now` sees the page up to its record.
+
+The buffer has one writer connection: every write is a transaction of its own,
+committed before the call returns, and an ingest page is synced to disk before
+it is acked. Readers (handlers, ticks) read on connections of their own and do
+not wait for the writer. Each input keeps its widest declared window plus an
+hour, and at least `buffer_floor` seconds (`DATAOPS_BUFFER_FLOOR_S`; default:
+`retention`, the broker's metrics retention, 14 days). The floor is what a
+code-change replay reaches back, and what a checkpointed producer's state is
+rebuilt from when its checkpoint does not match the new code; lower it only
+where producers rebuild their state from their declared windows. The trim runs
+while the ingest is caught up, in short statements that never hold up a page,
+and keeps what a running replay or backfill still reads. A buffer from chaski
+0.27 or older drops its duplicate index on `points` when it is opened.
+
 
 ### Durable publication and build compatibility
 

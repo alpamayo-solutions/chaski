@@ -12,16 +12,19 @@ The cursor is a :class:`chaski.door.Stream`, the consume lane every service
 uses. The loop opens it again whenever the signal filter changes
 (:meth:`Ingest.rebind`); the cursor name, and so its position, stays.
 
-**Crash safety.** Per page: append and run handlers, wait until the node
-confirmed what they published (their writes are pipelined,
-:mod:`chaski.publishing`), save the checkpoints of the producers that keep one
-(once per page), commit, then ack. A crash before
+**Crash safety.** Per page: commit the page's points, run the handlers, wait
+until the node confirmed what they published (their writes are pipelined,
+:mod:`chaski.publishing`), commit the checkpoints of the producers that keep
+one (once per page), sync the buffer to disk, then ack. A crash before
 the ack redelivers the page, and appends are idempotent on
 ``(signal_id, ts)``. Handlers must be idempotent for the same reason.
 
-**One page, one hop.** The worker thread hands a page with handlers to the
-service's loop once; there each record is appended, then handled, in stream
-order (:meth:`Ingest._dispatch_page`).
+**Each producer on its own worker.** The ingest's thread commits a page's
+points, then hands each producer its records of the page in one piece of work
+on its worker (:mod:`chaski.dataops.worker`, :meth:`Ingest._dispatch_page`),
+in stream order. Nothing of a producer runs on the service's loop. A handler
+reads the buffer as the page left it: a window ending at its record's event
+time (``self.now``) sees every point of the page up to then.
 
 **A failed handler is not acknowledged.** The cursor moves only past the
 records before it, and :meth:`Ingest.run_forever` retries the same record
@@ -72,6 +75,7 @@ pages it walks hold none of its signals and are acked past.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import threading
 import time
@@ -90,6 +94,7 @@ from chaski.retry import Backoff
 
 from .base import PageCheckpoints, RewindFailed
 from .buffer import Buffer
+from .worker import worker_of
 
 log = logging.getLogger("chaski.dataops.ingest")
 
@@ -189,6 +194,9 @@ class Ingest:
         #: producer over to live dispatch under it, between two pages
         #: (:mod:`chaski.dataops.backfill`).
         self.page_lock = threading.Lock()
+        #: Per producer (``id``), the offset through which its handlers ran;
+        #: a page read again skips what they already handled.
+        self._handled_through: dict[int, int] = {}
         #: Rung each time a drain reaches the head and the loop starts to wait.
         self.caught_up = Doorbell()
         self._window_started = time.monotonic()
@@ -217,10 +225,10 @@ class Ingest:
         Producers often start before the signals they read are commissioned.
         Only the table and the filter change; the cursor keeps its position.
         Records of a newly resolved signal that the cursor passed while the
-        filter left it out are not read again: nothing recovers them on its
-        own. A producer that needs them repairs the range
-        (:meth:`~chaski.dataops.DataOpsService.request_backfill`, from the
-        historian).
+        filter left it out are not read again here; the service repairs the
+        windows of the producers that read it from the historian, or reports
+        the loss where there is none
+        (:meth:`~chaski.dataops.DataOpsService._inputs_resolved_late`).
         """
         self._dispatch = dispatch or {}
         self._signal_ids = list(signal_ids) if signal_ids is not None else None
@@ -284,67 +292,106 @@ class Ingest:
 
         self._failed = None
         records = page.records
-        # One commit per page: the page is acked only after it, and a crash
-        # before the ack appends the page again.
-        with self.page_lock, self._buffer.one_commit():
+        with self.page_lock:
             if any(self._dispatch.get(self._signal_id_of(record) or "") for record in records):
-                # One hop to the loop per page, not per record.
-                asyncio.run_coroutine_threadsafe(self._dispatch_page(records), loop).result()
+                self._dispatch_page(records, loop)
             else:
                 self._append_many(records)
+            # What the page wrote is on disk before it is acked.
+            self._buffer.sync()
         return len(records)
 
-    async def _dispatch_page(self, records: list[Record]) -> None:
-        """Append and dispatch ``records`` in order, on the service's loop.
+    def _dispatch_page(self, records: list[Record], loop: asyncio.AbstractEventLoop) -> None:
+        """Append ``records`` and run their handlers, from the ingest's thread.
 
-        A record is appended right before its handlers run, so a handler sees
-        no later record of the page. What the handlers publish is pipelined
-        (:class:`~chaski.publishing.PublishBatch`) and confirmed when the page
-        ends, before checkpointed producers save their state once
-        (:class:`~chaski.dataops.base.PageCheckpoints`), still inside the
-        page's commit and before its ack. A write the node refused or did not
-        confirm puts every checkpointed producer back to the page's start, and
-        the page is acked only before its first handled record.
+        The page's points are committed first. Each producer's records of the
+        page then go to its worker (:mod:`chaski.dataops.worker`) in one piece
+        of work (:meth:`_slice`), in stream order; producers run side by side.
+        What a producer publishes is pipelined
+        (:class:`~chaski.publishing.PublishBatch`) and confirmed when its
+        records are done, before a checkpointed producer saves its state once
+        (:class:`~chaski.dataops.base.PageCheckpoints`), before the page's sync
+        and ack. Handlers without a producer run on ``loop``.
+
+        A handler that fails stops its producer at that record; the other
+        producers finish the page. The page is acked only before the earliest
+        record that failed (or that a producer was put back to, after a write
+        the node refused or did not confirm), and the records after it are
+        read again; a producer skips those it already handled
+        (``_handled_through``, kept in memory: after a restart every
+        unacknowledged record is handled again, which handlers tolerate).
         """
+        self._append_many(records)
+        slices: dict[int, tuple[Any, list[tuple[Handler, Record]]]] = {}
+        for record in records:
+            signal_id = self._signal_id_of(record)
+            for handler in self._dispatch.get(signal_id, ()) if signal_id is not None else ():
+                producer = getattr(handler, "producer", None)
+                through = self._handled_through.get(id(producer))
+                if through is not None and record.offset <= through:
+                    continue
+                slices.setdefault(id(producer), (producer, []))[1].append((handler, record))
+        if not slices:
+            return
+        running = []
+        for key, (producer, items) in slices.items():
+            worker = worker_of(producer)
+            work = functools.partial(self._slice, items)
+            done = worker.submit(work) if worker is not None else asyncio.run_coroutine_threadsafe(work(), loop)
+            running.append((key, items, done))
+        earliest: tuple[str, Record, BaseException] | None = None
+        for key, items, done in running:
+            try:
+                failed, through = done.result()
+            except BaseException as exc:  # the worker stopped under it
+                failed, through = (consumer_name(items[0][0]), items[0][1], exc), items[0][1].offset - 1
+            known = self._handled_through.get(key)
+            # A failure, or a rewind, puts the producer back to before it.
+            if failed is not None or known is None or through > known:
+                self._handled_through[key] = through
+            if failed is not None and (earliest is None or failed[1].offset < earliest[1].offset):
+                earliest = failed
+        if earliest is not None:
+            self._failed = (earliest[0], earliest[1])
+            raise earliest[2]
+
+    async def _slice(self, items: list[tuple[Handler, Record]]) -> tuple[tuple[str, Record, BaseException] | None, int]:
+        """One producer's records of a page, on its worker, in order. Returns
+        the failure that stopped it (``(consumer, record, exception)``), if
+        any, and the offset through which its records were handled."""
         page = PageCheckpoints()
         batch = PublishBatch()
-        first_handled: Record | None = None
-        try:
-            with page.active():
-                try:
-                    with batch.active():
-                        # Records nobody handles are appended together, right
-                        # before the next record that is handled (or the page's end).
-                        quiet: list[Record] = []
-                        for record in records:
-                            signal_id = self._signal_id_of(record)
-                            if signal_id is None or not self._dispatch.get(signal_id):
-                                quiet.append(record)
-                                continue
-                            self._append_many(quiet)
-                            quiet.clear()
-                            self._append(record)
-                            if first_handled is None:
-                                first_handled = record
-                            await self._handle(signal_id, record)
-                        self._append_many(quiet)
-                finally:
-                    # Confirmed also when a handler failed: the records before
-                    # it are acked, and their writes with them.
-                    if len(batch):
+        failed: tuple[str, Record, BaseException] | None = None
+        first = items[0][1]
+        through = first.offset - 1
+        with page.active():
+            try:
+                with batch.active():
+                    for handler, record in items:
                         try:
-                            await asyncio.to_thread(batch.settle)
+                            await self._call(handler, record)
+                        except RewindFailed as exc:
+                            # The producer went back to its first record of the page.
+                            failed, through = (exc.consumer, exc.record, exc), exc.record.offset - 1
+                            break
                         except Exception as exc:
-                            page.abandon(batch.failed_origin or "publish", first_handled or records[0], exc)
-        finally:
-            # A checkpoint that could not be saved, or a write that was not
-            # confirmed, puts producers back to the page's records named here;
-            # the page is acked only before that record.
-            late = page.failed
-            if late is not None and (self._failed is None or late.record.offset < self._failed[1].offset):
-                self._failed = (late.consumer, late.record)
-        if page.failed is not None:
-            raise page.failed
+                            failed, through = (consumer_name(handler), record, exc), record.offset - 1
+                            break
+                        through = record.offset
+            finally:
+                # Confirmed also when a handler failed: the records before it
+                # are acked, and their writes with them.
+                if len(batch):
+                    try:
+                        await asyncio.to_thread(batch.settle)
+                    except Exception as exc:
+                        page.abandon(batch.failed_origin or "publish", first, exc)
+        # A checkpoint that could not be saved, or a write that was not
+        # confirmed, put the producer back to its first record of the page.
+        late = page.failed
+        if late is not None and (failed is None or late.record.offset <= failed[1].offset):
+            failed, through = (late.consumer, late.record, late), late.record.offset - 1
+        return failed, through
 
     # ------------------------------------------------------------------ read-ahead
 
@@ -457,7 +504,7 @@ class Ingest:
                 self._no_signal_id(record)
                 continue
             points.append((signal_id, self._timestamp_of(record), self._value_of(record)))
-        self._buffer.append_many(points)
+        self._buffer.append_many(points, durable=False)
 
     @staticmethod
     def _no_signal_id(record: Record) -> None:
@@ -465,40 +512,23 @@ class Ingest:
             "Record at offset=%d on %s has no signal_id — cannot buffer or dispatch it", record.offset, record.topic
         )
 
-    def _append(self, record: Record) -> str | None:
-        """Buffer one record; its ``signal_id``, or ``None`` when it has none."""
-        signal_id = self._signal_id_of(record)
-        if signal_id is None:
-            self._no_signal_id(record)
-            return None
-        self._buffer.append(signal_id, self._timestamp_of(record), self._value_of(record))
-        return signal_id
-
-    async def _handle(self, signal_id: str, record: Record) -> None:
-        for handler in self._dispatch.get(signal_id, []):
-            name = consumer_name(handler)
-            batch = PublishBatch.current()
-            if batch is not None:
-                batch.origin = name
-            try:
-                try:
-                    await handler(record)
-                except Reject as rejected:
-                    subject = {
-                        "stream": STREAM,
-                        "cursor": self.cursor,
-                        "signal_id": signal_id,
-                        **record_subject(record),
-                    }
-                    await asyncio.to_thread(self._record_rejection, name, subject, rejected)
-            except RewindFailed as exc:
-                # The producer went back to its first record of the page.
-                self._failed = (exc.consumer, exc.record)
-                raise
-            except Exception:
-                self._failed = (name, record)
-                raise
-            self._health.succeeded(name)
+    async def _call(self, handler: Handler, record: Record) -> None:
+        """Run one handler at ``record``, in a :class:`_Session`."""
+        name = consumer_name(handler)
+        batch = PublishBatch.current()
+        if batch is not None:
+            batch.origin = name
+        try:
+            await handler(record)
+        except Reject as rejected:
+            subject = {
+                "stream": STREAM,
+                "cursor": self.cursor,
+                "signal_id": self._signal_id_of(record),
+                **record_subject(record),
+            }
+            await asyncio.to_thread(self._record_rejection, name, subject, rejected)
+        self._health.succeeded(name)
 
     def _record_rejection(self, name: str, subject: dict[str, Any], rejected: Reject) -> None:
         if self._reject is None:

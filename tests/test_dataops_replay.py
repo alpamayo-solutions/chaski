@@ -283,7 +283,7 @@ async def test_checkpoint_failure_restores_memory_and_preserves_retry(buffer, ru
     await replay_changed_producers(runtime, [instance])
     save = buffer.save_checkpoint
 
-    def broken(*args):
+    def broken(*args, **kwargs):
         raise OSError("disk full")
 
     monkeypatch.setattr(buffer, "save_checkpoint", broken)
