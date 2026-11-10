@@ -337,11 +337,10 @@ def test_three_days_of_missed_ticks_are_caught_up_at_their_instants(tmp_path):
     class Oee(Producer):
         name = "oee"
         system_element_name = "Line/M1"
-        catch_up_ticks = True
         state = SignalRangeInput("state", window="2h")
         mean = SignalOutput("hourly_mean", "float", "mean state over the hour")
 
-        @every("1h")
+        @every("1h", catch_up=True)
         async def tick(self) -> None:
             frame = self.state.fetch(self.now - 3600.0, self.now)
             if len(frame):

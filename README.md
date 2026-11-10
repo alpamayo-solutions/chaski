@@ -831,9 +831,11 @@ is opened; nothing else in it changes.
 Every `@every`/`@cron` tick records the instant it ran for. Instants a tick
 missed by more than a minute (a stalled producer, a stopped service) are
 reported in the service's retained `missed_ticks` `_Finding` and on the health
-door. A producer that sets `catch_up_ticks = True` has them run later, each at
-its instant (`self.now`), on an instance of its own, once the ingest has
-caught up with the stream. Opt in only when the tick computes from `self.now`
+door. A tick declared with `catch_up=True` (`@every("30s", catch_up=True)`,
+`@cron(..., catch_up=True)`) has them run later, each at its instant
+(`self.now`), on an instance of its own, once the ingest has caught up with
+the stream. The choice is per tick: a subclass flags its own ticks and never
+the ones it inherits. Opt in only when the tick computes from `self.now`
 and its input windows: a tick that publishes at the wall clock or keeps state
 from one tick to the next does the wrong thing for a past instant. Interval
 ticks fire on multiples of their interval since the epoch.

@@ -1181,7 +1181,6 @@ async def test_a_tick_catch_up_runs_each_missed_instant_at_its_time_on_an_instan
     class Oee(Producer):
         name = "oee"
         system_element_name = "press"
-        catch_up_ticks = True
         state = SignalRangeInput("state", window="1h")
 
         def __init__(self) -> None:
@@ -1189,7 +1188,7 @@ async def test_a_tick_catch_up_runs_each_missed_instant_at_its_time_on_an_instan
             self.ran: list[tuple[float, object]] = []
             instances.append(self)
 
-        @every("1h")
+        @every("1h", catch_up=True)
         async def tick(self) -> None:
             if len(self.ran) == 5:
                 self.ran.append((self.now, "failed"))
