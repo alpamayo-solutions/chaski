@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/alpamayo-solutions/chaski/compare/v0.27.3...v0.28.0) (2026-11-10)
+
+
+### Features
+
+* **dataops:** runtime hardening: single buffer writer, paced trim, one worker per producer, durable ticks ([#198](https://github.com/alpamayo-solutions/chaski/issues/198)) ([e10b3cf](https://github.com/alpamayo-solutions/chaski/commit/e10b3cf25bcd855fbcaba3771794b78203662b87))
+
 ## [0.27.3](https://github.com/alpamayo-solutions/chaski/compare/v0.27.2...v0.27.3) (2026-11-09)
 
 
