@@ -858,8 +858,10 @@ code-change replay reaches back, and what a checkpointed producer's state is
 rebuilt from when its checkpoint does not match the new code; lower it only
 where producers rebuild their state from their declared windows. The trim runs
 while the ingest is caught up, in short statements that never hold up a page,
-and keeps what a running replay or backfill still reads. A buffer from chaski
-0.27 or older drops its duplicate index on `points` when it is opened.
+and keeps what a running replay or backfill still reads. Opening a buffer never
+rewrites it whole: a buffer from chaski 0.27 or older keeps its second index on
+`points` (the same columns as the primary key: it costs disk space and write time,
+nothing else).
 
 
 ### Durable publication and build compatibility
