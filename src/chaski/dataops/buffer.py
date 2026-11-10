@@ -271,15 +271,12 @@ class Buffer:
         conn.execute("DROP TABLE IF EXISTS pending_inputs")
         conn.execute("DELETE FROM watermarks WHERE substr(producer, 1, 10) = '__clock__:'")
         conn.execute("DELETE FROM meta WHERE key = 'input_intake'")
-        # chaski 0.27 and older indexed ``points`` twice on (signal_id, ts):
-        # its primary key and this index. The copy cost a third of the file
-        # and of the page writes of every append and trim.
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_points_signal_ts'").fetchone():
-            began = time.monotonic()
-            conn.execute("DROP INDEX idx_points_signal_ts")
-            log.info(
-                "Dropped the duplicate index on buffered points in %.1f s (%s)", time.monotonic() - began, self._path
-            )
+        # chaski 0.27 and older also indexed ``points`` on (signal_id, ts), a
+        # copy of its primary key. It stays: dropping it frees every page of
+        # it in one transaction, and with SQLite's secure_delete (Debian's
+        # default) each freed page is rewritten into the WAL, a gigabyte on a
+        # large buffer, more than a small container's memory. Startup only
+        # makes writes whose size does not grow with the buffer.
 
     def _read(self) -> sqlite3.Connection:
         """This thread's read connection (the write connection on the writer

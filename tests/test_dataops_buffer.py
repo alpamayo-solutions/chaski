@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -428,23 +429,58 @@ def test_a_reader_does_not_wait_for_a_long_write(db_path):
         buffer.close()
 
 
-def test_opening_an_old_buffer_drops_the_duplicate_points_index(db_path):
+def _bytes_written() -> int:
+    """Bytes this process has written so far (WAL and database file alike)."""
+    with open("/proc/self/io") as io:
+        return next(int(line.split()[1]) for line in io if line.startswith("wchar:"))
+
+
+@pytest.mark.skipif(not Path("/proc/self/io").exists(), reason="counts writes through Linux /proc/self/io")
+def test_opening_a_large_old_buffer_writes_a_bounded_wal_and_keeps_its_index(db_path, monkeypatch):
+    """chaski 0.27 and older indexed ``points`` twice. Opening such a buffer
+    leaves the copy alone: dropping it rewrote every page of it into the WAL
+    (secure_delete), a gigabyte on a plant's buffer, which a 512 MiB container
+    did not survive. Startup writes stay small whatever the buffer's size."""
     old = sqlite3.connect(db_path)
+    old.execute("PRAGMA journal_mode=WAL")
     old.executescript(
         """
         CREATE TABLE points (signal_id TEXT NOT NULL, ts REAL NOT NULL, value TEXT NOT NULL,
                              PRIMARY KEY (signal_id, ts));
         CREATE INDEX idx_points_signal_ts ON points (signal_id, ts);
-        INSERT INTO points VALUES ('sig-1', 10, '1');
         """
     )
+    signals = [f"uns/plant/area/line-{n:03d}/machine/temperature" for n in range(50)]
+    old.executemany(
+        "INSERT INTO points VALUES (?, ?, ?)",
+        ((signals[i % 50], float(i // 50), "21.5") for i in range(200_000)),
+    )
     old.commit()
+    old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    index_bytes = old.execute("SELECT SUM(pgsize) FROM dbstat WHERE name = 'idx_points_signal_ts'").fetchone()[0]
     old.close()
+    assert index_bytes > 8 * 1024 * 1024  # the index alone outgrows the bound below
+
+    # Debian's SQLite (the service image's) is built with secure_delete on,
+    # which turns every page a statement frees into a page written.
+    connect = sqlite3.connect
+
+    def secure_connect(*args, **kwargs):
+        conn = connect(*args, **kwargs)
+        conn.execute("PRAGMA secure_delete=ON")
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", secure_connect)
+    written_before = _bytes_written()
     buffer = Buffer(db_path)
     try:
+        assert _bytes_written() - written_before < 1024 * 1024
         indexes = {row[0] for row in buffer._read().execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        assert "idx_points_signal_ts" not in indexes
-        assert buffer.latest("sig-1") == 10
+        assert "idx_points_signal_ts" in indexes
+        assert buffer.latest(signals[0]) == 3999.0
+        buffer.append(signals[0], 4000.0, 22.0)
+        assert buffer.trim({signals[0]: 10.0}, now=4005.0) == 3994
+        assert buffer.points(signals[0], 0, 5000) == [(float(ts), 21.5) for ts in range(3994, 4000)] + [(4000.0, 22.0)]
     finally:
         buffer.close()
 
