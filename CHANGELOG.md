@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.1](https://github.com/alpamayo-solutions/chaski/compare/v0.28.0...v0.28.1) (2026-11-10)
+
+
+### Fixes
+
+* **dataops:** catch-up of missed ticks is declared per tick ([#200](https://github.com/alpamayo-solutions/chaski/issues/200)) ([a6e0b72](https://github.com/alpamayo-solutions/chaski/commit/a6e0b727db37202c14211761416b1a81f18ce394))
+
 ## [0.28.0](https://github.com/alpamayo-solutions/chaski/compare/v0.27.3...v0.28.0) (2026-11-10)
 
 
