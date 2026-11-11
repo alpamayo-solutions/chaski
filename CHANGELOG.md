@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.3](https://github.com/alpamayo-solutions/chaski/compare/v0.28.2...v0.28.3) (2026-11-11)
+
+
+### Fixes
+
+* producer setup failures isolated, retained _Metric holds the newest sample ([#204](https://github.com/alpamayo-solutions/chaski/issues/204)) ([767eb14](https://github.com/alpamayo-solutions/chaski/commit/767eb141bcd4ac50e54882570ae0048513162f00))
+
 ## [0.28.2](https://github.com/alpamayo-solutions/chaski/compare/v0.28.1...v0.28.2) (2026-11-10)
 
 
