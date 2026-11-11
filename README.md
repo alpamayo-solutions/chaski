@@ -522,7 +522,12 @@ class Ownership(Producer):
 delivery is retained, so subscribing also delivers whatever is already set.
 `on_ready()` runs once per producer, after every output is bound and before
 any trigger — `@every`/`@cron`/`@on_metric`/`@on_constant`/`@on_signal` —
-can fire, for startup work that needs to publish.
+can fire, for startup work that needs to publish. A failing `on_ready()` is
+reported and the producer's triggers run anyway. A failing `setup()` leaves
+that producer out of the run: it is reported on the health door and in the
+service's retained `producers_not_started` finding, none of its triggers is
+wired, and the other producers run. A code change or a restart sets it up
+again.
 
 `@on_command` executes a command sent to an exact node-local path and answers
 it with an `_Ack` beside it (`_Ack/<node>/<path>`). A person may command but

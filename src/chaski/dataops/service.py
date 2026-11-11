@@ -38,8 +38,11 @@ producer runtime.
 Startup order inside :meth:`DataOpsService.serve`:
 
  1. ``start()``: connect, register, open the door, then open the buffer
- 2. instantiate every producer, attach it and run ``setup()``; a failed
-    producer stops startup before intake can advance
+ 2. instantiate every producer, attach it and run ``setup()``; a producer
+    whose ``setup()`` raises is reported (health door, ``producers_not_started``
+    finding) and left out of this run: its outputs stay catalogued, none of
+    its triggers is wired, and the other producers run. A code change or a
+    restart runs its ``setup()`` again
  3. open the live resolution index (an unplaced local service: one KV read,
     then the node's retained ``_SystemElement``/``_Signal``/``_AnnotationType``
     records over MQTT), publish the ``SignalOutput`` catalogue if it changed,
@@ -142,6 +145,14 @@ INDEX_RETRY_S = 1.0
 _METRIC_FIELDS = {f.name for f in fields(Metric)}
 #: The retained finding that names input records pruned before they were read.
 GAP_FINDING = "stream_gap"
+#: The retained ``_Finding`` naming producers that could not start in this run.
+NOT_STARTED_FINDING = "producers_not_started"
+
+
+def _error_text(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"[:200]
+
+
 #: The verb, below the service's own path, of the command accepting their loss.
 ACCEPT_GAP = "acceptGap"
 ACCEPT_GAP_CONTRACT = "_CmdMaintain"
@@ -958,6 +969,8 @@ class DataOpsService(Service):
         #: not be built: reported as failing on the health door at start.
         self._failed_modules: dict[str, BaseException] = {}
         self._failed_producers: dict[str, BaseException] = {}
+        #: Producers whose setup() raised in this run: not wired, reported.
+        self._failed_setups: dict[str, BaseException] = {}
         #: Missed tick instants: reported, and caught up where a producer does.
         self.missed_ticks: ticks.MissedTicks | None = None
 
@@ -1080,6 +1093,40 @@ class DataOpsService(Service):
             self.retract(topic)
         else:
             self.send(topic, json.dumps(payload), retain=True)
+
+    def _publish_not_started_finding(self) -> None:
+        """Publish the retained ``producers_not_started`` finding naming every
+        producer module, producer and ``setup()`` that failed at this start,
+        or retire it when everything started."""
+        failed = [
+            *(
+                {"kind": "module", "name": name, "error": _error_text(exc)}
+                for name, exc in self._failed_modules.items()
+            ),
+            *(
+                {"kind": "producer", "name": name, "error": _error_text(exc)}
+                for name, exc in self._failed_producers.items()
+            ),
+            *({"kind": "setup", "name": name, "error": _error_text(exc)} for name, exc in self._failed_setups.items()),
+        ]
+        payload: dict[str, Any] | None = None
+        if failed:
+            names = ", ".join(f"{f['name']} ({f['kind']})" for f in failed)
+            payload = {
+                "reason": NOT_STARTED_FINDING,
+                "summary": f"{len(failed)} producer(s) did not start and do not run: {names}"[:300],
+                "observed_at": time.time(),
+                "suggested_severity": "critical",
+                "detail": {"failed": failed},
+                "remedy": (
+                    "Fix the cause named in the error, then deploy the fix or restart the service; "
+                    "the other producers keep running meanwhile."
+                ),
+            }
+        try:
+            self._publish_finding(NOT_STARTED_FINDING, payload)
+        except Exception as exc:
+            warn_failure(log, exc, "Could not publish the %s finding", NOT_STARTED_FINDING)
 
     def _account_missed_ticks(self, instances: list[Producer]) -> None:
         """At start: the tick instants missed while the service was down."""
@@ -1597,25 +1644,43 @@ class DataOpsService(Service):
             else:
                 log.info("Running %d producer(s): %s", len(producers), [p.name for p in producers])
 
-            # Every configured producer must initialize before intake can advance.
+            # Every producer initializes before intake can advance. One whose
+            # setup() raises is left out of this run: no trigger of it is
+            # wired, nothing advances its progress, and the others run.
             instances: list[Producer] = []
             self.instances = instances
+            not_set_up: list[Producer] = []
             for instance in self.instantiate():
                 # Everything of a producer runs on its own worker from here on.
                 instance._worker = ProducerWorker(instance.name)
                 instances.append(instance)
-                await on_worker(instance, instance.setup)
-            # What could not even start stays visible: failing on the health
-            # door and in the service's status, until it is fixed and restarted.
+                try:
+                    await on_worker(instance, instance.setup)
+                except Exception as error:
+                    log.error("%s.setup failed; its triggers are not wired in this run", instance.name, exc_info=error)
+                    self._failed_setups[instance.name] = error
+                    not_set_up.append(instance)
+            # What could not start stays visible: failing on the health door,
+            # in the service's status and as a retained finding, until it is
+            # fixed (a code change or a restart runs it again).
             for module, exc in self._failed_modules.items():
                 self.handler_health.failed(f"module {module}", exc)
             for producer, exc in self._failed_producers.items():
                 self.handler_health.failed(f"producer {producer}", exc)
+            for producer, exc in self._failed_setups.items():
+                self.handler_health.failed(f"{producer}.setup", exc)
+            await asyncio.to_thread(self._publish_not_started_finding)
 
             # 3) Catalogue the SignalOutputs and bind the AnnotationOutputs,
             #    after opening the live resolution index so the bindings the
-            #    node writes for the catalogue arrive on it.
+            #    node writes for the catalogue arrive on it. A producer whose
+            #    setup failed still declares its outputs: they stay in the
+            #    catalogue, not stale, for the run that sets it up.
             self.bind_outputs(instances)
+            for instance in not_set_up:
+                instances.remove(instance)
+                if instance._worker is not None:
+                    await asyncio.to_thread(instance._worker.stop)
             # Catalogue publication commits new Signal bindings. Synchronize
             # once at this causal boundary, before on_ready or durable ingest;
             # ordinary per-signal lookups thereafter use the pushed cache.
