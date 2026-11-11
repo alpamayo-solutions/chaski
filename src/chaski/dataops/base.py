@@ -243,6 +243,14 @@ class Producer(ABC):
         (``DataOpsService.serve``'s own startup order) — a ``publish()``
         called from here raises. Use :meth:`on_ready` for startup work that
         needs to publish.
+
+        An exception here is logged and reported as failing on the health
+        door (``<name>.setup``) and in the service's retained
+        ``producers_not_started`` finding. This producer then does not run
+        in this service run: none of its triggers is wired and its tick
+        progress does not advance. Its outputs stay catalogued, and the other
+        producers run normally. A code change or a restart runs ``setup()``
+        again; there is no retry loop.
         """
 
     async def on_ready(self) -> None:  # noqa: B027 - optional hook

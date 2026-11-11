@@ -2,7 +2,10 @@
 
 Capture stream positions before the snapshot; catch up from those positions
 before exposing it. Per-topic offsets reject records older than the snapshot.
-Tombstones are applied too. This view is rebuildable, not a delivery ledger.
+Tombstones are applied too. A _Metric entry holds the newest sample, as
+Colca's current value does: a record whose payload timestamp (capped at
+ingest time + :data:`SAMPLE_LEAD_S`) is older than the held one's is history
+and does not replace it; the same timestamp does. This view is rebuildable, not a delivery ledger.
 
 A view holds its contracts within one :class:`ViewScope`: the paths it reads.
 The snapshot reads only those paths, and the drain fetches only its contracts
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -58,6 +62,31 @@ WALK_INTERVAL_S = 1.0
 #: How long an available view keeps serving its last applied state while its
 #: background drain fails for a reason Colca causes and retries (see the module).
 STALE_GRACE_S = 30.0
+
+#: How far a _Metric's payload timestamp may run ahead of the time Colca
+#: ingested it before the view orders it by ingest time + this, as Colca does.
+SAMPLE_LEAD_S = 60.0
+
+
+def sample_order(payload, ts_ms) -> float | None:
+    """The time a _Metric record is ordered by, in unix seconds, as Colca
+    orders its current value: the payload's ``timestamp``, capped at
+    :data:`SAMPLE_LEAD_S` past the ingest time ``ts_ms`` (milliseconds);
+    the ingest time without a timestamp; None when neither is known."""
+    ingest = ts_ms / 1000.0 if ts_ms else None
+    stamp = payload.get("timestamp") if isinstance(payload, Mapping) else None
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp) and 0 < stamp < 9.2e9:
+        return stamp if ingest is None else min(stamp, ingest + SAMPLE_LEAD_S)
+    return ingest
+
+
+def _older(record, held) -> bool:
+    """Whether a _Metric record is older than the entry the view holds for its
+    topic: then it is history, not the current value. The same time replaces."""
+    if held is None:
+        return False
+    at, held_at = sample_order(record.payload, record.ts), sample_order(held.payload, held.ts)
+    return at is not None and held_at is not None and at < held_at
 
 
 @dataclass(frozen=True, init=False)
@@ -394,8 +423,17 @@ class RetainedView:
                             if record.offset <= self.offsets.get(record.topic, -1):
                                 continue
                             self.offsets[record.topic] = record.offset
+                            tombstone = record.payload is None or record.payload == b""
+                            if (
+                                not tombstone
+                                and parts[2] == "_Metric"
+                                and _older(record, self.entries.get(record.topic))
+                            ):
+                                # Colca keeps the newest sample as current; an
+                                # older one (backfill, repair) is history only.
+                                continue
                             self.revision += 1
-                            if record.payload is None or record.payload == b"":
+                            if tombstone:
                                 self.entries.pop(record.topic, None)
                             else:
                                 self.entries[record.topic] = KvEntry(

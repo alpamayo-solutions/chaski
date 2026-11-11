@@ -590,6 +590,86 @@ async def test_a_failing_on_ready_is_reported_and_the_service_runs_on(tmp_path: 
 
 
 @run_async
+async def test_a_failing_setup_leaves_out_that_producer_and_the_others_run(tmp_path: Path, monkeypatch):
+    """chaski 0.28 stopped the whole service when one producer's setup()
+    raised. That producer is now reported (health door and a retained
+    finding) and left out of the run; its outputs stay catalogued, and the
+    other producers' triggers run."""
+    ran: list[str] = []
+
+    class BrokenSetup(Producer):
+        name = "broken_setup"
+        system_element_name = "press"
+        state = SignalOutput("state", "string", "never written in a run whose setup failed")
+
+        async def setup(self) -> None:
+            raise RuntimeError("state file unreadable")
+
+        async def on_ready(self) -> None:
+            ran.append("on_ready")
+
+        @on_constant("press/operator/setpoint")
+        async def on_setpoint(self, constant) -> None:
+            ran.append("on_setpoint")
+
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(BrokenSetup)
+    svc.add(ReadyAndWatched)
+    findings: list[tuple[str, dict | None]] = []
+    publish_finding = svc._publish_finding
+
+    def record(reason: str, payload: dict | None) -> None:
+        findings.append((reason, payload))
+        publish_finding(reason, payload)
+
+    monkeypatch.setattr(svc, "_publish_finding", record)
+    working = f"colca/v1/_Constant/{NODE_ID}/oven/operator/setpoint"
+    broken = f"colca/v1/_Constant/{NODE_ID}/press/operator/setpoint"
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: working in client.subscriptions)
+        assert not task.done()
+        assert broken not in client.subscriptions
+        assert "broken_setup.setup" in svc.handler_health.failing()
+        assert [i.name for i in svc.instances] == ["ready_and_watched"]
+        # The working producer's on_ready published; the broken one's did not run.
+        await _poll_until(lambda: any(t.endswith("/oven/ready") for t, _ in _FakeNodeDoor.instances[0].metrics()))
+        assert ran == []
+        (payload,) = [p for r, p in findings if r == "producers_not_started"]
+        assert payload is not None
+        assert payload["detail"]["failed"] == [
+            {"kind": "setup", "name": "broken_setup", "error": "RuntimeError: state file unreadable"}
+        ]
+        assert any(t.endswith("/producers_not_started") for t, _ in client.published)
+        # Its output stays declared, not stale, for the run that sets it up.
+        tag = svc._started_catalogue.tag("broken_setup.state")
+        assert tag is not None and not tag.is_stale
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+
+@run_async
+async def test_a_clean_start_retires_the_producers_not_started_finding(tmp_path: Path, monkeypatch):
+    client = _FakeClient()
+    _connect(client, monkeypatch)
+    svc = DataOpsService("dataops", state_dir=tmp_path, data_dir=tmp_path / "data", retry_min=0.02, health_port=0)
+    svc.add(ReadyAndWatched)
+    findings: list[tuple[str, dict | None]] = []
+    monkeypatch.setattr(svc, "_publish_finding", lambda reason, payload: findings.append((reason, payload)))
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(svc.serve(stop))
+    try:
+        await _poll_until(lambda: ("producers_not_started", None) in findings)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)
+
+
+@run_async
 async def test_a_module_that_fails_to_import_is_reported_as_failing(tmp_path: Path, monkeypatch):
     modules = tmp_path / "modules"
     modules.mkdir()

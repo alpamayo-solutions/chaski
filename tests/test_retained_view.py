@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from chaski.door import Gap, KvEntry, Page
-from chaski.retained_view import RetainedView, ViewScope
+from chaski.retained_view import RetainedView, ViewScope, sample_order
 
 TOPIC = "colca/v1/_Metric/node/temperature"
 
@@ -81,6 +81,51 @@ def test_disconnect_refuses_cached_state_and_gap_rebuilds_from_snapshot():
     assert door.snapshots == 2
     door.put({"value": 3})
     assert view(door).read()[0].payload["value"] == 3
+
+
+class TimedDoor(Door):
+    """Door whose records carry an ingest time (ms) and payload timestamps."""
+
+    def put_at(self, value, stamp, ingest_ms=1_800_000_000_000):
+        payload = {"value": value, "timestamp": stamp}
+        self.records.append(SimpleNamespace(topic=TOPIC, payload=payload, offset=len(self.records) + 1, ts=ingest_ms))
+
+    def kv(self, prefix, *, contract, depth=None):
+        self.snapshots += 1
+        return []  # start empty: every record arrives through the drain
+
+
+def test_an_older_sample_does_not_replace_the_newest_one():
+    door = TimedDoor()
+    current = view(door)
+    assert current.synchronize()[1] == []  # hydrated empty: what follows arrives through the drain
+    door.put_at(2, 1_700_000_200)
+    door.put_at(1, 1_700_000_100)  # a backfill after the newer sample
+    assert current.synchronize()[1][0].payload["value"] == 2
+    door.put_at(3, 1_700_000_200)  # a correction at the same timestamp
+    assert current.synchronize()[1][0].payload["value"] == 3
+    door.put_at(4, 1_700_000_201)
+    assert current.synchronize()[1][0].payload["value"] == 4
+
+
+def test_a_future_dated_sample_holds_for_at_most_a_minute_past_its_ingest():
+    door = TimedDoor()
+    current = view(door)
+    assert current.synchronize()[1] == []
+    ingest = 1_700_000_000_000
+    door.put_at(1, 1_800_000_000, ingest)  # device clock years ahead
+    door.put_at(2, 1_700_000_030, ingest + 30_000)
+    assert current.synchronize()[1][0].payload["value"] == 1
+    door.put_at(3, 1_700_000_061, ingest + 61_000)
+    assert current.synchronize()[1][0].payload["value"] == 3
+
+
+def test_sample_order():
+    assert sample_order({"timestamp": 10.5}, 0) == 10.5
+    assert sample_order({"timestamp": 10.5}, 20_000) == 10.5
+    assert sample_order({"timestamp": 500}, 20_000) == 80.0  # capped at ingest + 60 s
+    assert sample_order({"value": 1}, 20_000) == 20.0  # no timestamp: ingest time
+    assert sample_order({"timestamp": "x"}, 0) is None
 
 
 def test_returned_view_cannot_modify_retained_state():

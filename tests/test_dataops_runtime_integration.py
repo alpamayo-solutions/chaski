@@ -9,7 +9,9 @@ Each test runs a ``DataOpsService`` on a real colcad (``COLCAD_BINARY``):
 * every page is committed before its ack, also while a backfill commits its
   windows (ack before commit through the shared commit counter);
 * ticks missed in a three-day stall are run afterwards, each at its instant,
-  for a producer that catches up (the OEE hole of 2026-11-05 to 11-09).
+  for a producer that catches up (the OEE hole of 2026-11-05 to 11-09);
+* a producer whose setup() raises is left out of the run and reported; the
+  others run, and a restart sets it up again.
 """
 
 from __future__ import annotations
@@ -377,3 +379,68 @@ def test_three_days_of_missed_ticks_are_caught_up_at_their_instants(tmp_path):
     for instant in expected_instants[:-1]:
         values = [v for ts, v in samples if instant - 3600.0 <= ts < instant]
         assert published[instant] == pytest.approx(sum(values) / len(values))
+
+
+# ─── a producer whose setup fails ──────────────────────────────────────────
+
+
+def _not_started(reader) -> dict | None:
+    for entry in reader.kv(contract="_Finding"):
+        if entry.path.endswith("producers_not_started") and isinstance(entry.payload, dict):
+            return entry.payload
+    return None
+
+
+def test_a_failing_setup_stops_only_its_producer_until_a_restart_sets_it_up(tmp_path):
+    """chaski 0.28 stopped the whole service when one setup() raised. Now the
+    other producer's records and ticks are handled, the failed one is
+    reported on the node as a retained finding, and a restart with the cause
+    fixed runs it and retires the finding."""
+    broken = {"setup": True}
+    log: list[str] = []
+
+    class Fragile(Producer):
+        name = "fragile"
+        system_element_name = "Line/M1"
+
+        async def setup(self) -> None:
+            if broken["setup"]:
+                raise RuntimeError("calibration table missing")
+
+        @every("1s")
+        async def tick(self) -> None:
+            log.append("fragile.tick")
+
+    class Sound(Producer):
+        name = "sound"
+        system_element_name = "Line/M2"
+        speed = SignalRangeInput("speed", window="1h")
+
+        @on_metric("speed")
+        async def on_speed(self, metric) -> None:
+            log.append("sound.speed")
+
+        @every("1s")
+        async def tick(self) -> None:
+            log.append("sound.tick")
+
+    with (
+        chaski.Node("setup-fails", data_dir=tmp_path / "node") as node,
+        node.service("machine2", mount="Line/M2") as machine2,
+        node.service("reader") as reader,
+    ):
+        with _serving(node, tmp_path / "data", Fragile, Sound) as svc:
+            machine2.publish("speed", 3.0, timestamp=time.time())
+            _wait(lambda: "sound.speed" in log and log.count("sound.tick") >= 2, timeout=30)
+            assert "fragile.tick" not in log
+            assert "fragile.setup" in svc.handler_health.failing()
+            _wait(lambda: _not_started(reader) is not None)
+            finding = _not_started(reader)
+            assert finding["detail"]["failed"][0]["name"] == "fragile"
+            assert "calibration table missing" in finding["detail"]["failed"][0]["error"]
+
+        broken["setup"] = False
+        with _serving(node, tmp_path / "data", Fragile, Sound) as svc:
+            _wait(lambda: "fragile.tick" in log, timeout=30)
+            assert "fragile.setup" not in svc.handler_health.failing()
+            _wait(lambda: _not_started(reader) is None)

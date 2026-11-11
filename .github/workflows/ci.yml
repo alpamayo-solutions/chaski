@@ -11,8 +11,8 @@ permissions:
 
 env:
   # The colca chaski is developed against: its data contracts and the broker of
-  # the integration tests. colca 0.45.0: a service's private state (_ServiceState).
-  COLCA_REF: e99114ffbb9ea60eeb5a74da73a6ddb3f4b74368
+  # the integration tests. colca 0.45.1: a _Metric entry holds its newest sample.
+  COLCA_REF: feb0507cb63c6b4efa67902ce3c8392cce9b9823
 
 # A newer push to a pull request or to main supersedes the running checks. A
 # release commit gets a group of its own, so its run (whose verdict the tag
