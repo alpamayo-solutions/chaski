@@ -501,6 +501,7 @@ class Service:
         max_queued_messages: int = 0,
         commands: Iterable[tuple[str, str]] | None = None,
         telemetry: ServiceTelemetry | None = None,
+        service_type: ServiceType | str = ServiceType.CONNECTOR,
     ) -> None:
         """``node`` says who this Service is to Colca: ``None`` (default,
         inside a deployment), a ``node=`` URL string (outside one — the
@@ -529,10 +530,17 @@ class Service:
         :class:`~chaski.dataops.DataOpsService` announces its ``@on_command``
         handlers itself. See :meth:`announce_commands`.
 
+        ``service_type`` is the ``_ServiceDetails.service_type`` the service
+        registers with. The default stays ``connector`` for compatibility; a
+        service that is no connector (a bridge, a simulator, an app backend)
+        says what it is, e.g. ``ServiceType.OTHER``, so the hub does not count
+        it as one.
+
         Construction does not dial the node; it only loads or mints an external
         identity on disk. See :meth:`start`.
         """
         self.name = name
+        self.service_type = ServiceType(service_type)
         self.telemetry = telemetry or ServiceTelemetry()
         self._subscriptions: Subscriptions | None = None
         self._reconnect_backoff: Any = None
@@ -2007,7 +2015,7 @@ class Service:
         details = ServiceDetails(
             id=self._service_id,
             name=self.name,
-            service_type=ServiceType.CONNECTOR,
+            service_type=self.service_type,
             colca_node_id=self._node_id,
             display_name=self.display_name or "",
             description=self.description or "",

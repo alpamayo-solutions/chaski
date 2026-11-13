@@ -104,7 +104,7 @@ import httpx
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from colca_data_contracts import Metric
+from colca_data_contracts import Metric, ServiceType
 
 from chaski.door import Door, Gap, Record, Stream
 from chaski.failures import HandlerHealth, Reject
@@ -920,6 +920,7 @@ class DataOpsService(Service):
             raise ValueError("backfill_busy must be in (0, 1]")
         if backfill_stall_after <= 0:
             raise ValueError("backfill_stall_after must be positive")
+        service_kw.setdefault("service_type", ServiceType.DATAOPS)
         super().__init__(name, mount, node=node, **service_kw)
         self._data_dir = Path(data_dir) if data_dir is not None else self._state_dir
         self.retention_s = float(retention) if retention is not None else DEFAULT_RETENTION_S
