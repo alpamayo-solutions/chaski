@@ -123,6 +123,15 @@ def test_start_publishes_one_active_healthy_service_details(tmp_path, monkeypatc
     assert d.colca_node_id == "n-edge1"
 
 
+def test_service_type_defaults_to_connector_and_can_be_set(tmp_path, monkeypatch):
+    _, client = _local_service(tmp_path, monkeypatch)
+    assert _details(client)[0].service_type.value == "connector"
+    _, other = _local_service(tmp_path / "other", monkeypatch, service_type="other")
+    assert _details(other)[0].service_type.value == "other"
+    with pytest.raises(ValueError):
+        Service("svc1", "line1", state_dir=tmp_path / "bad", service_type="simulator")
+
+
 def test_close_republishes_inactive(tmp_path, monkeypatch):
     svc, client = _local_service(tmp_path, monkeypatch)
     svc.close()

@@ -377,12 +377,12 @@ async def test_one_on_metric_producer_publishes_one_computed_value(tmp_path: Pat
 
     # The ingest wakes on its own input's topic only, on the base class's own
     # client, and the service is a plain local service to the node:
-    # registration is CONNECTOR-typed, and close() marked it inactive.
+    # registration is DATAOPS-typed, and close() marked it inactive.
     assert f"colca/v1/_Metric/{NODE_ID}/oven/temperature" in client.subscriptions
     assert client.qos[f"colca/v1/_Metric/{NODE_ID}/oven/temperature"] == 1, "a wake is not dropped on the way"
     assert not any(t.endswith("/#") and "_Metric" in t for t in client.subscriptions)
     details = [p for _t, p in client.published if isinstance(p, ServiceDetails)]
-    assert details[0].name == "dataops" and details[0].service_type.value == "connector"
+    assert details[0].name == "dataops" and details[0].service_type.value == "dataops"
     assert details[-1].is_active is False
 
 
@@ -464,13 +464,14 @@ def test_a_dataops_service_announces_its_commands_in_details_and_will(tmp_path: 
 
 
 def test_a_dataops_service_registers_byte_identical_to_a_bare_service(tmp_path: Path, monkeypatch):
-    """For the same inputs a DataOpsService and a plain Service publish the same
-    `_ServiceDetails`, byte for byte, container health metrics included."""
+    """For the same inputs a DataOpsService and a plain dataops-typed Service
+    publish the same `_ServiceDetails`, byte for byte, container health
+    metrics included."""
     metrics = container_resource_health_metrics()
 
     bare_client = _FakeClient()
     _connect(bare_client, monkeypatch)
-    bare = Service("dataops", state_dir=tmp_path / "bare", health_metrics=metrics)
+    bare = Service("dataops", state_dir=tmp_path / "bare", health_metrics=metrics, service_type="dataops")
     bare.start()
 
     family_client = _FakeClient()
