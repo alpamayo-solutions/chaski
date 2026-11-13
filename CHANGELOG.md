@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/alpamayo-solutions/chaski/compare/v0.28.3...v0.29.0) (2026-11-13)
+
+
+### Features
+
+* **service:** service_type keyword, DataOpsService registers as dataops ([#206](https://github.com/alpamayo-solutions/chaski/issues/206)) ([4fe03ab](https://github.com/alpamayo-solutions/chaski/commit/4fe03abea0d90f908ef42de7dc14f4d9de6959b1))
+
 ## [0.28.3](https://github.com/alpamayo-solutions/chaski/compare/v0.28.2...v0.28.3) (2026-11-11)
 
 
